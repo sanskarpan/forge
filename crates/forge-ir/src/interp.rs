@@ -141,6 +141,11 @@ pub fn interpret(f: &Function, args: &[RtValue]) -> RtValue {
                     (get(&vals, *a).as_i64() as u64).wrapping_shr(get(&vals, *b).as_i64() as u32)
                         as i64,
                 ),
+                // Not currently reachable from lower.rs — see Task 10/
+                // language-design follow-up on whether i64's `>>` should be
+                // arithmetic; source `>>` only ever lowers to `Inst::Shr`
+                // (logical shift) today, so this arm is correctly
+                // interpreted but untested from the language surface.
                 Inst::Sar(a, b) => RtValue::I64(
                     get(&vals, *a)
                         .as_i64()
@@ -323,6 +328,10 @@ mod tests {
 
     #[test]
     fn i64_min_div_by_neg_one_wraps_without_panicking() {
+        // i64::MIN / -1's true mathematical result is 2^63, which overflows
+        // the representable positive range of i64 — exactly the case x86's
+        // `idiv` traps on. `wrapping_div` sidesteps that by returning
+        // i64::MIN itself instead of panicking or trapping.
         let r = run("x / y", &[RtValue::I64(i64::MIN), RtValue::I64(-1)]);
         assert_eq!(r, RtValue::I64(i64::MIN));
     }
