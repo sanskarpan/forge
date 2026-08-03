@@ -2,6 +2,7 @@
 
 pub mod builder;
 pub mod dominance;
+pub mod interp;
 pub mod ir;
 pub mod lower;
 pub mod print;
