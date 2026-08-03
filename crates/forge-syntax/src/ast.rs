@@ -45,7 +45,7 @@ impl<T> std::fmt::Debug for Idx<T> {
 
 pub type ExprIdx = Idx<Expr>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Float(f64),
     Int(i64),
