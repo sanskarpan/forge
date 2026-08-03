@@ -5,6 +5,24 @@ use smallvec::SmallVec;
 
 use crate::ir::*;
 
+/// Implements Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau's SSA
+/// construction algorithm.
+///
+/// ## Block lifecycle contract
+///
+/// A block goes through three states: created (via [`Builder::create_block`]),
+/// then has zero or more predecessors registered via [`Builder::add_pred`],
+/// then is sealed via [`Builder::seal_block`]. **Seal a block only after ALL
+/// of its predecessors have been registered.** Sealing is what tells
+/// `read_variable_recursive` that `preds` is final and it's safe to resolve
+/// any phis that were left "incomplete" while the block was open — a block
+/// that is never sealed leaves its phis permanently incomplete (missing
+/// operands), silently corrupting the IR rather than erroring.
+///
+/// `cur_block` is caller-managed bookkeeping: no method on `Builder` reads
+/// it internally (every method takes an explicit `block` parameter), so
+/// callers (Task 10's `lower.rs`) are responsible for keeping it in sync
+/// with wherever they're currently emitting into.
 pub struct Builder {
     pub f: Function,
     current_def: Vec<FxHashMap<String, Value>>,
@@ -37,10 +55,21 @@ impl Builder {
     }
 
     pub fn add_pred(&mut self, block: Block, pred: Block) {
+        debug_assert!(
+            !self.sealed[block.0 as usize],
+            "add_pred on already-sealed block {:?}: predecessors registered after sealing are \
+             invisible to fill_phi_operands, silently producing a phi with a missing operand",
+            block
+        );
         self.f.blocks[block.0 as usize].preds.push(pred);
     }
 
     pub fn seal_block(&mut self, block: Block) {
+        debug_assert!(
+            !self.sealed[block.0 as usize],
+            "seal_block called twice on block {:?}",
+            block
+        );
         let pending: Vec<(String, Value)> = self.incomplete_phis[block.0 as usize].drain().collect();
         for (name, phi) in pending {
             self.fill_phi_operands(phi, block, &name);
@@ -58,6 +87,9 @@ impl Builder {
     }
 
     fn new_phi(&mut self, block: Block, ty: Ty) -> Value {
+        // Phis are synthetic — inserted by this algorithm, not written by the
+        // user — so there's no real source location to attribute; (0, 0) is
+        // a placeholder span.
         self.emit(block, Inst::Phi { incoming: SmallVec::new() }, ty, forge_syntax::span::Span::new(0, 0))
     }
 
