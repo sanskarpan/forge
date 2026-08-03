@@ -74,7 +74,7 @@ pub struct Function {
 }
 
 /// Every use-operand of an instruction, for the verifier and for
-/// `replace_all_uses`. `Inst` is deliberately not `Copy`/matched elsewhere
+/// `replace_in_inst`. `Inst` is deliberately not `Copy`/matched elsewhere
 /// with a catch-all — a new variant must be added here explicitly, or the
 /// verifier silently stops checking its operands.
 pub fn uses_of(inst: &Inst) -> Vec<Value> {
@@ -94,6 +94,8 @@ pub fn uses_of(inst: &Inst) -> Vec<Value> {
     }
 }
 
+/// Same exhaustiveness rationale as `uses_of` above — no wildcard arm, so a
+/// new `Inst` variant must be handled here explicitly.
 pub fn replace_in_inst(inst: &mut Inst, old: Value, new: Value) {
     let sub = |v: &mut Value| { if *v == old { *v = new; } };
     match inst {
