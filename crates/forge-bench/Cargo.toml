@@ -1,0 +1,6 @@
+[package]
+name = "forge-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

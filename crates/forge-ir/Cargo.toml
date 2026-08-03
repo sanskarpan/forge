@@ -1,0 +1,9 @@
+[package]
+name = "forge-ir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+forge-syntax = { path = "../forge-syntax" }
+rustc-hash.workspace = true
+smallvec.workspace = true

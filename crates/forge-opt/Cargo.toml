@@ -1,0 +1,6 @@
+[package]
+name = "forge-opt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

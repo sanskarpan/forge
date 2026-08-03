@@ -1,0 +1,6 @@
+[package]
+name = "forge-x64"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

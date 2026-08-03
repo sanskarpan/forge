@@ -1,0 +1,6 @@
+[package]
+name = "forge-simd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

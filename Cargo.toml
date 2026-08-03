@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forge-syntax",
+    "crates/forge-ir",
+    "crates/forge-mem",
+    "crates/forge-opt",
+    "crates/forge-regalloc",
+    "crates/forge-x64",
+    "crates/forge-aarch64",
+    "crates/forge-wasm",
+    "crates/forge-runtime",
+    "crates/forge-simd",
+    "crates/forge-bench",
+    "crates/forge-cli",
+    "crates/forge-wasm-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[workspace.dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["mman"] }
+region = "3"
+raw-cpuid = "11"
+smallvec = "1"
+bitvec = "1"
+rustc-hash = "2"
+thiserror = "1"
+anyhow = "1"
+iced-x86 = "1.21"
+capstone = "0.12"
+criterion = "0.5"
+proptest = "1"

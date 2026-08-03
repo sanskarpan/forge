@@ -1,0 +1,11 @@
+[package]
+name = "forge-mem"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+[[example]]
+name = "spike"
+path = "examples/spike.rs"

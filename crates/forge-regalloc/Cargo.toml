@@ -1,0 +1,6 @@
+[package]
+name = "forge-regalloc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
