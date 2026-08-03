@@ -1,1 +1,5 @@
-//! Placeholder — real implementation lands in Task 8. See CHECKLIST.md.
+// crates/forge-ir/src/lib.rs
+
+pub mod ir;
+
+pub use ir::*;
