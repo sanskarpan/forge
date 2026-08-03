@@ -8,6 +8,18 @@ use forge_syntax::typeck::{Ty as AstTy, TypedAst};
 use crate::builder::Builder;
 use crate::ir::*;
 
+/// Lowers a type-checked AST into SSA IR.
+///
+/// # Precondition
+///
+/// `typed` must have been produced by a successful [`forge_syntax::typeck::typecheck`]
+/// call (typically via `typecheck(resolve(ast))`). This function does not
+/// re-validate call arity or callee names — that's `typecheck`'s job.
+/// Behavior on a hand-built or otherwise malformed `TypedAst` (e.g. an
+/// `Expr::Call` with an unknown callee, or a known callee with the wrong
+/// number of arguments) is unspecified: it may panic via `unreachable!()`
+/// or an index-out-of-bounds in `lower_call`, rather than returning a
+/// diagnostic.
 pub fn lower(typed: &TypedAst) -> Function {
     let mut b = Builder::new();
     let entry = b.create_block();
@@ -39,12 +51,21 @@ fn lower_ty(t: AstTy) -> Ty {
 /// Returns the value produced and the block that now holds it. `if` creates
 /// new blocks, so every caller threads the returned block forward instead of
 /// assuming `b.cur_block` is still what it was before the recursive call.
+///
+/// # Invariant
+///
+/// On return, `b.cur_block` must equal the returned `Block` — this is
+/// checked with a `debug_assert_eq!` below. Any new block-creating construct
+/// added to the match below must explicitly reassign `b.cur_block` before
+/// recursing into (or emitting in) the new block; see the `If` arm for the
+/// canonical pattern (assign `b.cur_block` immediately before each
+/// `lower_expr` call into a freshly created block).
 fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block) {
     let span = typed.ast.span(idx);
     let ty = lower_ty(typed.types[idx.index()]);
     let block = b.cur_block;
 
-    match typed.ast.get(idx).clone() {
+    let result = match typed.ast.get(idx).clone() {
         Expr::Float(v) => (b.emit(block, Inst::ConstF64(v.to_bits()), ty, span), block),
         Expr::Int(n) => (b.emit(block, Inst::ConstI64(n), ty, span), block),
         Expr::Bool(v) => (b.emit(block, Inst::ConstBool(v), ty, span), block),
@@ -121,7 +142,13 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
             b.write_variable(&name, block, v);
             lower_expr(b, typed, body)
         }
-    }
+    };
+
+    debug_assert_eq!(
+        b.cur_block, result.1,
+        "lower_expr must leave b.cur_block equal to the block it returns"
+    );
+    result
 }
 
 fn lower_binary(op: BinaryOp, l: Value, r: Value) -> Inst {
@@ -142,23 +169,33 @@ fn lower_binary(op: BinaryOp, l: Value, r: Value) -> Inst {
     }
 }
 
+/// # Precondition
+///
+/// `callee` must be a known intrinsic name and `args` must have exactly the
+/// arity `typecheck`'s `check_call` validated for it (1 for sqrt/abs/floor/
+/// ceil/round/trunc/sin/cos/tan/exp/log, 2 for min/max/pow, 3 for fma) — see
+/// `lower`'s doc comment. The `debug_assert!`s below turn a violation into a
+/// clear panic message in debug builds instead of a raw index-out-of-bounds.
 fn lower_call(callee: &str, args: &[Value]) -> Inst {
     match callee {
-        "sqrt" => Inst::Sqrt(args[0]),
-        "abs" => Inst::Abs(args[0]),
-        "floor" => Inst::Floor(args[0]),
-        "ceil" => Inst::Ceil(args[0]),
-        "round" => Inst::Round(args[0]),
-        "trunc" => Inst::Trunc(args[0]),
-        "min" => Inst::Min(args[0], args[1]),
-        "max" => Inst::Max(args[0], args[1]),
-        "fma" => Inst::Fma { a: args[0], b: args[1], c: args[2] },
-        "sin" => Inst::Call { func: LibFunc::Sin, args: args.iter().copied().collect() },
-        "cos" => Inst::Call { func: LibFunc::Cos, args: args.iter().copied().collect() },
-        "tan" => Inst::Call { func: LibFunc::Tan, args: args.iter().copied().collect() },
-        "exp" => Inst::Call { func: LibFunc::Exp, args: args.iter().copied().collect() },
-        "log" => Inst::Call { func: LibFunc::Log, args: args.iter().copied().collect() },
-        "pow" => Inst::Call { func: LibFunc::Pow, args: args.iter().copied().collect() },
+        "sqrt" => { debug_assert!(args.len() == 1); Inst::Sqrt(args[0]) }
+        "abs" => { debug_assert!(args.len() == 1); Inst::Abs(args[0]) }
+        "floor" => { debug_assert!(args.len() == 1); Inst::Floor(args[0]) }
+        "ceil" => { debug_assert!(args.len() == 1); Inst::Ceil(args[0]) }
+        "round" => { debug_assert!(args.len() == 1); Inst::Round(args[0]) }
+        "trunc" => { debug_assert!(args.len() == 1); Inst::Trunc(args[0]) }
+        "min" => { debug_assert!(args.len() == 2); Inst::Min(args[0], args[1]) }
+        "max" => { debug_assert!(args.len() == 2); Inst::Max(args[0], args[1]) }
+        "fma" => {
+            debug_assert!(args.len() == 3);
+            Inst::Fma { a: args[0], b: args[1], c: args[2] }
+        }
+        "sin" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Sin, args: args.iter().copied().collect() } }
+        "cos" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Cos, args: args.iter().copied().collect() } }
+        "tan" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Tan, args: args.iter().copied().collect() } }
+        "exp" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Exp, args: args.iter().copied().collect() } }
+        "log" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Log, args: args.iter().copied().collect() } }
+        "pow" => { debug_assert!(args.len() == 2); Inst::Call { func: LibFunc::Pow, args: args.iter().copied().collect() } }
         other => unreachable!("type checker already rejected unknown intrinsic `{other}`"),
     }
 }
@@ -214,5 +251,108 @@ mod tests {
         for b in &f.blocks {
             assert!(b.term.is_some());
         }
+    }
+
+    #[test]
+    fn int_literal_lowers_to_const_i64() {
+        let f = lowered("1");
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::ConstI64(1))));
+    }
+
+    #[test]
+    fn bool_literal_lowers_to_const_bool() {
+        let f = lowered("true");
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::ConstBool(true))));
+    }
+
+    #[test]
+    fn logical_not_lowers_to_inst_not() {
+        let f = lowered("!true");
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::Not(_))));
+    }
+
+    #[test]
+    fn bitwise_not_lowers_to_inst_not() {
+        let f = lowered("~n");
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::Not(_))));
+    }
+
+    #[test]
+    fn sub_lowers_to_inst_sub() {
+        let f = lowered("x - 1.0");
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::Sub(_, _))));
+    }
+
+    #[test]
+    fn div_lowers_to_inst_div() {
+        let f = lowered("x / 2.0");
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::Div(_, _))));
+    }
+
+    #[test]
+    fn bitand_lowers_to_inst_and() {
+        let f = lowered("n & 1");
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::And(_, _))));
+    }
+
+    #[test]
+    fn eq_lowers_to_cmp_eq() {
+        let f = lowered("x == 1.0");
+        assert!(f
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::Cmp { op: CmpOp::Eq, .. })));
+    }
+
+    #[test]
+    fn min_lowers_to_inst_min_with_both_args() {
+        let f = lowered("min(x, y)");
+        let min = f
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Min(a, b) => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("a Min inst exists");
+        assert_ne!(min.0, min.1, "min's two args must be distinct params");
+    }
+
+    #[test]
+    fn max_lowers_to_inst_max_with_both_args() {
+        let f = lowered("max(x, y)");
+        let max = f
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Max(a, b) => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("a Max inst exists");
+        assert_ne!(max.0, max.1, "max's two args must be distinct params");
+    }
+
+    #[test]
+    fn fma_lowers_to_inst_fma_with_three_distinct_args() {
+        let f = lowered("fma(x, y, z)");
+        let fma = f
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Fma { a, b, c } => Some((*a, *b, *c)),
+                _ => None,
+            })
+            .expect("an Fma inst exists");
+        assert_ne!(fma.0, fma.1);
+        assert_ne!(fma.1, fma.2);
+        assert_ne!(fma.0, fma.2);
+    }
+
+    #[test]
+    fn sin_lowers_to_libm_call() {
+        let f = lowered("sin(x)");
+        assert!(f.insts.iter().any(
+            |i| matches!(i, Inst::Call { func: LibFunc::Sin, .. })
+        ));
     }
 }
