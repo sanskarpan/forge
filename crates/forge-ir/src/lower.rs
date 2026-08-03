@@ -30,7 +30,15 @@ pub fn lower(typed: &TypedAst) -> Function {
     let root_span = typed.ast.span(typed.ast.root);
     for (i, (name, ty)) in typed.params.iter().enumerate() {
         let ty = lower_ty(*ty);
-        let v = b.emit(entry, Inst::Param { index: i as u32, ty }, ty, root_span);
+        let v = b.emit(
+            entry,
+            Inst::Param {
+                index: i as u32,
+                ty,
+            },
+            ty,
+            root_span,
+        );
         b.f.params.push((name.clone(), ty));
         b.write_variable(name, entry, v);
     }
@@ -109,8 +117,11 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
             let else_block = b.create_block();
             let merge_block = b.create_block();
 
-            b.f.blocks[block.0 as usize].term =
-                Some(Terminator::Branch { cond: c, then_: then_block, else_: else_block });
+            b.f.blocks[block.0 as usize].term = Some(Terminator::Branch {
+                cond: c,
+                then_: then_block,
+                else_: else_block,
+            });
             b.add_pred(then_block, block);
             b.add_pred(else_block, block);
             b.seal_block(then_block);
@@ -129,7 +140,10 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
             b.seal_block(merge_block);
             b.cur_block = merge_block;
             let incoming = smallvec![(then_exit, then_val), (else_exit, else_val)];
-            (b.emit(merge_block, Inst::Phi { incoming }, ty, span), merge_block)
+            (
+                b.emit(merge_block, Inst::Phi { incoming }, ty, span),
+                merge_block,
+            )
         }
 
         // `name` was already alpha-renamed by forge_syntax::resolve to be
@@ -154,18 +168,46 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
 fn lower_binary(op: BinaryOp, l: Value, r: Value) -> Inst {
     use BinaryOp::*;
     match op {
-        Add => Inst::Add(l, r), Sub => Inst::Sub(l, r), Mul => Inst::Mul(l, r),
-        Div => Inst::Div(l, r), Rem => Inst::Rem(l, r),
+        Add => Inst::Add(l, r),
+        Sub => Inst::Sub(l, r),
+        Mul => Inst::Mul(l, r),
+        Div => Inst::Div(l, r),
+        Rem => Inst::Rem(l, r),
         BitAnd | And => Inst::And(l, r),
         BitOr | Or => Inst::Or(l, r),
         BitXor => Inst::Xor(l, r),
-        Shl => Inst::Shl(l, r), Shr => Inst::Shr(l, r),
-        Eq => Inst::Cmp { op: CmpOp::Eq, lhs: l, rhs: r },
-        Ne => Inst::Cmp { op: CmpOp::Ne, lhs: l, rhs: r },
-        Lt => Inst::Cmp { op: CmpOp::Lt, lhs: l, rhs: r },
-        Le => Inst::Cmp { op: CmpOp::Le, lhs: l, rhs: r },
-        Gt => Inst::Cmp { op: CmpOp::Gt, lhs: l, rhs: r },
-        Ge => Inst::Cmp { op: CmpOp::Ge, lhs: l, rhs: r },
+        Shl => Inst::Shl(l, r),
+        Shr => Inst::Shr(l, r),
+        Eq => Inst::Cmp {
+            op: CmpOp::Eq,
+            lhs: l,
+            rhs: r,
+        },
+        Ne => Inst::Cmp {
+            op: CmpOp::Ne,
+            lhs: l,
+            rhs: r,
+        },
+        Lt => Inst::Cmp {
+            op: CmpOp::Lt,
+            lhs: l,
+            rhs: r,
+        },
+        Le => Inst::Cmp {
+            op: CmpOp::Le,
+            lhs: l,
+            rhs: r,
+        },
+        Gt => Inst::Cmp {
+            op: CmpOp::Gt,
+            lhs: l,
+            rhs: r,
+        },
+        Ge => Inst::Cmp {
+            op: CmpOp::Ge,
+            lhs: l,
+            rhs: r,
+        },
     }
 }
 
@@ -178,24 +220,88 @@ fn lower_binary(op: BinaryOp, l: Value, r: Value) -> Inst {
 /// clear panic message in debug builds instead of a raw index-out-of-bounds.
 fn lower_call(callee: &str, args: &[Value]) -> Inst {
     match callee {
-        "sqrt" => { debug_assert!(args.len() == 1); Inst::Sqrt(args[0]) }
-        "abs" => { debug_assert!(args.len() == 1); Inst::Abs(args[0]) }
-        "floor" => { debug_assert!(args.len() == 1); Inst::Floor(args[0]) }
-        "ceil" => { debug_assert!(args.len() == 1); Inst::Ceil(args[0]) }
-        "round" => { debug_assert!(args.len() == 1); Inst::Round(args[0]) }
-        "trunc" => { debug_assert!(args.len() == 1); Inst::Trunc(args[0]) }
-        "min" => { debug_assert!(args.len() == 2); Inst::Min(args[0], args[1]) }
-        "max" => { debug_assert!(args.len() == 2); Inst::Max(args[0], args[1]) }
+        "sqrt" => {
+            debug_assert!(args.len() == 1);
+            Inst::Sqrt(args[0])
+        }
+        "abs" => {
+            debug_assert!(args.len() == 1);
+            Inst::Abs(args[0])
+        }
+        "floor" => {
+            debug_assert!(args.len() == 1);
+            Inst::Floor(args[0])
+        }
+        "ceil" => {
+            debug_assert!(args.len() == 1);
+            Inst::Ceil(args[0])
+        }
+        "round" => {
+            debug_assert!(args.len() == 1);
+            Inst::Round(args[0])
+        }
+        "trunc" => {
+            debug_assert!(args.len() == 1);
+            Inst::Trunc(args[0])
+        }
+        "min" => {
+            debug_assert!(args.len() == 2);
+            Inst::Min(args[0], args[1])
+        }
+        "max" => {
+            debug_assert!(args.len() == 2);
+            Inst::Max(args[0], args[1])
+        }
         "fma" => {
             debug_assert!(args.len() == 3);
-            Inst::Fma { a: args[0], b: args[1], c: args[2] }
+            Inst::Fma {
+                a: args[0],
+                b: args[1],
+                c: args[2],
+            }
         }
-        "sin" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Sin, args: args.iter().copied().collect() } }
-        "cos" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Cos, args: args.iter().copied().collect() } }
-        "tan" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Tan, args: args.iter().copied().collect() } }
-        "exp" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Exp, args: args.iter().copied().collect() } }
-        "log" => { debug_assert!(args.len() == 1); Inst::Call { func: LibFunc::Log, args: args.iter().copied().collect() } }
-        "pow" => { debug_assert!(args.len() == 2); Inst::Call { func: LibFunc::Pow, args: args.iter().copied().collect() } }
+        "sin" => {
+            debug_assert!(args.len() == 1);
+            Inst::Call {
+                func: LibFunc::Sin,
+                args: args.iter().copied().collect(),
+            }
+        }
+        "cos" => {
+            debug_assert!(args.len() == 1);
+            Inst::Call {
+                func: LibFunc::Cos,
+                args: args.iter().copied().collect(),
+            }
+        }
+        "tan" => {
+            debug_assert!(args.len() == 1);
+            Inst::Call {
+                func: LibFunc::Tan,
+                args: args.iter().copied().collect(),
+            }
+        }
+        "exp" => {
+            debug_assert!(args.len() == 1);
+            Inst::Call {
+                func: LibFunc::Exp,
+                args: args.iter().copied().collect(),
+            }
+        }
+        "log" => {
+            debug_assert!(args.len() == 1);
+            Inst::Call {
+                func: LibFunc::Log,
+                args: args.iter().copied().collect(),
+            }
+        }
+        "pow" => {
+            debug_assert!(args.len() == 2);
+            Inst::Call {
+                func: LibFunc::Pow,
+                args: args.iter().copied().collect(),
+            }
+        }
         other => unreachable!("type checker already rejected unknown intrinsic `{other}`"),
     }
 }
@@ -227,7 +333,11 @@ mod tests {
         let f = lowered("if x > 0.0 then x else -x");
         assert_eq!(f.blocks.len(), 4); // entry, then, else, merge
         let merge = &f.blocks[3];
-        let phi_count = merge.insts.iter().filter(|&&v| matches!(f.insts[v.0 as usize], Inst::Phi { .. })).count();
+        let phi_count = merge
+            .insts
+            .iter()
+            .filter(|&&v| matches!(f.insts[v.0 as usize], Inst::Phi { .. }))
+            .count();
         assert_eq!(phi_count, 1);
     }
 
@@ -236,11 +346,19 @@ mod tests {
         // (let x = 1.0 in x) + x must add the let's value to the PARAMETER x,
         // not to itself — this is the shadowing bug the resolve pass fixes.
         let f = lowered("(let x = 1.0 in x) + x");
-        let add = f.insts.iter().find(|i| matches!(i, Inst::Add(_, _))).expect("an Add exists");
+        let add = f
+            .insts
+            .iter()
+            .find(|i| matches!(i, Inst::Add(_, _)))
+            .expect("an Add exists");
         let Inst::Add(l, r) = add else { unreachable!() };
         // Both operands trace back to the single Param instruction — if the
         // shadow leaked, one operand would instead be the ConstF64(1.0).
-        let param_idx = f.insts.iter().position(|i| matches!(i, Inst::Param { .. })).unwrap() as u32;
+        let param_idx = f
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Param { .. }))
+            .unwrap() as u32;
         assert_eq!(r.0, param_idx, "the trailing `x` must be the parameter");
         let _ = l; // lhs is the let's inner (shadowed) value — not asserted here
     }
@@ -351,8 +469,12 @@ mod tests {
     #[test]
     fn sin_lowers_to_libm_call() {
         let f = lowered("sin(x)");
-        assert!(f.insts.iter().any(
-            |i| matches!(i, Inst::Call { func: LibFunc::Sin, .. })
-        ));
+        assert!(f.insts.iter().any(|i| matches!(
+            i,
+            Inst::Call {
+                func: LibFunc::Sin,
+                ..
+            }
+        )));
     }
 }

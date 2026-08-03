@@ -35,8 +35,12 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             f: Function {
-                insts: Vec::new(), types: Vec::new(), spans: Vec::new(),
-                blocks: Vec::new(), entry: Block(0), params: Vec::new(),
+                insts: Vec::new(),
+                types: Vec::new(),
+                spans: Vec::new(),
+                blocks: Vec::new(),
+                entry: Block(0),
+                params: Vec::new(),
             },
             current_def: Vec::new(),
             sealed: Vec::new(),
@@ -70,14 +74,21 @@ impl Builder {
             "seal_block called twice on block {:?}",
             block
         );
-        let pending: Vec<(String, Value)> = self.incomplete_phis[block.0 as usize].drain().collect();
+        let pending: Vec<(String, Value)> =
+            self.incomplete_phis[block.0 as usize].drain().collect();
         for (name, phi) in pending {
             self.fill_phi_operands(phi, block, &name);
         }
         self.sealed[block.0 as usize] = true;
     }
 
-    pub fn emit(&mut self, block: Block, inst: Inst, ty: Ty, span: forge_syntax::span::Span) -> Value {
+    pub fn emit(
+        &mut self,
+        block: Block,
+        inst: Inst,
+        ty: Ty,
+        span: forge_syntax::span::Span,
+    ) -> Value {
         let v = Value(self.f.insts.len() as u32);
         self.f.insts.push(inst);
         self.f.types.push(ty);
@@ -90,7 +101,14 @@ impl Builder {
         // Phis are synthetic — inserted by this algorithm, not written by the
         // user — so there's no real source location to attribute; (0, 0) is
         // a placeholder span.
-        self.emit(block, Inst::Phi { incoming: SmallVec::new() }, ty, forge_syntax::span::Span::new(0, 0))
+        self.emit(
+            block,
+            Inst::Phi {
+                incoming: SmallVec::new(),
+            },
+            ty,
+            forge_syntax::span::Span::new(0, 0),
+        )
     }
 
     pub fn write_variable(&mut self, name: &str, block: Block, value: Value) {
@@ -98,7 +116,9 @@ impl Builder {
     }
 
     pub fn read_variable(&mut self, name: &str, block: Block, ty: Ty) -> Value {
-        if let Some(&v) = self.current_def[block.0 as usize].get(name) { return v; }
+        if let Some(&v) = self.current_def[block.0 as usize].get(name) {
+            return v;
+        }
         self.read_variable_recursive(name, block, ty)
     }
 
@@ -145,7 +165,9 @@ impl Builder {
         };
         let mut same: Option<Value> = None;
         for (_, v) in &incoming {
-            if *v == phi { continue; }
+            if *v == phi {
+                continue;
+            }
             match same {
                 Some(s) if s != *v => return,
                 _ => same = Some(*v),
@@ -162,12 +184,16 @@ impl Builder {
         }
         for def in &mut self.current_def {
             for v in def.values_mut() {
-                if *v == old { *v = new; }
+                if *v == old {
+                    *v = new;
+                }
             }
         }
     }
 }
 
 impl Default for Builder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

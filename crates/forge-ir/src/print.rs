@@ -21,8 +21,12 @@ pub fn print_function(f: &Function) -> String {
         match &bd.term {
             Some(Terminator::Return(v)) => writeln!(out, "  ret v{}", v.0).unwrap(),
             Some(Terminator::Jump(b)) => writeln!(out, "  jump block{}", b.0).unwrap(),
-            Some(Terminator::Branch { cond, then_, else_ }) =>
-                writeln!(out, "  branch v{}, block{}, block{}", cond.0, then_.0, else_.0).unwrap(),
+            Some(Terminator::Branch { cond, then_, else_ }) => writeln!(
+                out,
+                "  branch v{}, block{}, block{}",
+                cond.0, then_.0, else_.0
+            )
+            .unwrap(),
             None => writeln!(out, "  <no terminator>").unwrap(),
         }
     }
@@ -65,7 +69,10 @@ fn print_inst(inst: &Inst) -> String {
         Inst::IToF(a) => format!("itof v{}", a.0),
         Inst::FToI(a) => format!("ftoi v{}", a.0),
         Inst::Phi { incoming } => {
-            let parts: Vec<String> = incoming.iter().map(|(b, v)| format!("block{} -> v{}", b.0, v.0)).collect();
+            let parts: Vec<String> = incoming
+                .iter()
+                .map(|(b, v)| format!("block{} -> v{}", b.0, v.0))
+                .collect();
             format!("phi [{}]", parts.join(", "))
         }
     }

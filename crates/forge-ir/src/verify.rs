@@ -49,7 +49,8 @@ pub fn verify(f: &Function) -> Result<(), String> {
                 // exactly the `then` edge the phi records it against.
                 Inst::Phi { incoming } => {
                     for (pred, val) in incoming {
-                        let def_block = *defined_in.get(val)
+                        let def_block = *defined_in
+                            .get(val)
                             .ok_or_else(|| format!("value {val:?} used but never defined"))?;
                         if !dominates(&idom, def_block, *pred) {
                             return Err(format!(
@@ -60,7 +61,8 @@ pub fn verify(f: &Function) -> Result<(), String> {
                 }
                 other => {
                     for used in uses_of(other) {
-                        let def_block = *defined_in.get(&used)
+                        let def_block = *defined_in
+                            .get(&used)
                             .ok_or_else(|| format!("value {used:?} used but never defined"))?;
                         if !dominates(&idom, def_block, block) {
                             return Err(format!(
@@ -74,17 +76,21 @@ pub fn verify(f: &Function) -> Result<(), String> {
 
         match &bd.term {
             Some(Terminator::Return(v)) => {
-                let def_block = *defined_in.get(v)
+                let def_block = *defined_in
+                    .get(v)
                     .ok_or_else(|| format!("return of undefined value {v:?}"))?;
                 if !dominates(&idom, def_block, block) {
                     return Err(format!("returned value {v:?} does not dominate {block:?}"));
                 }
             }
             Some(Terminator::Branch { cond, .. }) => {
-                let def_block = *defined_in.get(cond)
+                let def_block = *defined_in
+                    .get(cond)
                     .ok_or_else(|| format!("branch on undefined value {cond:?}"))?;
                 if !dominates(&idom, def_block, block) {
-                    return Err(format!("branch condition {cond:?} does not dominate {block:?}"));
+                    return Err(format!(
+                        "branch condition {cond:?} does not dominate {block:?}"
+                    ));
                 }
             }
             Some(Terminator::Jump(_)) => {}
@@ -96,7 +102,8 @@ pub fn verify(f: &Function) -> Result<(), String> {
                 if incoming.len() != bd.preds.len() {
                     return Err(format!(
                         "phi {v:?} in {block:?} has {} operand(s) but block has {} predecessor(s)",
-                        incoming.len(), bd.preds.len()
+                        incoming.len(),
+                        bd.preds.len()
                     ));
                 }
             }
@@ -112,8 +119,8 @@ mod tests {
     use forge_syntax::lexer::lex;
     use forge_syntax::parser::parse;
     use forge_syntax::resolve::resolve;
-    use forge_syntax::typeck::typecheck;
     use forge_syntax::span::Span;
+    use forge_syntax::typeck::typecheck;
 
     fn lowered(src: &str) -> Function {
         let (tokens, _) = lex(src);
@@ -141,14 +148,20 @@ mod tests {
         // value index (one past the end of insts).
         let bad = Value(f.insts.len() as u32);
         let last = f.insts.len() - 1;
-        if let Inst::Mul(_, b) = &mut f.insts[last] { *b = bad; }
+        if let Inst::Mul(_, b) = &mut f.insts[last] {
+            *b = bad;
+        }
         assert!(verify(&f).is_err());
     }
 
     #[test]
     fn rejects_phi_with_wrong_operand_count() {
         let mut f = lowered("if x > 0.0 then x else -x");
-        let phi_idx = f.insts.iter().position(|i| matches!(i, Inst::Phi { .. })).unwrap();
+        let phi_idx = f
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Phi { .. }))
+            .unwrap();
         if let Inst::Phi { incoming } = &mut f.insts[phi_idx] {
             incoming.pop(); // now has 1 operand but its block has 2 preds
         }
@@ -169,7 +182,9 @@ mod tests {
         // which is what we corrupt the Return to use instead of the phi.
         let mut f = lowered("if x > 0.0 then x else -x");
         let else_block = f.blocks[2].insts.clone();
-        let else_val = *else_block.first().expect("else block has at least one inst");
+        let else_val = *else_block
+            .first()
+            .expect("else block has at least one inst");
         // Force merge's Return to use the else-only value instead of the phi.
         let merge_idx = f.blocks.len() - 1;
         f.blocks[merge_idx].term = Some(Terminator::Return(else_val));
@@ -184,11 +199,18 @@ mod tests {
         // which has no predecessors at all, so this is a genuine violation,
         // not just a forward reference within the same block.
         let mut f = lowered("if x > 0.0 then x else -x");
-        let else_val = *f.blocks[2].insts.first().expect("else block has at least one inst");
+        let else_val = *f.blocks[2]
+            .insts
+            .first()
+            .expect("else block has at least one inst");
         let Some(Terminator::Branch { then_, else_, .. }) = f.blocks[0].term.clone() else {
             panic!("entry block must end in a Branch");
         };
-        f.blocks[0].term = Some(Terminator::Branch { cond: else_val, then_, else_ });
+        f.blocks[0].term = Some(Terminator::Branch {
+            cond: else_val,
+            then_,
+            else_,
+        });
         assert!(verify(&f).is_err());
     }
 }

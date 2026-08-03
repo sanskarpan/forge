@@ -13,7 +13,9 @@ pub fn reverse_postorder(f: &Function) -> Vec<Block> {
 }
 
 fn visit(f: &Function, b: Block, visited: &mut Vec<bool>, post: &mut Vec<Block>) {
-    if visited[b.0 as usize] { return; }
+    if visited[b.0 as usize] {
+        return;
+    }
     visited[b.0 as usize] = true;
     if let Some(term) = &f.blocks[b.0 as usize].term {
         match term {
@@ -42,7 +44,9 @@ pub fn compute_dominators(f: &Function) -> Vec<Option<Block>> {
             let preds = f.blocks[b.0 as usize].preds.clone();
             let mut new_idom = None;
             for p in preds {
-                if idom[p.0 as usize].is_none() { continue; }
+                if idom[p.0 as usize].is_none() {
+                    continue;
+                }
                 new_idom = Some(match new_idom {
                     None => p,
                     Some(cur) => intersect(&idom, &rpo_num, cur, p),
@@ -67,17 +71,28 @@ pub fn compute_dominators(f: &Function) -> Vec<Option<Block>> {
 /// that pointer strictly toward the entry — when both pointers finally
 /// agree, that block is where `a`'s and `b`'s idom chains first converge,
 /// i.e. their nearest common dominator.
-fn intersect(idom: &[Option<Block>], rpo_num: &FxHashMap<Block, usize>, mut a: Block, mut b: Block) -> Block {
+fn intersect(
+    idom: &[Option<Block>],
+    rpo_num: &FxHashMap<Block, usize>,
+    mut a: Block,
+    mut b: Block,
+) -> Block {
     while a != b {
-        while rpo_num[&a] > rpo_num[&b] { a = idom[a.0 as usize].expect("reachable block has an idom"); }
-        while rpo_num[&b] > rpo_num[&a] { b = idom[b.0 as usize].expect("reachable block has an idom"); }
+        while rpo_num[&a] > rpo_num[&b] {
+            a = idom[a.0 as usize].expect("reachable block has an idom");
+        }
+        while rpo_num[&b] > rpo_num[&a] {
+            b = idom[b.0 as usize].expect("reachable block has an idom");
+        }
     }
     a
 }
 
 pub fn dominates(idom: &[Option<Block>], a: Block, mut b: Block) -> bool {
     loop {
-        if a == b { return true; }
+        if a == b {
+            return true;
+        }
         match idom[b.0 as usize] {
             Some(next) if next != b => b = next,
             _ => return false,
