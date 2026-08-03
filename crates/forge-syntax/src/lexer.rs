@@ -12,10 +12,14 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
 
     while i < bytes.len() {
         let start = i;
-        let c = bytes[i] as char;
+        // `i` is always a valid UTF-8 boundary (see advancement below), so
+        // decoding the real char here — rather than casting a raw byte —
+        // avoids slicing mid-character on multi-byte input.
+        let c = src[i..].chars().next().unwrap();
+        let c_len = c.len_utf8();
 
         if c.is_whitespace() {
-            i += 1;
+            i += c_len;
             continue;
         }
 
@@ -87,7 +91,11 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
             continue;
         }
 
-        if i + 1 < bytes.len() {
+        // Only ASCII bytes participate in two-char operators, but guard the
+        // slice with `is_char_boundary` regardless so a multi-byte char
+        // sitting right after (or straddling) this offset can never cause
+        // an out-of-boundary panic here.
+        if i + 2 <= bytes.len() && src.is_char_boundary(i + 2) {
             let two = &src[i..i + 2];
             let two_kind = match two {
                 "==" => Some(TokenKind::EqEq),
@@ -135,18 +143,18 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
             Some(k) => {
                 tokens.push(Token {
                     kind: k,
-                    span: Span::new(start as u32, (start + 1) as u32),
+                    span: Span::new(start as u32, (start + c_len) as u32),
                     text: String::new(),
                 });
-                i += 1;
+                i += c_len;
             }
             None => {
                 diags.push(Diagnostic::error(
                     format!("unexpected character '{c}'"),
-                    Span::new(start as u32, (start + 1) as u32),
+                    Span::new(start as u32, (start + c_len) as u32),
                     "not a valid token",
                 ));
-                i += 1;
+                i += c_len;
             }
         }
     }
@@ -243,5 +251,17 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(tokens[0].kind, TokenKind::Int);
         assert_eq!(tokens[1].kind, TokenKind::Int); // lexer skips the bad char and continues
+    }
+
+    #[test]
+    fn multibyte_unknown_char_does_not_panic() {
+        // '€' is 3 bytes in UTF-8 (0xE2 0x82 0xAC); previously the lexer
+        // cast raw bytes to `char` and sliced `&src[i..i+2]` for two-char
+        // operator lookahead, which panicked when `i` landed mid-character.
+        let (tokens, diags) = lex("1 € 2");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Int);
+        assert_eq!(tokens[1].kind, TokenKind::Int); // lexer skips the bad char and continues
+        assert_eq!(tokens[2].kind, TokenKind::Eof);
     }
 }
