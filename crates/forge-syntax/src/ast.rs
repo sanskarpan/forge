@@ -105,7 +105,7 @@ pub enum BinaryOp {
     Ge,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Ast {
     pub exprs: Vec<Expr>,
     pub spans: Vec<Span>,
