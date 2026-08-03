@@ -1,4 +1,26 @@
 // crates/forge-ir/src/verify.rs
+//
+// Known limitations (acceptable for this slice — there's no optimizer pass
+// yet to exercise them, and fixing them now means guessing at requirements
+// a real pass hasn't stated):
+//
+// - Dominance is checked at BLOCK granularity only. `verify()` never checks
+//   that a def appears before its use *within* the same block — it's
+//   currently safe only because `Builder::emit` guarantees append order ==
+//   Value-index order (see builder.rs), not because `verify()` re-derives
+//   that invariant itself. If anything besides `Builder` ever constructs or
+//   reorders `BlockData::insts` (e.g. a scheduling pass), this file needs a
+//   same-block position check added alongside the cross-block dominance
+//   check.
+//
+// - `verify()` returns `Result<(), String>` — first error only, no span
+//   info — rather than `Result<(), Vec<Diagnostic>>` the way
+//   `forge-syntax`'s parser/typechecker report errors. `Function.spans`
+//   already carries a per-instruction source span that goes unused here.
+//   TODO: switch to `Diagnostic`-based, multi-error reporting before this
+//   is actually wired into a real optimizer pass pipeline (Phase 4+) —
+//   callers there will want every violation at once, pointed at source,
+//   not just the first one found.
 
 use rustc_hash::FxHashMap;
 
@@ -58,7 +80,14 @@ pub fn verify(f: &Function) -> Result<(), String> {
                     return Err(format!("returned value {v:?} does not dominate {block:?}"));
                 }
             }
-            Some(_) => {}
+            Some(Terminator::Branch { cond, .. }) => {
+                let def_block = *defined_in.get(cond)
+                    .ok_or_else(|| format!("branch on undefined value {cond:?}"))?;
+                if !dominates(&idom, def_block, block) {
+                    return Err(format!("branch condition {cond:?} does not dominate {block:?}"));
+                }
+            }
+            Some(Terminator::Jump(_)) => {}
             None => return Err(format!("block {block:?} has no terminator")),
         }
 
@@ -146,5 +175,20 @@ mod tests {
         f.blocks[merge_idx].term = Some(Terminator::Return(else_val));
         assert!(verify(&f).is_err());
         let _ = Span::new(0, 0); // silence unused import if Span is otherwise unused
+    }
+
+    #[test]
+    fn rejects_branch_condition_that_does_not_dominate_its_block() {
+        // entry's Branch.cond illegally points at a value defined only in
+        // `else` (block 2) — block 2 does not dominate entry (block 0),
+        // which has no predecessors at all, so this is a genuine violation,
+        // not just a forward reference within the same block.
+        let mut f = lowered("if x > 0.0 then x else -x");
+        let else_val = *f.blocks[2].insts.first().expect("else block has at least one inst");
+        let Some(Terminator::Branch { then_, else_, .. }) = f.blocks[0].term.clone() else {
+            panic!("entry block must end in a Branch");
+        };
+        f.blocks[0].term = Some(Terminator::Branch { cond: else_val, then_, else_ });
+        assert!(verify(&f).is_err());
     }
 }

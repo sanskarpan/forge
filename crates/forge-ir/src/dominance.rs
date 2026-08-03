@@ -57,6 +57,16 @@ pub fn compute_dominators(f: &Function) -> Vec<Option<Block>> {
     idom
 }
 
+/// The "meet" operation of the Cooper-Harvey-Kennedy algorithm: given two
+/// blocks that each already have a (possibly provisional) computed idom,
+/// find their nearest common dominator by walking both up their own idom
+/// chains in lockstep. `rpo_num` doubles as a cheap "is this an ancestor in
+/// the dominator tree" proxy: a block's idom always has a strictly lower
+/// RPO number than the block itself (it's visited first), so repeatedly
+/// stepping the pointer with the *larger* RPO number to its own idom moves
+/// that pointer strictly toward the entry — when both pointers finally
+/// agree, that block is where `a`'s and `b`'s idom chains first converge,
+/// i.e. their nearest common dominator.
 fn intersect(idom: &[Option<Block>], rpo_num: &FxHashMap<Block, usize>, mut a: Block, mut b: Block) -> Block {
     while a != b {
         while rpo_num[&a] > rpo_num[&b] { a = idom[a.0 as usize].expect("reachable block has an idom"); }
