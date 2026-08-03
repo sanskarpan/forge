@@ -12,9 +12,12 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
 
     while i < bytes.len() {
         let start = i;
-        // `i` is always a valid UTF-8 boundary (see advancement below), so
-        // decoding the real char here — rather than casting a raw byte —
-        // avoids slicing mid-character on multi-byte input.
+        // Invariant: `i` is always a valid UTF-8 boundary at the top of this
+        // loop. It holds because every sub-scanner below that walks `bytes`
+        // by raw index (digit/ident runs, the two-char operator lookahead)
+        // only ever advances across ASCII bytes and never crosses into a
+        // multi-byte char; a new byte-indexed branch must preserve that
+        // ASCII-only advancement or this invariant breaks.
         let c = src[i..].chars().next().unwrap();
         let c_len = c.len_utf8();
 
@@ -263,5 +266,52 @@ mod tests {
         assert_eq!(tokens[0].kind, TokenKind::Int);
         assert_eq!(tokens[1].kind, TokenKind::Int); // lexer skips the bad char and continues
         assert_eq!(tokens[2].kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn empty_input_yields_only_eof() {
+        let (tokens, diags) = lex("");
+        assert!(diags.is_empty());
+        assert_eq!(
+            tokens,
+            vec![Token {
+                kind: TokenKind::Eof,
+                span: Span::new(0, 0),
+                text: String::new()
+            }]
+        );
+    }
+
+    #[test]
+    fn incomplete_number_at_eof_does_not_panic() {
+        // A trailing `.` with no following digit is not part of the number;
+        // it falls through to the unknown-char diagnostic path.
+        let (tokens, diags) = lex("3.");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Int);
+        assert_eq!(tokens[0].text, "3");
+        assert_eq!(tokens[1].kind, TokenKind::Eof);
+
+        // A trailing `e` with no exponent digits backtracks out of the
+        // number and is re-lexed as a separate identifier.
+        let (tokens, diags) = lex("1e");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(tokens[0].kind, TokenKind::Int);
+        assert_eq!(tokens[0].text, "1");
+        assert_eq!(tokens[1].kind, TokenKind::Ident);
+        assert_eq!(tokens[1].text, "e");
+        assert_eq!(tokens[2].kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn multibyte_char_at_end_of_input_does_not_panic() {
+        // U+2019 (RIGHT SINGLE QUOTATION MARK, 3 bytes in UTF-8) sits right
+        // at EOF, exercising the two-char-operator lookahead's end-of-slice
+        // bounds check as well as the single-char fallback advancement.
+        let (tokens, diags) = lex("x\u{2019}");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Ident);
+        assert_eq!(tokens[0].text, "x");
+        assert_eq!(tokens[1].kind, TokenKind::Eof);
     }
 }
