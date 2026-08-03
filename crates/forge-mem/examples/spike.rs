@@ -31,7 +31,12 @@ fn main() {
                 0,
             )
         } as *mut u8;
-        assert_ne!(p as isize, -1, "mmap MAP_JIT failed: {} — is the binary codesigned with entitlements.plist?", std::io::Error::last_os_error());
+        assert_ne!(
+            p as isize,
+            -1,
+            "mmap MAP_JIT failed: {} — is the binary codesigned with entitlements.plist?",
+            std::io::Error::last_os_error()
+        );
         p
     };
 
@@ -52,7 +57,12 @@ fn main() {
                 0,
             )
         } as *mut u8;
-        assert_ne!(p as isize, -1, "mmap failed: {}", std::io::Error::last_os_error());
+        assert_ne!(
+            p as isize,
+            -1,
+            "mmap failed: {}",
+            std::io::Error::last_os_error()
+        );
         p
     };
 
@@ -124,7 +134,12 @@ fn main() {
         // what makes this W^X: the page is never writable and executable
         // at the same time.
         let rc = unsafe { libc::mprotect(mem as _, page, libc::PROT_READ | libc::PROT_EXEC) };
-        assert_eq!(rc, 0, "mprotect failed: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            rc,
+            0,
+            "mprotect failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     // SAFETY: this is the single most dangerous line in the file. `mem`
