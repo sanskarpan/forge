@@ -19,13 +19,19 @@ impl Diagnostic {
     pub fn error(message: impl Into<String>, span: Span, label: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            primary: Label { span, message: label.into() },
+            primary: Label {
+                span,
+                message: label.into(),
+            },
             secondary: Vec::new(),
         }
     }
 
     pub fn with_secondary(mut self, span: Span, message: impl Into<String>) -> Self {
-        self.secondary.push(Label { span, message: message.into() });
+        self.secondary.push(Label {
+            span,
+            message: message.into(),
+        });
         self
     }
 }

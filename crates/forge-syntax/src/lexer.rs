@@ -20,28 +20,44 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
         }
 
         if c.is_ascii_digit() {
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') { i += 1; }
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+                i += 1;
+            }
             let mut is_float = false;
-            if i < bytes.len() && bytes[i] == b'.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            if i < bytes.len()
+                && bytes[i] == b'.'
+                && i + 1 < bytes.len()
+                && bytes[i + 1].is_ascii_digit()
+            {
                 is_float = true;
                 i += 1;
-                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') { i += 1; }
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+                    i += 1;
+                }
             }
             if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
                 let save = i;
                 let mut j = i + 1;
-                if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') { j += 1; }
+                if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+                    j += 1;
+                }
                 if j < bytes.len() && bytes[j].is_ascii_digit() {
                     is_float = true;
                     i = j;
-                    while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
                 } else {
                     i = save;
                 }
             }
             let text: String = src[start..i].chars().filter(|&c| c != '_').collect();
             tokens.push(Token {
-                kind: if is_float { TokenKind::Float } else { TokenKind::Int },
+                kind: if is_float {
+                    TokenKind::Float
+                } else {
+                    TokenKind::Int
+                },
                 span: Span::new(start as u32, i as u32),
                 text,
             });
@@ -49,7 +65,9 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
         }
 
         if c.is_ascii_alphabetic() || c == '_' {
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
             let text = &src[start..i];
             let kind = match text {
                 "if" => TokenKind::If,
@@ -61,39 +79,65 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 "false" => TokenKind::False,
                 _ => TokenKind::Ident,
             };
-            tokens.push(Token { kind, span: Span::new(start as u32, i as u32), text: text.to_string() });
+            tokens.push(Token {
+                kind,
+                span: Span::new(start as u32, i as u32),
+                text: text.to_string(),
+            });
             continue;
         }
 
         if i + 1 < bytes.len() {
             let two = &src[i..i + 2];
             let two_kind = match two {
-                "==" => Some(TokenKind::EqEq), "!=" => Some(TokenKind::NotEq),
-                "<=" => Some(TokenKind::Le),   ">=" => Some(TokenKind::Ge),
-                "&&" => Some(TokenKind::AndAnd), "||" => Some(TokenKind::OrOr),
-                "<<" => Some(TokenKind::Shl),  ">>" => Some(TokenKind::Shr),
+                "==" => Some(TokenKind::EqEq),
+                "!=" => Some(TokenKind::NotEq),
+                "<=" => Some(TokenKind::Le),
+                ">=" => Some(TokenKind::Ge),
+                "&&" => Some(TokenKind::AndAnd),
+                "||" => Some(TokenKind::OrOr),
+                "<<" => Some(TokenKind::Shl),
+                ">>" => Some(TokenKind::Shr),
                 _ => None,
             };
             if let Some(kind) = two_kind {
-                tokens.push(Token { kind, span: Span::new(start as u32, (start + 2) as u32), text: String::new() });
+                tokens.push(Token {
+                    kind,
+                    span: Span::new(start as u32, (start + 2) as u32),
+                    text: String::new(),
+                });
                 i += 2;
                 continue;
             }
         }
 
         let kind = match c {
-            '(' => Some(TokenKind::LParen), ')' => Some(TokenKind::RParen),
-            ',' => Some(TokenKind::Comma), '@' => Some(TokenKind::At), '=' => Some(TokenKind::Assign),
-            '|' => Some(TokenKind::Pipe), '^' => Some(TokenKind::Caret), '&' => Some(TokenKind::Amp),
-            '<' => Some(TokenKind::Lt), '>' => Some(TokenKind::Gt),
-            '+' => Some(TokenKind::Plus), '-' => Some(TokenKind::Minus),
-            '*' => Some(TokenKind::Star), '/' => Some(TokenKind::Slash), '%' => Some(TokenKind::Percent),
-            '!' => Some(TokenKind::Bang), '~' => Some(TokenKind::Tilde),
+            '(' => Some(TokenKind::LParen),
+            ')' => Some(TokenKind::RParen),
+            ',' => Some(TokenKind::Comma),
+            '@' => Some(TokenKind::At),
+            '=' => Some(TokenKind::Assign),
+            '|' => Some(TokenKind::Pipe),
+            '^' => Some(TokenKind::Caret),
+            '&' => Some(TokenKind::Amp),
+            '<' => Some(TokenKind::Lt),
+            '>' => Some(TokenKind::Gt),
+            '+' => Some(TokenKind::Plus),
+            '-' => Some(TokenKind::Minus),
+            '*' => Some(TokenKind::Star),
+            '/' => Some(TokenKind::Slash),
+            '%' => Some(TokenKind::Percent),
+            '!' => Some(TokenKind::Bang),
+            '~' => Some(TokenKind::Tilde),
             _ => None,
         };
         match kind {
             Some(k) => {
-                tokens.push(Token { kind: k, span: Span::new(start as u32, (start + 1) as u32), text: String::new() });
+                tokens.push(Token {
+                    kind: k,
+                    span: Span::new(start as u32, (start + 1) as u32),
+                    text: String::new(),
+                });
                 i += 1;
             }
             None => {
@@ -107,7 +151,11 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
         }
     }
 
-    tokens.push(Token { kind: TokenKind::Eof, span: Span::new(bytes.len() as u32, bytes.len() as u32), text: String::new() });
+    tokens.push(Token {
+        kind: TokenKind::Eof,
+        span: Span::new(bytes.len() as u32, bytes.len() as u32),
+        text: String::new(),
+    });
     (tokens, diags)
 }
 
@@ -142,8 +190,17 @@ mod tests {
     fn keywords_and_idents() {
         assert_eq!(
             kinds("if then else let in x true false"),
-            vec![TokenKind::If, TokenKind::Then, TokenKind::Else, TokenKind::Let, TokenKind::In,
-                 TokenKind::Ident, TokenKind::True, TokenKind::False, TokenKind::Eof]
+            vec![
+                TokenKind::If,
+                TokenKind::Then,
+                TokenKind::Else,
+                TokenKind::Let,
+                TokenKind::In,
+                TokenKind::Ident,
+                TokenKind::True,
+                TokenKind::False,
+                TokenKind::Eof
+            ]
         );
     }
 
@@ -151,9 +208,18 @@ mod tests {
     fn multi_char_operators_before_single_char() {
         assert_eq!(
             kinds("== != <= >= && || << >> ="),
-            vec![TokenKind::EqEq, TokenKind::NotEq, TokenKind::Le, TokenKind::Ge,
-                 TokenKind::AndAnd, TokenKind::OrOr, TokenKind::Shl, TokenKind::Shr,
-                 TokenKind::Assign, TokenKind::Eof]
+            vec![
+                TokenKind::EqEq,
+                TokenKind::NotEq,
+                TokenKind::Le,
+                TokenKind::Ge,
+                TokenKind::AndAnd,
+                TokenKind::OrOr,
+                TokenKind::Shl,
+                TokenKind::Shr,
+                TokenKind::Assign,
+                TokenKind::Eof
+            ]
         );
     }
 
@@ -161,7 +227,13 @@ mod tests {
     fn bitwise_and_shift_tokens() {
         assert_eq!(
             kinds("& | ^ ~"),
-            vec![TokenKind::Amp, TokenKind::Pipe, TokenKind::Caret, TokenKind::Tilde, TokenKind::Eof]
+            vec![
+                TokenKind::Amp,
+                TokenKind::Pipe,
+                TokenKind::Caret,
+                TokenKind::Tilde,
+                TokenKind::Eof
+            ]
         );
     }
 
