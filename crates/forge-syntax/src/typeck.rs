@@ -74,6 +74,24 @@ impl<'a> Ctx<'a> {
     /// even though `n` isn't a direct operand of `>>`. Names containing `%`
     /// are let-locals (see `resolve.rs`), not parameters, and are skipped —
     /// their type comes directly from their value expression in `check`.
+    ///
+    /// `param_ty` is a single mutable slot per parameter, not a proper type
+    /// variable with unification: `constrain_param` unconditionally
+    /// overwrites, so when a parameter's usages disagree, the LAST-visited
+    /// constraint in AST traversal order wins pass 1's seeding — there is
+    /// no merge, no "first constraint wins", and no attempt to detect the
+    /// conflict here. Pass 2 then flags whichever usage disagrees with
+    /// that final choice, which may not be the usage a reader would
+    /// intuitively blame. For example, in `(x & 1) + (!x)`, `x & 1` is
+    /// visited first and tentatively seeds `x` as i64, but `!x` is visited
+    /// second and overwrites that to bool, so `x` ends up seeded as bool;
+    /// pass 2 then reports "expected I64, found Bool" pointing at the `x`
+    /// inside `x & 1` — the *earlier* usage in the source — even though
+    /// `!x` is the usage that actually won the seeding. No type error
+    /// slips through — the checker is still sound — but the blamed site is
+    /// an artifact of traversal order, not the "real" offender. This is
+    /// acceptable for a checker without full unification, but worth
+    /// knowing before debugging a confusing-looking type error.
     fn infer_expect(&mut self, idx: ExprIdx, expected: Option<Ty>) {
         match self.ast.get(idx).clone() {
             Expr::Ident(name) => {
@@ -341,5 +359,40 @@ mod tests {
         // though a let-local also happens to be named x.
         let t = typed("(let x = 1.0 in x) + x").unwrap();
         assert_eq!(t.params, vec![("x".to_string(), Ty::F64)]);
+    }
+
+    #[test]
+    fn eq_accepts_bool_operands() {
+        // Equality is legal on any matching-type pair, including bool —
+        // unlike ordering comparisons, which are numeric-only (see
+        // `lt_rejects_bool_operands` below).
+        assert!(typed("true == false").is_ok());
+    }
+
+    #[test]
+    fn lt_rejects_bool_operands() {
+        // `<`/`<=`/`>`/`>=` go through `expect_numeric`, so bool operands
+        // are a type error even though `==`/`!=` accept them.
+        let err = typed("true < false").unwrap_err();
+        assert_eq!(err.len(), 1);
+    }
+
+    #[test]
+    fn bitwise_op_rejects_float_operands() {
+        // `&`/`|`/`^`/`<<`/`>>` require i64 operands; f64 literals are a
+        // type error even though they're numeric. Both `1.0` and `2.0` are
+        // checked against I64 independently (`check_binary`'s BitAnd arm
+        // calls `expect` on lhs and rhs separately), so a bad operand on
+        // both sides reports two diagnostics, not one.
+        let err = typed("1.0 & 2.0").unwrap_err();
+        assert_eq!(err.len(), 2);
+        assert!(err.iter().all(|d| d.message.contains("I64")));
+    }
+
+    #[test]
+    fn unknown_intrinsic_is_a_type_error() {
+        let err = typed("bogus(1.0)").unwrap_err();
+        assert_eq!(err.len(), 1);
+        assert!(err[0].message.contains("unknown intrinsic"));
     }
 }
