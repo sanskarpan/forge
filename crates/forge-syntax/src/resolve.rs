@@ -195,4 +195,57 @@ mod tests {
             other => panic!("expected top-level Binary, got {other:?}"),
         }
     }
+
+    #[test]
+    fn let_value_referencing_same_name_binds_to_outer_scope() {
+        // let x = x + 1 in x — the x inside `value` must resolve to whatever
+        // x meant BEFORE this let (a free parameter here), not to the new
+        // binding being created, since the binding doesn't exist yet while
+        // its own initializer is evaluated.
+        let ast = resolved("let x = x + 1 in x");
+        let Expr::Let { name, value, body } = ast.get(ast.root) else {
+            panic!()
+        };
+        match ast.get(*value) {
+            Expr::Binary { lhs, .. } => {
+                // lhs must be the ORIGINAL "x" (the free param), not `name`.
+                assert_eq!(ast.get(*lhs), &Expr::Ident("x".to_string()));
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+        // body's x, by contrast, DOES refer to the new binding.
+        assert_eq!(ast.get(*body), &Expr::Ident(name.clone()));
+    }
+
+    #[test]
+    fn nested_let_value_referencing_same_name_binds_to_immediately_outer_let() {
+        // let x = 1 in let x = x + 1 in x — the inner let's `value` refers
+        // to `x` as bound by the OUTER let (whose value is `1`), not the
+        // free parameter and not the inner binding being created.
+        let ast = resolved("let x = 1 in let x = x + 1 in x");
+        let Expr::Let {
+            name: outer_name,
+            body: outer_body,
+            ..
+        } = ast.get(ast.root)
+        else {
+            panic!()
+        };
+        let Expr::Let {
+            name: inner_name,
+            value: inner_value,
+            body: inner_body,
+        } = ast.get(*outer_body)
+        else {
+            panic!()
+        };
+        assert_ne!(outer_name, inner_name);
+        match ast.get(*inner_value) {
+            Expr::Binary { lhs, .. } => {
+                assert_eq!(ast.get(*lhs), &Expr::Ident(outer_name.clone()));
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+        assert_eq!(ast.get(*inner_body), &Expr::Ident(inner_name.clone()));
+    }
 }
