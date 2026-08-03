@@ -91,4 +91,19 @@ mod tests {
         assert!(text.contains("sqrt"));
         assert!(text.contains("ret"));
     }
+
+    #[test]
+    fn multi_block_function_prints_block_headers() {
+        let (tokens, _) = lex("if x > 0.0 then x else -x");
+        let (ast, _) = parse(&tokens);
+        let typed = typecheck(resolve(ast)).unwrap();
+        let f = crate::lower::lower(&typed);
+        let text = print_function(&f);
+        assert!(text.contains("block0:"));
+        assert!(text.contains("block1:"));
+        assert!(text.contains("block2:"));
+        assert!(text.contains("block3:"));
+        assert!(text.contains("branch"));
+        assert!(text.contains("phi"));
+    }
 }
