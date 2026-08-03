@@ -9,6 +9,13 @@ use crate::ast::{Ast, Expr, ExprIdx};
 /// reuse a name get distinct renamed forms. Everything downstream —
 /// type-checking, IR lowering — can therefore treat a bare name as
 /// unambiguous: always the same parameter, or always the same local.
+///
+/// This exists because a naive scoped-lookup approach (walk enclosing
+/// scopes at use-sites, without ever renaming) gets `(let x = 1 in x) + x`
+/// wrong under the SSA-style variable resolution the IR builder uses
+/// downstream: the trailing `x` must resolve to the outer parameter, not
+/// to the let's `1`, and only physically distinct names make that
+/// unambiguous everywhere the name is used.
 pub fn resolve(mut ast: Ast) -> Ast {
     let mut counter = 0u32;
     let root = ast.root;
@@ -17,6 +24,9 @@ pub fn resolve(mut ast: Ast) -> Ast {
 }
 
 fn rename(ast: &mut Ast, idx: ExprIdx, scope: &mut Vec<(String, String)>, counter: &mut u32) {
+    // `.clone()` here (and on `unique` below) is only to release the borrow
+    // on `ast.exprs` before recursing into a call that needs `&mut ast`;
+    // it carries no correctness weight of its own.
     match ast.exprs[idx.index()].clone() {
         Expr::Ident(name) => {
             if let Some((_, unique)) = scope.iter().rev().find(|(orig, _)| *orig == name) {
@@ -45,9 +55,16 @@ fn rename(ast: &mut Ast, idx: ExprIdx, scope: &mut Vec<(String, String)>, counte
             scope.push((name, unique.clone()));
             rename(ast, body, scope, counter);
             scope.pop();
-            if let Expr::Let { name: n, .. } = &mut ast.exprs[idx.index()] {
-                *n = unique;
-            }
+            // `value` and `body` are unchanged `Copy` indices (only the
+            // nodes they point to were mutated above), so this write-back
+            // is infallible by construction — a direct struct literal
+            // instead of a re-match-and-patch avoids a silent no-op if
+            // that invariant is ever broken by a future refactor.
+            ast.exprs[idx.index()] = Expr::Let {
+                name: unique,
+                value,
+                body,
+            };
         }
         Expr::Float(_) | Expr::Int(_) | Expr::Bool(_) => {}
     }
