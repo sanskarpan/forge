@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: cargo build
+        run: cargo build --workspace
+      - name: cargo test
+        run: cargo test --workspace
+      - name: cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: codesign spike
+        run: |
+          cargo build --example spike -p forge-mem
+          codesign --entitlements entitlements.plist -s - target/debug/examples/spike
+      - name: run spike
+        run: ./target/debug/examples/spike
