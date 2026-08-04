@@ -1,5 +1,7 @@
 // crates/forge-opt/src/lib.rs
 
+pub mod fold;
+
 use forge_ir::Function;
 
 /// One optimization transform. `run` returns whether it changed the IR —
@@ -39,7 +41,7 @@ pub fn run_passes(f: &mut Function, passes: &mut [Box<dyn Pass>]) {
 /// SPEC.md §6.5 specifies: fold, simplify, strength-reduce, GVN, reassoc, DCE.
 pub fn optimize(f: &mut Function) {
     let mut passes: Vec<Box<dyn Pass>> = vec![
-        // Box::new(fold::ConstFold),              <- added by a later task
+        Box::new(fold::ConstFold),
         // Box::new(simplify::AlgebraicSimplify),  <- added by a later task
         // Box::new(strength::StrengthReduceShifts), Box::new(strength::MagicDivision), <- later tasks
         // Box::new(gvn::Gvn),                     <- added by a later task
