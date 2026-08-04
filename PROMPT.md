@@ -781,6 +781,23 @@ pub fn magic_signed(d: i64) -> MagicNumber {
     MagicNumber { multiplier: m, shift: p - 64 }
 }
 
+/// `apply_magic` needs `d` itself, not just the derived `MagicNumber` — this
+/// is easy to get wrong (an earlier draft of this doc omitted it). The
+/// classic sign-correction step ("add n back if d>0 and the multiplier came
+/// out negative; subtract n if d<0 and it came out positive") depends on
+/// d's OWN sign, which `m.multiplier`'s sign alone cannot always recover —
+/// concretely, `magic_signed(100)` and `magic_signed(-7)` both produce a
+/// negative multiplier, yet only the d=100 case needs the `+n` correction.
+/// Forgetting `d` here produces answers that are right for most divisors and
+/// silently wrong for specific others — exactly the "looks fine until a
+/// particular edge case" bug class this project is built around avoiding.
+fn apply_magic(n: i64, d: i64, m: &MagicNumber) -> i64 {
+    let q = ((n as i128 * m.multiplier as i128) >> (64 + m.shift)) as i64;
+    let q = if m.multiplier < 0 { q.wrapping_add(n) } else { q };
+    let q = if m.shift > 0 { q + (q >> 63) } else { q }; // round toward zero
+    if d > 0 { q } else { -q }
+}
+
 #[test]
 fn magic_division_is_exact() {
     // Must be exact for EVERY input, including i64::MIN — the case that breaks
@@ -788,13 +805,13 @@ fn magic_division_is_exact() {
     for d in [3i64, 5, 7, 10, 100, 1000, -3, -7, -100] {
         let m = magic_signed(d);
         for n in [0i64, 1, -1, 42, -42, i64::MAX, i64::MIN, i64::MAX - 1] {
-            assert_eq!(apply_magic(n, &m), n.wrapping_div(d),
+            assert_eq!(apply_magic(n, d, &m), n.wrapping_div(d),
                        "magic division wrong for {n} / {d}");
         }
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
         for _ in 0..100_000 {
             let n: i64 = rng.gen();
-            assert_eq!(apply_magic(n, &m), n.wrapping_div(d));
+            assert_eq!(apply_magic(n, d, &m), n.wrapping_div(d));
         }
     }
 }
