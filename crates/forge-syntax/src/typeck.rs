@@ -215,7 +215,12 @@ impl<'a> Ctx<'a> {
                 // the result is f64 and the i64 side gets widened via Inst::IToF at
                 // lowering time (see lower.rs's Binary arm). Deliberately scoped to
                 // arithmetic only -- comparisons/bitwise/logical/if-branches still
-                // require an exact type match; see docs/superpowers/specs/2026-08-03-phase-0-3-slice-design.md.
+                // require an exact type match, because arithmetic is where the
+                // surface language actually produces the mismatch (e.g. `x + 1`)
+                // and widening there has one obvious meaning, whereas widening
+                // comparisons/branches is a different, unification-like question
+                // with no current example motivating it; see SPEC.md's "Type
+                // system" section for the full rationale.
                 match (lt, rt) {
                     (Ty::F64, _) | (_, Ty::F64) => Ty::F64,
                     _ => lt,

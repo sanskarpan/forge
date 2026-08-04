@@ -56,11 +56,12 @@ fn lower_ty(t: AstTy) -> Ty {
     }
 }
 
-/// Implicit i64 -> f64 widening (SPEC §3), applied at the one place it's
-/// actually needed: `typeck`'s `check_binary`/`check_call` allow an i64
-/// operand where f64 is expected, so lowering must insert the conversion
-/// typeck implicitly promised. Only I64 needs coercion here -- Bool never
-/// reaches this because typeck already rejected it upstream.
+/// Implicit i64 -> f64 widening (SPEC §3). `typeck`'s `check_binary`/
+/// `check_call` allow an i64 operand where f64 is expected, so lowering must
+/// insert the conversion typeck implicitly promised; this helper is called
+/// from the three sites that need it (each `Binary` operand, and each `Call`
+/// argument). Only I64 needs coercion here -- Bool never reaches this
+/// because typeck already rejected it upstream.
 fn coerce_to_f64(
     b: &mut Builder,
     block: Block,
@@ -518,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_arithmetic_inserts_itof_for_the_integer_operand() {
+    fn mixed_i64_f64_arithmetic_inserts_itof_for_the_integer_operand() {
         let f = lowered("1 + 2.0");
         let itof_count = f
             .insts
@@ -541,13 +542,13 @@ mod tests {
     }
 
     #[test]
-    fn pure_i64_arithmetic_inserts_no_itof() {
+    fn pure_i64_arithmetic_needs_no_widening() {
         let f = lowered("1 + 2");
         assert!(!f.insts.iter().any(|i| matches!(i, Inst::IToF(_))));
     }
 
     #[test]
-    fn intrinsic_call_with_int_literal_arg_inserts_itof() {
+    fn intrinsic_call_widens_int_literal_arg() {
         let f = lowered("sqrt(4)");
         assert!(f.insts.iter().any(|i| matches!(i, Inst::IToF(_))));
         assert!(f.insts.iter().any(|i| matches!(i, Inst::Sqrt(_))));
