@@ -221,3 +221,75 @@ pub fn replace_in_inst(inst: &mut Inst, old: Value, new: Value) {
         Inst::ConstF64(_) | Inst::ConstI64(_) | Inst::ConstBool(_) | Inst::Param { .. } => {}
     }
 }
+
+/// Redirects every use of `old` to `new`, across BOTH instruction operands
+/// (via `replace_in_inst`) and terminator operands (`Return`'s value,
+/// `Branch`'s condition) — the gap `uses_of`/`replace_in_inst` alone don't
+/// cover (flagged during a prior code review) and load-bearing for the
+/// optimizer: GVN/DCE need to redirect a terminator's operand when the
+/// value it referenced gets CSE'd away.
+pub fn replace_value_everywhere(f: &mut Function, old: Value, new: Value) {
+    for inst in &mut f.insts {
+        replace_in_inst(inst, old, new);
+    }
+    for block in &mut f.blocks {
+        match &mut block.term {
+            Some(Terminator::Return(v)) => {
+                if *v == old {
+                    *v = new;
+                }
+            }
+            Some(Terminator::Branch { cond, .. }) => {
+                if *cond == old {
+                    *cond = new;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_syntax::span::Span;
+
+    fn hand_built_return_fn() -> Function {
+        // v0 = ConstF64(1.0), v1 = ConstF64(2.0), term: Return(v0)
+        Function {
+            insts: vec![Inst::ConstF64(1.0f64.to_bits()), Inst::ConstF64(2.0f64.to_bits())],
+            types: vec![Ty::F64, Ty::F64],
+            spans: vec![Span::new(0, 0), Span::new(0, 0)],
+            blocks: vec![BlockData {
+                insts: vec![Value(0), Value(1)],
+                term: Some(Terminator::Return(Value(0))),
+                preds: Default::default(),
+            }],
+            entry: Block(0),
+            params: vec![],
+        }
+    }
+
+    #[test]
+    fn replaces_return_terminator_operand() {
+        let mut f = hand_built_return_fn();
+        replace_value_everywhere(&mut f, Value(0), Value(1));
+        assert!(matches!(f.blocks[0].term, Some(Terminator::Return(v)) if v == Value(1)));
+    }
+
+    #[test]
+    fn replaces_branch_terminator_condition() {
+        let mut f = hand_built_return_fn();
+        f.blocks[0].term = Some(Terminator::Branch { cond: Value(0), then_: Block(0), else_: Block(0) });
+        replace_value_everywhere(&mut f, Value(0), Value(1));
+        assert!(matches!(f.blocks[0].term, Some(Terminator::Branch { cond, .. }) if cond == Value(1)));
+    }
+
+    #[test]
+    fn still_replaces_instruction_operands_via_existing_replace_in_inst() {
+        let mut f = hand_built_return_fn();
+        f.insts.push(Inst::Add(Value(0), Value(1))); // v2 = v0 + v1
+        replace_value_everywhere(&mut f, Value(0), Value(1));
+        assert!(matches!(f.insts[2], Inst::Add(a, b) if a == Value(1) && b == Value(1)));
+    }
+}

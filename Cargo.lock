@@ -88,6 +88,12 @@ dependencies = [
 [[package]]
 name = "forge-opt"
 version = "0.1.0"
+dependencies = [
+ "forge-ir",
+ "forge-syntax",
+ "proptest",
+ "rustc-hash",
+]
 
 [[package]]
 name = "forge-regalloc"
