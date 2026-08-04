@@ -22,7 +22,10 @@ pub fn run_passes(f: &mut Function, passes: &mut [Box<dyn Pass>]) {
             changed |= pass_changed;
             #[cfg(debug_assertions)]
             if let Err(e) = forge_ir::verify::verify(f) {
-                panic!("verifier failed after pass '{}' (round {round}): {e}", pass.name());
+                panic!(
+                    "verifier failed after pass '{}' (round {round}): {e}",
+                    pass.name()
+                );
             }
         }
         if !changed {
@@ -56,7 +59,10 @@ mod tests {
 
     fn trivial_function() -> Function {
         Function {
-            insts: vec![Inst::Param { index: 0, ty: Ty::F64 }],
+            insts: vec![Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            }],
             types: vec![Ty::F64],
             spans: vec![Span::new(0, 0)],
             blocks: vec![BlockData {
@@ -88,8 +94,10 @@ mod tests {
     fn driver_runs_to_fixed_point_and_stops() {
         let mut f = trivial_function();
         let calls = Rc::new(Cell::new(0));
-        let mut passes: Vec<Box<dyn Pass>> =
-            vec![Box::new(CountingPass { calls: calls.clone(), fire_times: 3 })];
+        let mut passes: Vec<Box<dyn Pass>> = vec![Box::new(CountingPass {
+            calls: calls.clone(),
+            fire_times: 3,
+        })];
         run_passes(&mut f, &mut passes);
         // Pass reports "changed" on calls 0,1,2 (3 times), then false on
         // call 3 -> the round-3 call is what makes changed=false, ending
@@ -101,8 +109,10 @@ mod tests {
     fn driver_caps_at_ten_rounds_even_if_always_changed() {
         let mut f = trivial_function();
         let calls = Rc::new(Cell::new(0));
-        let mut passes: Vec<Box<dyn Pass>> =
-            vec![Box::new(CountingPass { calls: calls.clone(), fire_times: u32::MAX })];
+        let mut passes: Vec<Box<dyn Pass>> = vec![Box::new(CountingPass {
+            calls: calls.clone(),
+            fire_times: u32::MAX,
+        })];
         run_passes(&mut f, &mut passes);
         assert_eq!(calls.get(), 10);
     }

@@ -239,10 +239,8 @@ pub fn replace_value_everywhere(f: &mut Function, old: Value, new: Value) {
                     *v = new;
                 }
             }
-            Some(Terminator::Branch { cond, .. }) => {
-                if *cond == old {
-                    *cond = new;
-                }
+            Some(Terminator::Branch { cond, .. }) if *cond == old => {
+                *cond = new;
             }
             _ => {}
         }
@@ -257,7 +255,10 @@ mod tests {
     fn hand_built_return_fn() -> Function {
         // v0 = ConstF64(1.0), v1 = ConstF64(2.0), term: Return(v0)
         Function {
-            insts: vec![Inst::ConstF64(1.0f64.to_bits()), Inst::ConstF64(2.0f64.to_bits())],
+            insts: vec![
+                Inst::ConstF64(1.0f64.to_bits()),
+                Inst::ConstF64(2.0f64.to_bits()),
+            ],
             types: vec![Ty::F64, Ty::F64],
             spans: vec![Span::new(0, 0), Span::new(0, 0)],
             blocks: vec![BlockData {
@@ -280,9 +281,15 @@ mod tests {
     #[test]
     fn replaces_branch_terminator_condition() {
         let mut f = hand_built_return_fn();
-        f.blocks[0].term = Some(Terminator::Branch { cond: Value(0), then_: Block(0), else_: Block(0) });
+        f.blocks[0].term = Some(Terminator::Branch {
+            cond: Value(0),
+            then_: Block(0),
+            else_: Block(0),
+        });
         replace_value_everywhere(&mut f, Value(0), Value(1));
-        assert!(matches!(f.blocks[0].term, Some(Terminator::Branch { cond, .. }) if cond == Value(1)));
+        assert!(
+            matches!(f.blocks[0].term, Some(Terminator::Branch { cond, .. }) if cond == Value(1))
+        );
     }
 
     #[test]
