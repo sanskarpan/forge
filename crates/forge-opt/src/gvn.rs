@@ -62,18 +62,31 @@ fn dom_tree_children(idom: &[Option<Block>]) -> FxHashMap<Block, Vec<Block>> {
 /// hash table scoped to the current root-to-node path.
 ///
 /// A CSE hit does more than redirect the redundant instruction's uses: it
-/// also splices that instruction out of its block's `insts` list and
-/// overwrites its own `f.insts` slot with an inert, type-matched constant.
-/// Value indices are permanent (they double as `Vec` indices throughout the
-/// IR -- see `Builder::emit`), so the redundant instruction's slot can never
-/// be physically removed; merely redirecting its uses (the pattern
-/// `simplify.rs`/`fold.rs` use for their `UseExisting` rewrites) would leave
-/// a structurally-identical, now-argument-only duplicate sitting in
-/// `f.insts` forever, undetectable by anything that scans the raw
-/// instruction array rather than following live block membership. Splicing
-/// it out of `block.insts` also means it can never wrongly resurface as a
-/// spurious "canonical" definition if this pass runs again (fixed-point
-/// iteration re-invokes it every round).
+/// also overwrites its own `f.insts` slot with an inert, type-matched
+/// constant, AND splices it out of its block's `insts` list. These two
+/// steps are not equally load-bearing:
+///
+/// - Overwriting the `f.insts` slot is REQUIRED. Value indices are
+///   permanent (they double as `Vec` indices throughout the IR -- see
+///   `Builder::emit`), so the redundant instruction's slot can never be
+///   physically removed; merely redirecting its uses (the pattern
+///   `simplify.rs`/`fold.rs` use for their `UseExisting` rewrites) would
+///   leave a structurally-identical, now-argument-only duplicate sitting in
+///   `f.insts` forever -- undetectable by `verify()`/`interp()` (which only
+///   follow live block membership) but very much still counted by anything
+///   that scans the raw instruction array, including this pass's own test
+///   helper (`count_op`, which does exactly that).
+/// - Splicing it out of `block.insts` is EXTRA hygiene, not strictly needed
+///   for `verify()` to pass (verify only ever looks at values reachable
+///   from a block's `insts`, and this Value has none left pointing to it
+///   either way). It's done anyway because it's cheap and it forecloses a
+///   real, if non-unsound, footgun: without it, the dead slot stays visible
+///   to a *later* preorder visit of the *same* block (this pass re-runs
+///   every fixed-point round), where it could wrongly resurface as a
+///   "canonical" definition for some later CSE hit -- correct per `verify()`
+///   but a wasteful, confusing one to debug. Verified empirically (dumped
+///   IR before/after on several cases, including this file's
+///   multi-level-dominator-chain test) rather than assumed.
 fn visit(
     block: Block,
     f: &mut Function,
@@ -251,6 +264,28 @@ mod tests {
     fn cse_result_still_passes_the_verifier() {
         let mut f = lowered("(a + b) * (a + b) + sqrt(a + b)");
         Gvn.run(&mut f);
+        assert!(forge_ir::verify::verify(&f).is_ok());
+    }
+
+    #[test]
+    fn cses_across_a_multi_level_dominator_chain() {
+        // Outer x*x at entry; nested if-in-if where the innermost then-branch
+        // recomputes x*x -- two dominator levels down from entry (entry ->
+        // outer-then -> inner-then). All 4 tests above exercise only a
+        // single block or a 2-block tree (entry+child, or two siblings);
+        // none stress the "insert on the way down, remove on the way back
+        // up" recursion across a genuine grandparent -> parent -> child
+        // chain, which is exactly what could silently regress to a
+        // shallow/flat table without a test noticing. Must CSE.
+        let mut f = lowered("x * x + (if x > 0.0 then (if y > 0.0 then x * x else 1.0) else 2.0)");
+        let before = count_op(&f, |i| matches!(i, Inst::Mul(_, _)));
+        assert_eq!(before, 2, "sanity: two separate x*x before GVN");
+        Gvn.run(&mut f);
+        let after = count_op(&f, |i| matches!(i, Inst::Mul(_, _)));
+        assert_eq!(
+            after, 1,
+            "the nested x*x should CSE against entry's, two dominator levels up"
+        );
         assert!(forge_ir::verify::verify(&f).is_ok());
     }
 }
