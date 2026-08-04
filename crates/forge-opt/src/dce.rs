@@ -14,6 +14,15 @@ use forge_ir::*;
 
 use crate::Pass;
 
+/// Caveat for future codegen: an unused function parameter's `Inst::Param`
+/// is a normal dead instruction from DCE's point of view, so DCE can (and
+/// will) sweep it out of `block.insts` if nothing in the body ever uses it.
+/// `f.params` -- the function's signature metadata -- is untouched by DCE
+/// either way, so the parameter stays declared there even after its
+/// `Inst::Param` is gone from `block.insts`. A future codegen pass must
+/// therefore source its parameter list from `f.params` directly, not by
+/// scanning `block.insts` for `Inst::Param` entries, or it will silently
+/// fail to materialize an unused-but-declared parameter.
 pub struct Dce;
 
 impl Pass for Dce {
