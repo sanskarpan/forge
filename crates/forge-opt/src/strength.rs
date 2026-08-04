@@ -1,0 +1,440 @@
+// crates/forge-opt/src/strength.rs
+
+use forge_ir::*;
+use forge_syntax::span::Span;
+
+/// Strength-reduces three i64-only patterns where the second (or, for `Mul`,
+/// either) operand is a literal power of two:
+///
+/// - `x * 2^k -> x << k`
+/// - `x / 2^k -> (x + ((x >> 63) & (2^k - 1))) >> k`   (signed rounding fixup)
+/// - `x % 2^k -> x - (q << k)`, reusing the corrected `q` from the division
+///   rule above
+///
+/// All three are naturally scoped to i64: the power-of-two check below only
+/// matches when the relevant operand is a literal `Inst::ConstI64`, which an
+/// f64-typed `Div`/`Mul`/`Rem` never has (its operands are `ConstF64` or
+/// something that resolves to f64) — no explicit `Ty` check is needed.
+///
+/// ## Why division needs a fixup at all
+///
+/// Truncating division (what this language's `/` is, matching Rust/C) rounds
+/// toward zero. Arithmetic shift right rounds toward negative infinity.
+/// These agree for non-negative `x` but disagree for negative `x`:
+/// `-7 / 2 == -3` (truncating) but `-7 >> 1 == -4` (arithmetic shift, floors
+/// toward -inf). The fix (the standard sequence GCC/LLVM emit): add a bias
+/// of `2^k - 1` before shifting, but ONLY when `x` is negative — otherwise
+/// the bias would incorrectly perturb an already-exact or positive result.
+/// `x >> 63` (arithmetic) is exactly that conditional: it's all-1-bits
+/// (-1i64) when `x < 0` and all-0-bits (0i64) when `x >= 0`, so ANDing it
+/// with `2^k - 1` yields the bias only in the negative case, and zero
+/// otherwise. This is provably correct (not just empirically observed) —
+/// see the design doc's "Strength reduction" section — but is exactly the
+/// kind of arithmetic that's easy to get subtly wrong, which is why the test
+/// module below exhaustively checks both signs and `i64::MIN`/`i64::MAX`
+/// rather than trusting the derivation alone.
+///
+/// ## Why remainder is NOT `x & (2^k - 1)`
+///
+/// That mask computes the EUCLIDEAN remainder (always non-negative), but
+/// this language's `%` is truncating (remainder's sign follows the
+/// dividend), matching `/`'s rounding. `-7 % 4 == -3` (truncating) but
+/// `-7 & 3 == 1` (masking) — these disagree for every negative `x` that
+/// isn't an exact multiple. SPEC.md §6.3 documents this exact bug. Instead
+/// we compute the remainder from the identity `x == q*d + r` using the
+/// ALREADY-CORRECTED `q` from the division rule: `r = x - (q << k)`. This is
+/// correct by construction (it's just that defining identity, rearranged),
+/// not a separately-derived bit trick, at the cost of a couple more
+/// instructions than the naive mask.
+pub struct StrengthReduceShifts;
+
+impl crate::Pass for StrengthReduceShifts {
+    fn name(&self) -> &'static str {
+        "strength-reduce-shifts"
+    }
+    fn run(&mut self, f: &mut Function) -> bool {
+        let mut changed = false;
+        for block_idx in 0..f.blocks.len() {
+            let block = Block(block_idx as u32);
+            let mut pos = 0usize;
+            while pos < f.blocks[block.0 as usize].insts.len() {
+                let v = f.blocks[block.0 as usize].insts[pos];
+                let span = f.spans[v.0 as usize];
+                let next_pos = match f.insts[v.0 as usize].clone() {
+                    Inst::Mul(a, b) => mul_pow2(f, block, pos, v, a, b, span),
+                    Inst::Div(a, b) => div_pow2(f, block, pos, v, a, b, span),
+                    Inst::Rem(a, b) => rem_pow2(f, block, pos, v, a, b, span),
+                    _ => None,
+                };
+                if next_pos.is_some() {
+                    changed = true;
+                }
+                pos = next_pos.unwrap_or(pos + 1);
+            }
+        }
+        changed
+    }
+}
+
+/// `n == 2^k` for some `k` in `1..63`? `k == 0` (`n == 1`) and `n == 0` are
+/// deliberately excluded — both are already handled by `simplify.rs`'s
+/// `x * 1 -> x` / `x * 0 -> 0` rules, and this pass only needs `k >= 1`.
+fn power_of_two_k(n: i64) -> Option<u32> {
+    if n <= 1 {
+        return None;
+    }
+    let u = n as u64;
+    if u.is_power_of_two() {
+        let k = u.trailing_zeros();
+        if (1..63).contains(&k) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// `Some(k)` if `v` is a literal `ConstI64` holding an exact power of two in
+/// `1..63`. Returning `None` for anything else (including a `ConstF64`) is
+/// exactly what keeps this pass naturally scoped to i64 — an f64 `Mul`/`Div`/
+/// `Rem` never has a `ConstI64` operand by construction.
+fn const_pow2_k(f: &Function, v: Value) -> Option<u32> {
+    match f.insts[v.0 as usize] {
+        Inst::ConstI64(n) => power_of_two_k(n),
+        _ => None,
+    }
+}
+
+/// Insert a new instruction into `block` at position `pos` (shifting
+/// everything at/after `pos` — including the value that used to sit there —
+/// one slot to the right) and return its freshly allocated `Value`. Unlike
+/// `Vec::push`, this lets us splice helper instructions in BEFORE an
+/// existing instruction whose own `Value` identity must be preserved (later
+/// code may already reference it), which is exactly what the div/rem
+/// sign-fixup sequences need: several new instructions have to be defined,
+/// in program order, before the position the original `Div`/`Rem` occupied.
+fn insert_before(
+    f: &mut Function,
+    block: Block,
+    pos: usize,
+    inst: Inst,
+    ty: Ty,
+    span: Span,
+) -> Value {
+    let v = Value(f.insts.len() as u32);
+    f.insts.push(inst);
+    f.types.push(ty);
+    f.spans.push(span);
+    f.blocks[block.0 as usize].insts.insert(pos, v);
+    v
+}
+
+fn mul_pow2(
+    f: &mut Function,
+    block: Block,
+    pos: usize,
+    v: Value,
+    a: Value,
+    b: Value,
+    span: Span,
+) -> Option<usize> {
+    let (x, k) = if let Some(k) = const_pow2_k(f, b) {
+        (a, k)
+    } else {
+        let k = const_pow2_k(f, a)?;
+        (b, k)
+    };
+    let k_const = insert_before(f, block, pos, Inst::ConstI64(k as i64), Ty::I64, span);
+    f.insts[v.0 as usize] = Inst::Shl(x, k_const);
+    Some(pos + 2) // the inserted k_const, plus the rewritten original
+}
+
+/// Emits the shared sign-fixup prefix used by both `x / 2^k` and `x % 2^k`:
+///
+/// ```text
+/// c63       = 63
+/// sign_mask = x >> 63           (arithmetic -- all-1s if x<0, all-0s else)
+/// mask      = 2^k - 1
+/// bias      = sign_mask & mask
+/// biased    = x + bias
+/// k_const   = k
+/// ```
+///
+/// Returns `(biased, k_const, pos)` where `pos` is the block position the
+/// ORIGINAL instruction (the one at the call site's `pos`) now occupies,
+/// after being shifted right by every instruction inserted here.
+fn emit_div_bias(
+    f: &mut Function,
+    block: Block,
+    mut pos: usize,
+    x: Value,
+    k: u32,
+    span: Span,
+) -> (Value, Value, usize) {
+    let c63 = insert_before(f, block, pos, Inst::ConstI64(63), Ty::I64, span);
+    pos += 1;
+    let sign_mask = insert_before(f, block, pos, Inst::Sar(x, c63), Ty::I64, span);
+    pos += 1;
+    let mask = (1i64 << k) - 1;
+    let mask_const = insert_before(f, block, pos, Inst::ConstI64(mask), Ty::I64, span);
+    pos += 1;
+    let bias = insert_before(
+        f,
+        block,
+        pos,
+        Inst::And(sign_mask, mask_const),
+        Ty::I64,
+        span,
+    );
+    pos += 1;
+    let biased = insert_before(f, block, pos, Inst::Add(x, bias), Ty::I64, span);
+    pos += 1;
+    let k_const = insert_before(f, block, pos, Inst::ConstI64(k as i64), Ty::I64, span);
+    pos += 1;
+    (biased, k_const, pos)
+}
+
+fn div_pow2(
+    f: &mut Function,
+    block: Block,
+    pos: usize,
+    v: Value,
+    a: Value,
+    b: Value,
+    span: Span,
+) -> Option<usize> {
+    let k = const_pow2_k(f, b)?;
+    let (biased, k_const, pos_after) = emit_div_bias(f, block, pos, a, k, span);
+    f.insts[v.0 as usize] = Inst::Sar(biased, k_const);
+    Some(pos_after + 1)
+}
+
+fn rem_pow2(
+    f: &mut Function,
+    block: Block,
+    pos: usize,
+    v: Value,
+    a: Value,
+    b: Value,
+    span: Span,
+) -> Option<usize> {
+    let k = const_pow2_k(f, b)?;
+    let (biased, k_const, mut pos_after) = emit_div_bias(f, block, pos, a, k, span);
+    let q = insert_before(
+        f,
+        block,
+        pos_after,
+        Inst::Sar(biased, k_const),
+        Ty::I64,
+        span,
+    );
+    pos_after += 1;
+    let shifted = insert_before(f, block, pos_after, Inst::Shl(q, k_const), Ty::I64, span);
+    pos_after += 1;
+    f.insts[v.0 as usize] = Inst::Sub(a, shifted);
+    Some(pos_after + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Pass;
+    use forge_ir::interp::{interpret, RtValue};
+    use forge_syntax::lexer::lex;
+    use forge_syntax::parser::parse;
+    use forge_syntax::resolve::resolve;
+    use forge_syntax::typeck::typecheck;
+
+    fn lowered(src: &str) -> Function {
+        let (tokens, _) = lex(src);
+        let (ast, _) = parse(&tokens);
+        let typed = typecheck(resolve(ast)).expect("should type-check");
+        forge_ir::lower::lower(&typed)
+    }
+
+    /// `n * 8` / `n / 8` / `n % 8` alone do NOT force `n: I64` -- a sibling
+    /// I64 literal doesn't constrain the OTHER Add/Sub/Mul/Div/Rem operand
+    /// (see `typeck::Ctx::infer_expect`'s `Add | Sub | Mul | Div | Rem =>
+    /// expected` passthrough with `expected == None` at the top level), so
+    /// `n` defaults to F64 and the literal gets widened via `IToF` instead.
+    /// Confirmed empirically (see `bare_n_without_forcing_infers_as_f64`
+    /// below) -- same issue Task 3 (`AlgebraicSimplify`) hit. `& -1` forces
+    /// I64 top-down through the pass-through inference without disturbing
+    /// which SSA `Value` `n` resolves to.
+    fn lowered_i64(src: &str) -> Function {
+        lowered(&format!("({src}) & -1"))
+    }
+
+    #[test]
+    fn bare_n_without_forcing_infers_as_f64() {
+        // Confirms the type-inference gotcha before trusting any other test
+        // in this module: `n * 8` unforced really does type `n` as F64 (its
+        // sole param comes back F64), so feeding it an `RtValue::I64` would
+        // panic in `interpret` -- exactly the trap the `lowered_i64` helper
+        // above exists to avoid.
+        let f = lowered("n * 8");
+        assert_eq!(f.params, vec![("n".to_string(), Ty::F64)]);
+
+        let forced = lowered_i64("n * 8");
+        assert_eq!(forced.params, vec![("n".to_string(), Ty::I64)]);
+    }
+
+    fn run_both(src: &str, n: i64) -> (RtValue, RtValue) {
+        let unreduced = lowered_i64(src);
+        let expected = interpret(&unreduced, &[RtValue::I64(n)]);
+        let mut reduced = lowered_i64(src);
+        StrengthReduceShifts.run(&mut reduced);
+        let actual = interpret(&reduced, &[RtValue::I64(n)]);
+        (expected, actual)
+    }
+
+    #[test]
+    fn mul_by_power_of_two_matches_for_positive_and_negative_n() {
+        for n in [0i64, 1, -1, 7, -7, i64::MIN, i64::MAX] {
+            let (e, a) = run_both("n * 8", n);
+            assert_eq!(e, a, "n={n}");
+        }
+    }
+
+    #[test]
+    fn mul_fires_and_becomes_a_shift() {
+        let mut f = lowered_i64("n * 8");
+        let changed = StrengthReduceShifts.run(&mut f);
+        assert!(changed);
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::Shl(..))));
+        assert!(!f.insts.iter().any(|i| matches!(i, Inst::Mul(..))));
+    }
+
+    #[test]
+    fn mul_fires_with_constant_on_the_left_too() {
+        let mut f = lowered_i64("8 * n");
+        let changed = StrengthReduceShifts.run(&mut f);
+        assert!(
+            changed,
+            "constant-on-the-left Mul should also strength-reduce"
+        );
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::Shl(..))));
+    }
+
+    #[test]
+    fn div_by_power_of_two_matches_wrapping_div_including_negative_dividends() {
+        // THE test that catches a naive (unfixed) shift implementation:
+        // truncating division and arithmetic shift disagree here.
+        for n in [
+            0i64,
+            1,
+            -1,
+            7,
+            -7,
+            8,
+            -8,
+            15,
+            -15,
+            i64::MIN,
+            i64::MAX,
+            -100_000,
+        ] {
+            let (e, a) = run_both("n / 8", n);
+            assert_eq!(e, a, "n={n}: expected {e:?}, got {a:?}");
+        }
+    }
+
+    #[test]
+    fn rem_by_power_of_two_matches_wrapping_rem_including_negative_dividends() {
+        // THE test that catches the SPEC.md-documented masking bug: a naive
+        // `x & (2^k - 1)` implementation would fail exactly here.
+        for n in [
+            0i64,
+            1,
+            -1,
+            7,
+            -7,
+            8,
+            -8,
+            15,
+            -15,
+            i64::MIN,
+            i64::MAX,
+            -100_000,
+        ] {
+            let (e, a) = run_both("n % 8", n);
+            assert_eq!(e, a, "n={n}: expected {e:?}, got {a:?}");
+        }
+    }
+
+    #[test]
+    fn div_fires_and_removes_the_original_div() {
+        let mut f = lowered_i64("n / 8");
+        let changed = StrengthReduceShifts.run(&mut f);
+        assert!(changed);
+        assert!(!f.insts.iter().any(|i| matches!(i, Inst::Div(..))));
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::Sar(..))));
+    }
+
+    #[test]
+    fn rem_fires_and_removes_the_original_rem() {
+        let mut f = lowered_i64("n % 8");
+        let changed = StrengthReduceShifts.run(&mut f);
+        assert!(changed);
+        assert!(!f.insts.iter().any(|i| matches!(i, Inst::Rem(..))));
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::Sub(..))));
+    }
+
+    #[test]
+    fn does_not_fire_on_non_power_of_two_divisor() {
+        let mut f = lowered_i64("n / 7");
+        let changed = StrengthReduceShifts.run(&mut f);
+        assert!(
+            !changed,
+            "7 is not a power of 2 -- magic division handles this, not shifts (a later task)"
+        );
+    }
+
+    #[test]
+    fn does_not_fire_on_non_power_of_two_divisor_for_rem() {
+        let mut f = lowered_i64("n % 7");
+        let changed = StrengthReduceShifts.run(&mut f);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn does_not_fire_on_f64_division() {
+        // f64 Div/Rem/Mul never have a ConstI64 operand, so this pass must
+        // decline naturally -- no explicit Ty check needed. Regression test
+        // for that "falls out naturally" claim.
+        let mut f = lowered("x / 8.0");
+        let changed = StrengthReduceShifts.run(&mut f);
+        assert!(
+            !changed,
+            "f64 division must never be strength-reduced by this pass"
+        );
+    }
+
+    #[test]
+    fn does_not_fire_on_c_equal_to_one_or_zero() {
+        // Already handled by simplify.rs; this pass should leave them alone
+        // (power_of_two_k excludes n<=1 by construction).
+        let mut f1 = lowered_i64("n * 1");
+        assert!(!StrengthReduceShifts.run(&mut f1));
+        let mut f0 = lowered_i64("n * 0");
+        assert!(!StrengthReduceShifts.run(&mut f0));
+    }
+
+    #[test]
+    fn verifies_after_rewrite() {
+        // The rewritten IR must still pass the same-block-position-agnostic
+        // dominance verifier -- and, more importantly for THIS pass, the
+        // helper instructions must genuinely precede the rewritten
+        // instruction in `block.insts` order (interp.rs iterates instructions
+        // in that literal order and panics on a used-before-defined value,
+        // which would catch an `insert_before` position bug that the
+        // dominance-only verifier itself cannot).
+        for src in ["n * 8", "n / 8", "n % 8"] {
+            let mut f = lowered_i64(src);
+            StrengthReduceShifts.run(&mut f);
+            assert!(
+                forge_ir::verify::verify(&f).is_ok(),
+                "verify failed for {src}"
+            );
+        }
+    }
+}

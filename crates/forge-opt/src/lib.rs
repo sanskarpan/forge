@@ -2,6 +2,7 @@
 
 pub mod fold;
 pub mod simplify;
+pub mod strength;
 
 use forge_ir::Function;
 
@@ -44,7 +45,8 @@ pub fn optimize(f: &mut Function) {
     let mut passes: Vec<Box<dyn Pass>> = vec![
         Box::new(fold::ConstFold),
         Box::new(simplify::AlgebraicSimplify),
-        // Box::new(strength::StrengthReduceShifts), Box::new(strength::MagicDivision), <- later tasks
+        Box::new(strength::StrengthReduceShifts),
+        // Box::new(strength::MagicDivision), <- later task
         // Box::new(gvn::Gvn),                     <- added by a later task
         // Box::new(reassoc::Reassociate),          <- added by a later task (before DCE — reassoc can expose new DCE opportunities)
         // Box::new(dce::Dce),                     <- added by a later task
