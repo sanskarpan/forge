@@ -210,8 +210,16 @@ impl<'a> Ctx<'a> {
         match op {
             Add | Sub | Mul | Div | Rem => {
                 self.expect_numeric(lt, lspan);
-                self.expect(rt, lt, rspan);
-                lt
+                self.expect_numeric(rt, rspan);
+                // Implicit i64 -> f64 widening (SPEC §3): if either operand is f64,
+                // the result is f64 and the i64 side gets widened via Inst::IToF at
+                // lowering time (see lower.rs's Binary arm). Deliberately scoped to
+                // arithmetic only -- comparisons/bitwise/logical/if-branches still
+                // require an exact type match; see docs/superpowers/specs/2026-08-03-phase-0-3-slice-design.md.
+                match (lt, rt) {
+                    (Ty::F64, _) | (_, Ty::F64) => Ty::F64,
+                    _ => lt,
+                }
             }
             BitAnd | BitOr | BitXor | Shl | Shr => {
                 self.expect(lt, Ty::I64, lspan);
@@ -284,7 +292,12 @@ impl<'a> Ctx<'a> {
                 }
                 for &a in args {
                     let t = self.check(a);
-                    self.expect(t, Ty::F64, self.ast.span(a));
+                    // Widen i64 args to f64 like arithmetic does (SPEC §3) -- every
+                    // intrinsic's signature is f64-only, so an i64 arg is always
+                    // unambiguous to widen rather than reject.
+                    if t != Ty::F64 && t != Ty::I64 {
+                        self.expect(t, Ty::F64, self.ast.span(a));
+                    }
                 }
                 *ret
             }
@@ -394,5 +407,33 @@ mod tests {
         let err = typed("bogus(1.0)").unwrap_err();
         assert_eq!(err.len(), 1);
         assert!(err[0].message.contains("unknown intrinsic"));
+    }
+
+    #[test]
+    fn mixed_i64_f64_arithmetic_widens_without_error() {
+        let t = typed("1 + 2.0").unwrap();
+        assert_eq!(t.types[t.ast.root.index()], Ty::F64);
+    }
+
+    #[test]
+    fn intrinsic_call_widens_i64_argument() {
+        let t = typed("sqrt(4)").unwrap();
+        assert_eq!(t.types[t.ast.root.index()], Ty::F64);
+    }
+
+    #[test]
+    fn same_type_i64_arithmetic_still_stays_i64() {
+        // Confirms widening doesn't accidentally kick in for a pure-i64 case.
+        let t = typed("1 + 2").unwrap();
+        assert_eq!(t.types[t.ast.root.index()], Ty::I64);
+    }
+
+    #[test]
+    fn let_bound_i64_widens_when_used_with_f64() {
+        // The let-local `t` is inferred I64 from its value `1`; using it in
+        // `t + 2.0` must still widen the whole expression to F64, exactly
+        // like a direct i64 literal would.
+        let t = typed("let t = 1 in t + 2.0").unwrap();
+        assert_eq!(t.types[t.ast.root.index()], Ty::F64);
     }
 }

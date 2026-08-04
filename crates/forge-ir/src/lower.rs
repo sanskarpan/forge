@@ -56,6 +56,25 @@ fn lower_ty(t: AstTy) -> Ty {
     }
 }
 
+/// Implicit i64 -> f64 widening (SPEC §3), applied at the one place it's
+/// actually needed: `typeck`'s `check_binary`/`check_call` allow an i64
+/// operand where f64 is expected, so lowering must insert the conversion
+/// typeck implicitly promised. Only I64 needs coercion here -- Bool never
+/// reaches this because typeck already rejected it upstream.
+fn coerce_to_f64(
+    b: &mut Builder,
+    block: Block,
+    val: Value,
+    ty: Ty,
+    span: forge_syntax::span::Span,
+) -> Value {
+    if ty == Ty::I64 {
+        b.emit(block, Inst::IToF(val), Ty::F64, span)
+    } else {
+        val
+    }
+}
+
 /// Returns the value produced and the block that now holds it. `if` creates
 /// new blocks, so every caller threads the returned block forward instead of
 /// assuming `b.cur_block` is still what it was before the recursive call.
@@ -94,6 +113,25 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
             b.cur_block = block;
             let (r, block) = lower_expr(b, typed, rhs);
             b.cur_block = block;
+            // Implicit i64 -> f64 widening (SPEC §3): typeck's check_binary
+            // allows (F64,F64), (I64,F64), (F64,I64), and (I64,I64), yielding
+            // F64/F64/F64/I64 respectively. Only coerce when the overall
+            // result is F64 -- (I64,I64) must NOT be coerced, or pure integer
+            // arithmetic would silently become float arithmetic.
+            let (l, r) = if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
+            ) && ty == Ty::F64
+            {
+                let lty = lower_ty(typed.types[lhs.index()]);
+                let rty = lower_ty(typed.types[rhs.index()]);
+                (
+                    coerce_to_f64(b, block, l, lty, span),
+                    coerce_to_f64(b, block, r, rty, span),
+                )
+            } else {
+                (l, r)
+            };
             let inst = lower_binary(op, l, r);
             (b.emit(block, inst, ty, span), block)
         }
@@ -103,9 +141,10 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
             let mut block = block;
             for a in &args {
                 let (v, blk) = lower_expr(b, typed, *a);
-                vals.push(v);
+                let arg_ty = lower_ty(typed.types[a.index()]);
                 block = blk;
                 b.cur_block = block;
+                vals.push(coerce_to_f64(b, block, v, arg_ty, span));
             }
             let inst = lower_call(&callee, &vals);
             (b.emit(block, inst, ty, span), block)
@@ -476,5 +515,63 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn mixed_arithmetic_inserts_itof_for_the_integer_operand() {
+        let f = lowered("1 + 2.0");
+        let itof_count = f
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::IToF(_)))
+            .count();
+        assert_eq!(
+            itof_count, 1,
+            "exactly one operand (the int literal) needs widening"
+        );
+        let add = f
+            .insts
+            .iter()
+            .find(|i| matches!(i, Inst::Add(_, _)))
+            .expect("an Add exists");
+        let Inst::Add(l, r) = add else { unreachable!() };
+        // Both operands feeding the Add must be f64-typed post-coercion.
+        assert_eq!(f.types[l.0 as usize], Ty::F64);
+        assert_eq!(f.types[r.0 as usize], Ty::F64);
+    }
+
+    #[test]
+    fn pure_i64_arithmetic_inserts_no_itof() {
+        let f = lowered("1 + 2");
+        assert!(!f.insts.iter().any(|i| matches!(i, Inst::IToF(_))));
+    }
+
+    #[test]
+    fn intrinsic_call_with_int_literal_arg_inserts_itof() {
+        let f = lowered("sqrt(4)");
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::IToF(_))));
+        assert!(f.insts.iter().any(|i| matches!(i, Inst::Sqrt(_))));
+    }
+
+    #[test]
+    fn let_bound_i64_widens_with_one_itof_when_used_with_f64() {
+        let f = lowered("let t = 1 in t + 2.0");
+        let itof_count = f
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::IToF(_)))
+            .count();
+        assert_eq!(
+            itof_count, 1,
+            "the let-bound i64 local must be widened exactly once"
+        );
+        let add = f
+            .insts
+            .iter()
+            .find(|i| matches!(i, Inst::Add(_, _)))
+            .expect("an Add exists");
+        let Inst::Add(l, r) = add else { unreachable!() };
+        assert_eq!(f.types[l.0 as usize], Ty::F64);
+        assert_eq!(f.types[r.0 as usize], Ty::F64);
     }
 }

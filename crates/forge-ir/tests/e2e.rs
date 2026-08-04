@@ -71,3 +71,10 @@ fn nan_producing_expression() {
     let r = eval("x / y", &[RtValue::F64(0.0), RtValue::F64(0.0)]);
     assert!(matches!(r, RtValue::F64(v) if v.is_nan()));
 }
+
+#[test]
+fn mixed_i64_f64_widening_end_to_end() {
+    // x is f64 (default inference); `1` is an i64 literal that must widen.
+    let r = eval("x + 1", &[RtValue::F64(2.5)]);
+    assert_eq!(r, RtValue::F64(3.5));
+}
