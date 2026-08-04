@@ -113,6 +113,8 @@ n / 7                                   # → magic-number multiply
 
 Deliberately minimal: `f64`, `i64`, `bool`, plus `vec<f64, N>` / `vec<i64, N>` introduced by the vectorizer. Implicit widening `i64 → f64` where unambiguous; everything else is a type error with a span.
 
+"Unambiguous" is scoped narrowly, not "anywhere an f64 and an i64 meet": it applies to **arithmetic operators** (`+ - * / %`) and **intrinsic call arguments** (every intrinsic is f64-only, so an i64 argument always widens rather than errors). It deliberately does **not** apply to comparisons (`== != < <= > >=`), bitwise/shift/logical operators (already i64-or-bool-only by design, §3 "Operators & precedence"), or `if`/`else` branch matching — those keep requiring an exact type match. The reason arithmetic gets widening and comparisons/branches don't: arithmetic is where the surface language actually produces the mismatch in practice (an integer literal like `1` next to an `f64` variable, e.g. `x + 1`), and widening there has one obvious meaning (compute in `f64`). Extending the same silent-coercion behavior to comparisons or branch unification is a different, unification-like design question — with no current example in this spec motivating it — so it's left as a deliberate non-goal rather than an oversight to "finish" later.
+
 ### Intrinsics
 
 `sqrt` `abs` `min` `max` `floor` `ceil` `round` `trunc` `sin` `cos` `tan` `exp` `log` `pow` `fma`
