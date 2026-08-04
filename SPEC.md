@@ -410,6 +410,11 @@ const RULES: &[(&str, Validity)] = &[
     ("x * 0     → 0",       Validity::IntOnly),     // ⚠ f64: NaN*0 = NaN, Inf*0 = NaN
     ("x / 1     → x",       Validity::Always),
     ("x - x     → 0",       Validity::IntOnly),     // ⚠ f64: NaN - NaN = NaN
+    // ⚠ i64: this is only safe when x is KNOWN non-zero (e.g. a literal).
+    // For an arbitrary SSA value, "x / x → 1" would silently erase a
+    // runtime division-by-zero trap the unsimplified program would have
+    // hit at x = 0 — the optimizer deliberately does NOT implement this
+    // direction for that reason (see forge-opt's simplify.rs).
     ("x / x     → 1",       Validity::IntOnly),     // ⚠ f64: 0/0 = NaN
     ("x * 2     → x + x",   Validity::Always),
     ("x + x     → x * 2",   Validity::Always),

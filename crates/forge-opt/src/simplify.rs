@@ -47,15 +47,19 @@ enum Rewrite {
 }
 
 /// True if `v` is EXACTLY f64 negative zero — either a literal `ConstF64`
-/// with the sign bit set, or (one level of) `Neg` of a positive-zero
-/// literal. The latter matters because the surface language has no negative
-/// float literal syntax: `-0.0` always parses as `Unary(Neg, Float(0.0))`
-/// and lowers to `Inst::Neg(ConstF64(+0.0))`, not a literal negative-zero
-/// constant — `ConstFold` would collapse that to a literal, but this pass
-/// must also work standalone (it's driven directly in tests, and nothing
-/// requires `ConstFold` to have run first). Seeing through `Neg` here is
-/// exact, not approximate: negating a float constant is just a sign-bit
-/// flip, so `Neg(+0.0)` IS `-0.0`, bit for bit.
+/// with the sign bit set, or `Neg` of something that is (recursively,
+/// through any number of chained `Neg`s) a positive-zero. The latter
+/// matters because the surface language has no negative float literal
+/// syntax: `-0.0` always parses as `Unary(Neg, Float(0.0))` and lowers to
+/// `Inst::Neg(ConstF64(+0.0))`, not a literal negative-zero constant —
+/// `ConstFold` would collapse that to a literal, but this pass must also
+/// work standalone (it's driven directly in tests, and nothing requires
+/// `ConstFold` to have run first). Seeing through `Neg` here is exact, not
+/// approximate: negating a float constant is just a sign-bit flip, so
+/// `Neg(+0.0)` IS `-0.0`, bit for bit — and the mutual recursion with
+/// `is_f64_pos_zero` below correctly toggles through an arbitrary-depth
+/// chain of `Neg`s (each recursive call strictly decreases the operand's
+/// SSA index, which is acyclic in valid IR, so this always terminates).
 fn is_f64_neg_zero(f: &Function, v: Value) -> bool {
     match &f.insts[v.0 as usize] {
         Inst::ConstF64(bits) => {
@@ -300,9 +304,58 @@ mod tests {
     }
 
     #[test]
+    fn zero_times_x_is_also_simplified_for_i64_zero_on_the_left() {
+        // Commutative-operand coverage: `n * 0` (zero on the right) is
+        // covered above, but the Mul arm has a separate `is_i64_zero(f, a)`
+        // branch for zero on the LEFT that nothing was exercising.
+        let mut f_int = lowered_i64("0 * n");
+        assert!(
+            AlgebraicSimplify.run(&mut f_int),
+            "i64 0*x should simplify to 0 (zero on the left)"
+        );
+    }
+
+    #[test]
     fn double_negation_cancels() {
         let mut f = lowered("- -x");
         assert!(AlgebraicSimplify.run(&mut f));
+    }
+
+    #[test]
+    fn x_times_one_and_x_div_one_actually_fire_for_f64() {
+        // The differential-sample test below confirms these rules don't
+        // change the ANSWER, but never asserts they actually FIRE -- it
+        // would pass identically even if both rules silently stopped
+        // simplifying anything. Dedicated `changed` coverage here closes
+        // that gap.
+        let mut f_mul = lowered("x * 1.0");
+        assert!(AlgebraicSimplify.run(&mut f_mul), "x * 1.0 should simplify");
+
+        let mut f_div = lowered("x / 1.0");
+        assert!(AlgebraicSimplify.run(&mut f_div), "x / 1.0 should simplify");
+    }
+
+    #[test]
+    fn and_of_same_value_simplifies_to_that_value() {
+        // `&` forces I64 directly (no `lowered_i64` workaround needed), and
+        // both occurrences of `n` resolve to the same SSA Param value.
+        let mut f = lowered("n & n");
+        let changed = AlgebraicSimplify.run(&mut f);
+        assert!(changed, "x & x should simplify to x");
+        // Redirected to the existing Param value, not a new constant.
+        assert!(
+            matches!(f.blocks[f.entry.0 as usize].term, Some(Terminator::Return(v)) if matches!(f.insts[v.0 as usize], Inst::Param { .. }))
+        );
+    }
+
+    #[test]
+    fn xor_of_same_value_simplifies_to_zero() {
+        let mut f = lowered("n ^ n");
+        let changed = AlgebraicSimplify.run(&mut f);
+        assert!(changed, "x ^ x should simplify to 0");
+        assert!(
+            matches!(f.blocks[f.entry.0 as usize].term, Some(Terminator::Return(v)) if matches!(f.insts[v.0 as usize], Inst::ConstI64(0)))
+        );
     }
 
     #[test]
