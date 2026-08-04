@@ -46,7 +46,25 @@ pub fn optimize(f: &mut Function) {
         Box::new(fold::ConstFold),
         Box::new(simplify::AlgebraicSimplify),
         Box::new(strength::StrengthReduceShifts),
-        // Box::new(strength::MagicDivision), <- later task
+        // Magic-number division (Granlund & Montgomery): the MATH
+        // (`magic_signed`/`apply_magic` in strength.rs) is implemented and
+        // exhaustively tested, but there is deliberately no IR-rewriting
+        // pass wired in here -- our IR has no widening-multiply instruction
+        // to express the "high 64 bits of a 128-bit product" step in, so
+        // this belongs to a later phase (once codegen can emit a real
+        // `imul` producing a 128-bit result, or instruction selection calls
+        // `magic_signed` directly when lowering `Div` by a constant). See
+        // strength.rs's module-level comment above `magic_signed` for the
+        // full reasoning.
+        //
+        // `pow()` strength reduction (pow(x,2)->x*x, pow(x,0.5)->sqrt(x),
+        // pow(x,-1)->1.0/x): investigated and deliberately NOT implemented
+        // either -- all three candidate rules failed empirical bit-exactness
+        // verification against this platform's real libm `pow`. See
+        // strength.rs's module-level comment above the (removed)
+        // `PowStrengthReduce` section for the full investigation, including
+        // why an early, wrong version of that verification gave a false
+        // "it's fine" answer.
         // Box::new(gvn::Gvn),                     <- added by a later task
         // Box::new(reassoc::Reassociate),          <- added by a later task (before DCE — reassoc can expose new DCE opportunities)
         // Box::new(dce::Dce),                     <- added by a later task
