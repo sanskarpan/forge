@@ -1,5 +1,6 @@
 // crates/forge-opt/src/lib.rs
 
+pub mod dce;
 pub mod fold;
 pub mod gvn;
 pub mod simplify;
@@ -68,7 +69,7 @@ pub fn optimize(f: &mut Function) {
         // "it's fine" answer.
         Box::new(gvn::Gvn),
         // Box::new(reassoc::Reassociate),          <- added by a later task (before DCE — reassoc can expose new DCE opportunities)
-        // Box::new(dce::Dce),                     <- added by a later task
+        Box::new(dce::Dce),
     ];
     run_passes(f, &mut passes);
 }
