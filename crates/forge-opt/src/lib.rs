@@ -3,6 +3,7 @@
 pub mod dce;
 pub mod fold;
 pub mod gvn;
+pub mod reassoc;
 pub mod simplify;
 pub mod strength;
 
@@ -68,7 +69,11 @@ pub fn optimize(f: &mut Function) {
         // why an early, wrong version of that verification gave a false
         // "it's fine" answer.
         Box::new(gvn::Gvn),
-        // Box::new(reassoc::Reassociate),          <- added by a later task (before DCE — reassoc can expose new DCE opportunities)
+        // Reassociation runs after GVN (rebalancing can only help once
+        // common subexpressions are already merged) and before DCE (it
+        // leaves the original, now-dead chain behind for DCE to sweep —
+        // see reassoc.rs's module doc comment).
+        Box::new(reassoc::Reassociate),
         Box::new(dce::Dce),
     ];
     run_passes(f, &mut passes);
