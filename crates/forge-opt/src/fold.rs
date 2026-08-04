@@ -33,17 +33,17 @@ impl Pass for ConstFold {
     }
 }
 
-enum C {
+enum ConstVal {
     F64(f64),
     I64(i64),
     Bool(bool),
 }
 
-fn as_const(f: &Function, v: Value) -> Option<C> {
+fn as_const(f: &Function, v: Value) -> Option<ConstVal> {
     match &f.insts[v.0 as usize] {
-        Inst::ConstF64(bits) => Some(C::F64(f64::from_bits(*bits))),
-        Inst::ConstI64(n) => Some(C::I64(*n)),
-        Inst::ConstBool(b) => Some(C::Bool(*b)),
+        Inst::ConstF64(bits) => Some(ConstVal::F64(f64::from_bits(*bits))),
+        Inst::ConstI64(n) => Some(ConstVal::I64(*n)),
+        Inst::ConstBool(b) => Some(ConstVal::Bool(*b)),
         _ => None,
     }
 }
@@ -55,102 +55,128 @@ fn f64_inst(x: f64) -> Inst {
 fn try_fold(f: &Function, v: Value) -> Option<Inst> {
     match &f.insts[v.0 as usize] {
         Inst::Add(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::F64(x)), Some(C::F64(y))) => Some(f64_inst(x + y)),
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x.wrapping_add(y))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(x + y)),
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => {
+                Some(Inst::ConstI64(x.wrapping_add(y)))
+            }
             _ => None,
         },
         Inst::Sub(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::F64(x)), Some(C::F64(y))) => Some(f64_inst(x - y)),
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x.wrapping_sub(y))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(x - y)),
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => {
+                Some(Inst::ConstI64(x.wrapping_sub(y)))
+            }
             _ => None,
         },
         Inst::Mul(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::F64(x)), Some(C::F64(y))) => Some(f64_inst(x * y)),
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x.wrapping_mul(y))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(x * y)),
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => {
+                Some(Inst::ConstI64(x.wrapping_mul(y)))
+            }
             _ => None,
         },
         Inst::Div(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::F64(x)), Some(C::F64(y))) => Some(f64_inst(x / y)),
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x.wrapping_div(y))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(x / y)),
+            // Unlike f64 division, i64 division by zero has no well-defined
+            // result (`wrapping_div` panics on it — it only guards the
+            // i64::MIN / -1 overflow case, not divisor == 0). This code may
+            // be unreachable at runtime (e.g. behind a dead branch), so we
+            // must not crash the optimizer over it: just decline to fold
+            // and leave the Div instruction as-is.
+            (Some(ConstVal::I64(_)), Some(ConstVal::I64(0))) => None,
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => {
+                Some(Inst::ConstI64(x.wrapping_div(y)))
+            }
             _ => None,
         },
         Inst::Rem(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::F64(x)), Some(C::F64(y))) => Some(f64_inst(x % y)),
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x.wrapping_rem(y))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(x % y)),
+            // Same reasoning as Div above: rem-by-zero has no well-defined
+            // i64 result, so decline to fold rather than panic.
+            (Some(ConstVal::I64(_)), Some(ConstVal::I64(0))) => None,
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => {
+                Some(Inst::ConstI64(x.wrapping_rem(y)))
+            }
             _ => None,
         },
         Inst::Neg(a) => match as_const(f, *a) {
-            Some(C::F64(x)) => Some(f64_inst(-x)),
-            Some(C::I64(x)) => Some(Inst::ConstI64(x.wrapping_neg())),
+            Some(ConstVal::F64(x)) => Some(f64_inst(-x)),
+            Some(ConstVal::I64(x)) => Some(Inst::ConstI64(x.wrapping_neg())),
             _ => None,
         },
         Inst::Sqrt(a) => match as_const(f, *a) {
-            Some(C::F64(x)) => Some(f64_inst(x.sqrt())),
+            Some(ConstVal::F64(x)) => Some(f64_inst(x.sqrt())),
             _ => None,
         },
         Inst::Abs(a) => match as_const(f, *a) {
-            Some(C::F64(x)) => Some(f64_inst(x.abs())),
+            Some(ConstVal::F64(x)) => Some(f64_inst(x.abs())),
             _ => None,
         },
         Inst::Floor(a) => match as_const(f, *a) {
-            Some(C::F64(x)) => Some(f64_inst(x.floor())),
+            Some(ConstVal::F64(x)) => Some(f64_inst(x.floor())),
             _ => None,
         },
         Inst::Ceil(a) => match as_const(f, *a) {
-            Some(C::F64(x)) => Some(f64_inst(x.ceil())),
+            Some(ConstVal::F64(x)) => Some(f64_inst(x.ceil())),
             _ => None,
         },
         Inst::Round(a) => match as_const(f, *a) {
-            Some(C::F64(x)) => Some(f64_inst(x.round())),
+            Some(ConstVal::F64(x)) => Some(f64_inst(x.round())),
             _ => None,
         },
         Inst::Trunc(a) => match as_const(f, *a) {
-            Some(C::F64(x)) => Some(f64_inst(x.trunc())),
+            Some(ConstVal::F64(x)) => Some(f64_inst(x.trunc())),
             _ => None,
         },
         Inst::Min(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::F64(x)), Some(C::F64(y))) => Some(f64_inst(x.min(y))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(x.min(y))),
             _ => None,
         },
         Inst::Max(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::F64(x)), Some(C::F64(y))) => Some(f64_inst(x.max(y))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(x.max(y))),
             _ => None,
         },
         Inst::Fma { a, b, c } => match (as_const(f, *a), as_const(f, *b), as_const(f, *c)) {
-            (Some(C::F64(x)), Some(C::F64(y)), Some(C::F64(z))) => Some(f64_inst(x.mul_add(y, z))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y)), Some(ConstVal::F64(z))) => {
+                Some(f64_inst(x.mul_add(y, z)))
+            }
             _ => None,
         },
         Inst::And(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x & y)),
-            (Some(C::Bool(x)), Some(C::Bool(y))) => Some(Inst::ConstBool(x & y)),
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => Some(Inst::ConstI64(x & y)),
+            (Some(ConstVal::Bool(x)), Some(ConstVal::Bool(y))) => Some(Inst::ConstBool(x & y)),
             _ => None,
         },
         Inst::Or(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x | y)),
-            (Some(C::Bool(x)), Some(C::Bool(y))) => Some(Inst::ConstBool(x | y)),
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => Some(Inst::ConstI64(x | y)),
+            (Some(ConstVal::Bool(x)), Some(ConstVal::Bool(y))) => Some(Inst::ConstBool(x | y)),
             _ => None,
         },
         Inst::Xor(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x ^ y)),
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => Some(Inst::ConstI64(x ^ y)),
             _ => None,
         },
         Inst::Not(a) => match as_const(f, *a) {
-            Some(C::I64(x)) => Some(Inst::ConstI64(!x)),
-            Some(C::Bool(x)) => Some(Inst::ConstBool(!x)),
+            Some(ConstVal::I64(x)) => Some(Inst::ConstI64(!x)),
+            Some(ConstVal::Bool(x)) => Some(Inst::ConstBool(!x)),
             _ => None,
         },
         Inst::Shl(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x.wrapping_shl(y as u32))),
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => {
+                Some(Inst::ConstI64(x.wrapping_shl(y as u32)))
+            }
             _ => None,
         },
         Inst::Shr(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::I64(x)), Some(C::I64(y))) => {
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => {
                 Some(Inst::ConstI64((x as u64).wrapping_shr(y as u32) as i64))
             }
             _ => None,
         },
         Inst::Sar(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(C::I64(x)), Some(C::I64(y))) => Some(Inst::ConstI64(x.wrapping_shr(y as u32))),
+            (Some(ConstVal::I64(x)), Some(ConstVal::I64(y))) => {
+                Some(Inst::ConstI64(x.wrapping_shr(y as u32)))
+            }
             _ => None,
         },
         Inst::Cmp { op, lhs, rhs } => {
@@ -159,7 +185,7 @@ fn try_fold(f: &Function, v: Value) -> Option<Inst> {
         }
         Inst::Call { func, args } => {
             let a = match as_const(f, args[0])? {
-                C::F64(x) => x,
+                ConstVal::F64(x) => x,
                 _ => return None,
             };
             let result = match func {
@@ -169,40 +195,40 @@ fn try_fold(f: &Function, v: Value) -> Option<Inst> {
                 LibFunc::Exp => a.exp(),
                 LibFunc::Log => a.ln(),
                 LibFunc::Pow => match as_const(f, args[1])? {
-                    C::F64(b) => a.powf(b),
+                    ConstVal::F64(b) => a.powf(b),
                     _ => return None,
                 },
             };
             Some(f64_inst(result))
         }
         Inst::IToF(a) => match as_const(f, *a) {
-            Some(C::I64(x)) => Some(f64_inst(x as f64)),
+            Some(ConstVal::I64(x)) => Some(f64_inst(x as f64)),
             _ => None,
         },
         Inst::FToI(a) => match as_const(f, *a) {
-            Some(C::F64(x)) => Some(Inst::ConstI64(x as i64)),
+            Some(ConstVal::F64(x)) => Some(Inst::ConstI64(x as i64)),
             _ => None,
         },
         _ => None,
     }
 }
 
-fn eval_cmp_const(op: CmpOp, l: C, r: C) -> Option<bool> {
+fn eval_cmp_const(op: CmpOp, l: ConstVal, r: ConstVal) -> Option<bool> {
     match (op, l, r) {
-        (CmpOp::Eq, C::F64(x), C::F64(y)) => Some(x == y),
-        (CmpOp::Ne, C::F64(x), C::F64(y)) => Some(x != y),
-        (CmpOp::Lt, C::F64(x), C::F64(y)) => Some(x < y),
-        (CmpOp::Le, C::F64(x), C::F64(y)) => Some(x <= y),
-        (CmpOp::Gt, C::F64(x), C::F64(y)) => Some(x > y),
-        (CmpOp::Ge, C::F64(x), C::F64(y)) => Some(x >= y),
-        (CmpOp::Eq, C::I64(x), C::I64(y)) => Some(x == y),
-        (CmpOp::Ne, C::I64(x), C::I64(y)) => Some(x != y),
-        (CmpOp::Lt, C::I64(x), C::I64(y)) => Some(x < y),
-        (CmpOp::Le, C::I64(x), C::I64(y)) => Some(x <= y),
-        (CmpOp::Gt, C::I64(x), C::I64(y)) => Some(x > y),
-        (CmpOp::Ge, C::I64(x), C::I64(y)) => Some(x >= y),
-        (CmpOp::Eq, C::Bool(x), C::Bool(y)) => Some(x == y),
-        (CmpOp::Ne, C::Bool(x), C::Bool(y)) => Some(x != y),
+        (CmpOp::Eq, ConstVal::F64(x), ConstVal::F64(y)) => Some(x == y),
+        (CmpOp::Ne, ConstVal::F64(x), ConstVal::F64(y)) => Some(x != y),
+        (CmpOp::Lt, ConstVal::F64(x), ConstVal::F64(y)) => Some(x < y),
+        (CmpOp::Le, ConstVal::F64(x), ConstVal::F64(y)) => Some(x <= y),
+        (CmpOp::Gt, ConstVal::F64(x), ConstVal::F64(y)) => Some(x > y),
+        (CmpOp::Ge, ConstVal::F64(x), ConstVal::F64(y)) => Some(x >= y),
+        (CmpOp::Eq, ConstVal::I64(x), ConstVal::I64(y)) => Some(x == y),
+        (CmpOp::Ne, ConstVal::I64(x), ConstVal::I64(y)) => Some(x != y),
+        (CmpOp::Lt, ConstVal::I64(x), ConstVal::I64(y)) => Some(x < y),
+        (CmpOp::Le, ConstVal::I64(x), ConstVal::I64(y)) => Some(x <= y),
+        (CmpOp::Gt, ConstVal::I64(x), ConstVal::I64(y)) => Some(x > y),
+        (CmpOp::Ge, ConstVal::I64(x), ConstVal::I64(y)) => Some(x >= y),
+        (CmpOp::Eq, ConstVal::Bool(x), ConstVal::Bool(y)) => Some(x == y),
+        (CmpOp::Ne, ConstVal::Bool(x), ConstVal::Bool(y)) => Some(x != y),
         _ => None,
     }
 }
@@ -240,6 +266,42 @@ mod tests {
     }
 
     #[test]
+    fn does_not_panic_on_i64_div_by_zero_even_in_dead_code() {
+        let mut f = lowered("if false then 5 / 0 else 1");
+        // Must not panic; folding div-by-zero should simply decline to fire.
+        ConstFold.run(&mut f);
+    }
+
+    #[test]
+    fn folds_i64_sar_hand_built() {
+        // `Sar` (arithmetic shift right) has no surface syntax — only `Shr`
+        // is ever lowered from `>>` (see forge_ir::lower.rs). Build the IR
+        // by hand, same pattern as forge-ir/src/ir.rs's test module, so the
+        // Sar arm of try_fold isn't left completely unverified.
+        use forge_syntax::span::Span;
+        let f = Function {
+            insts: vec![
+                Inst::ConstI64(-8),            // v0 = -8
+                Inst::ConstI64(2),             // v1 = 2
+                Inst::Sar(Value(0), Value(1)), // v2 = -8 >> 2 (arithmetic)
+            ],
+            types: vec![Ty::I64, Ty::I64, Ty::I64],
+            spans: vec![Span::new(0, 0), Span::new(0, 0), Span::new(0, 0)],
+            blocks: vec![BlockData {
+                insts: vec![Value(0), Value(1), Value(2)],
+                term: Some(Terminator::Return(Value(2))),
+                preds: Default::default(),
+            }],
+            entry: Block(0),
+            params: vec![],
+        };
+        let mut folded = f;
+        ConstFold.run(&mut folded);
+        // -8 >> 2 arithmetic == -2
+        assert!(matches!(folded.insts[2], Inst::ConstI64(n) if n == -2));
+    }
+
+    #[test]
     fn does_not_fold_when_an_operand_is_not_literal() {
         let mut f = lowered("x + 1.0");
         let before = f.insts.len();
@@ -267,6 +329,12 @@ mod tests {
             "1.0 == 1.0",
             "sin(0.0)",
             "pow(2.0, 3.0)",
+            "5 & 3",
+            "5 | 2",
+            "5 ^ 1",
+            "~5",
+            "1 << 4",
+            "256 >> 4",
         ] {
             let unfolded = lowered(src);
             let expected = interpret(&unfolded, &[]);
