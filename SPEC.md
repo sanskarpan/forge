@@ -394,7 +394,17 @@ fn fold(inst: &Inst, consts: &FxHashMap<Value, Const>) -> Option<Inst> {
 /// Each rule is annotated with whether it is valid for floats. This table is
 /// where most "optimizing compiler broke my numerics" bugs come from.
 const RULES: &[(&str, Validity)] = &[
-    ("x + 0     → x",       Validity::Always),      // +0.0 identity holds
+    // ⚠ "x + 0 → x" is NOT unconditionally valid for f64: IEEE-754 defines
+    // (-0.0) + (+0.0) = +0.0, so if x is -0.0, adding a literal +0.0 flips
+    // its sign — the rule silently changes the answer. The direction that
+    // IS always safe is adding NEGATIVE zero: x + (-0.0) → x holds for
+    // every x, including x = -0.0 and x = +0.0. (i64 has no signed zero, so
+    // "x + 0 → x" is unconditionally fine there — this caveat is f64-only.)
+    ("x + (-0.0) → x",      Validity::Always),      // f64: the only always-safe add-zero direction
+    ("x + 0     → x",       Validity::IntOnly),      // f64: unsafe when x = -0.0 (see above)
+    // x - 0 → x IS always safe for f64 (subtracting +0.0 is the same as
+    // adding -0.0), unlike the addition case above — don't "fix" this one
+    // to match; the asymmetry is real and IEEE-754-mandated.
     ("x - 0     → x",       Validity::Always),
     ("x * 1     → x",       Validity::Always),
     ("x * 0     → 0",       Validity::IntOnly),     // ⚠ f64: NaN*0 = NaN, Inf*0 = NaN
@@ -430,7 +440,17 @@ fn magic_divide(d: i64) -> MagicNumber {
 const REDUCTIONS: &[&str] = &[
     "x * 2^k        → x << k",
     "x / 2^k        → x >> k        (signed: needs a rounding fixup)",
-    "x % 2^k        → x & (2^k - 1)",
+    // ⚠ "x % 2^k → x & (2^k - 1)" as written is ONLY correct for
+    // non-negative x. Our `%` (like Rust's) is truncating — the remainder's
+    // sign follows the dividend — but `x & (2^k-1)` computes the EUCLIDEAN
+    // remainder, which is always non-negative. These disagree for negative
+    // x: -7 % 4 == -3 (truncating), but -7 & 3 == 1 (masking). The masked
+    // form is only a valid strength reduction when x is provably
+    // non-negative; the general signed case needs the same sign-fixup
+    // machinery as the division rule above it (reuse the corrected quotient
+    // q and compute the remainder as x - (q << k), which is correct by
+    // construction from q rather than a separately-derived bit trick).
+    "x % 2^k        → x & (2^k - 1)   (unsigned/non-negative x only — see caveat)",
     "x / C          → magic multiply + shift",
     "x * 3          → lea (x + x*2)",
     "x * 5          → lea (x + x*4)",
