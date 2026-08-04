@@ -18,26 +18,40 @@ fn eval(src: &str, args: &[RtValue]) -> RtValue {
     assert!(diags.is_empty(), "lex errors for {src:?}: {diags:?}");
     let (ast, diags) = parse(&tokens);
     assert!(diags.is_empty(), "parse errors for {src:?}: {diags:?}");
-    let typed = typecheck(resolve(ast)).unwrap_or_else(|e| panic!("type errors for {src:?}: {e:?}"));
+    let typed =
+        typecheck(resolve(ast)).unwrap_or_else(|e| panic!("type errors for {src:?}: {e:?}"));
     let f = lower(&typed);
     verify(&f).unwrap_or_else(|e| panic!("verifier rejected {src:?}: {e}"));
     interpret(&f, args)
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // spec test data (SPEC §3's own example), not a Pi typo
 fn straight_line_arithmetic() {
-    assert_eq!(eval("3.14159 * r * r", &[RtValue::F64(2.0)]), RtValue::F64(3.14159 * 2.0 * 2.0));
+    assert_eq!(
+        eval("3.14159 * r * r", &[RtValue::F64(2.0)]),
+        RtValue::F64(3.14159 * 2.0 * 2.0)
+    );
 }
 
 #[test]
 fn if_and_let() {
-    let r = eval("let t = a - b in if t > 0.0 then t else -t", &[RtValue::F64(3.0), RtValue::F64(5.0)]);
+    let r = eval(
+        "let t = a - b in if t > 0.0 then t else -t",
+        &[RtValue::F64(3.0), RtValue::F64(5.0)],
+    );
     assert_eq!(r, RtValue::F64(2.0)); // |3 - 5|
 }
 
 #[test]
 fn intrinsic_sqrt() {
-    assert_eq!(eval("sqrt(x * x + y * y)", &[RtValue::F64(3.0), RtValue::F64(4.0)]), RtValue::F64(5.0));
+    assert_eq!(
+        eval(
+            "sqrt(x * x + y * y)",
+            &[RtValue::F64(3.0), RtValue::F64(4.0)]
+        ),
+        RtValue::F64(5.0)
+    );
 }
 
 #[test]
