@@ -7,14 +7,14 @@ pub struct Value(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Block(pub u32);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Ty {
     F64,
     I64,
     Bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -24,7 +24,7 @@ pub enum CmpOp {
     Ge,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum LibFunc {
     Sin,
     Cos,
@@ -34,7 +34,7 @@ pub enum LibFunc {
     Pow,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Inst {
     ConstF64(u64),
     ConstI64(i64),
