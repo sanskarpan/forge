@@ -1,6 +1,7 @@
 // crates/forge-opt/src/lib.rs
 
 pub mod fold;
+pub mod simplify;
 
 use forge_ir::Function;
 
@@ -42,7 +43,7 @@ pub fn run_passes(f: &mut Function, passes: &mut [Box<dyn Pass>]) {
 pub fn optimize(f: &mut Function) {
     let mut passes: Vec<Box<dyn Pass>> = vec![
         Box::new(fold::ConstFold),
-        // Box::new(simplify::AlgebraicSimplify),  <- added by a later task
+        Box::new(simplify::AlgebraicSimplify),
         // Box::new(strength::StrengthReduceShifts), Box::new(strength::MagicDivision), <- later tasks
         // Box::new(gvn::Gvn),                     <- added by a later task
         // Box::new(reassoc::Reassociate),          <- added by a later task (before DCE — reassoc can expose new DCE opportunities)
