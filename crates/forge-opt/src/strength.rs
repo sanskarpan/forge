@@ -112,6 +112,25 @@ fn const_pow2_k(f: &Function, v: Value) -> Option<u32> {
 /// code may already reference it), which is exactly what the div/rem
 /// sign-fixup sequences need: several new instructions have to be defined,
 /// in program order, before the position the original `Div`/`Rem` occupied.
+///
+/// ## Chaining several calls in a row
+///
+/// Each call only shifts things right by one slot, so inserting a whole
+/// SEQUENCE of `n` new instructions before some original position requires
+/// threading a mutable `pos` through `n` calls, incrementing it by one after
+/// each: the first call inserts at the original `pos`; every following call
+/// must insert at the now-updated `pos` too, since that's where the
+/// still-pending original instruction (and everything after it) has been
+/// pushed to. After all `n` calls, the original instruction's own new
+/// position is `pos` (i.e. `old_pos + n`) — not `old_pos + n + 1`, since
+/// `pos` was already advanced past the last inserted instruction; callers
+/// that also rewrite the original instruction's own slot afterward, and then
+/// need to know where to resume scanning the block, use `pos + 1` for that
+/// (skip past the rewritten original too). See `emit_div_bias` for the
+/// reference implementation of this pattern (six calls in a row, `pos`
+/// incremented after each), and `div_pow2`/`rem_pow2` for how its returned
+/// `pos` is subsequently used both to insert further instructions and to
+/// compute the caller's resume position.
 fn insert_before(
     f: &mut Function,
     block: Block,
@@ -421,13 +440,15 @@ mod tests {
 
     #[test]
     fn verifies_after_rewrite() {
-        // The rewritten IR must still pass the same-block-position-agnostic
-        // dominance verifier -- and, more importantly for THIS pass, the
-        // helper instructions must genuinely precede the rewritten
-        // instruction in `block.insts` order (interp.rs iterates instructions
-        // in that literal order and panics on a used-before-defined value,
-        // which would catch an `insert_before` position bug that the
-        // dominance-only verifier itself cannot).
+        // The rewritten IR must still pass `verify()` -- but note `verify()`
+        // only checks BLOCK-granularity dominance (see verify.rs's own
+        // doc comment), not same-block instruction order, so this test alone
+        // would NOT catch an `insert_before` position bug that puts a helper
+        // instruction after the value that uses it. Ordering itself is
+        // caught by the interpret()-based tests above (they panic on
+        // "undefined value" if a use precedes its def in `block.insts`),
+        // not this one -- this test is only confirming dominance stays
+        // intact, a real but separate property.
         for src in ["n * 8", "n / 8", "n % 8"] {
             let mut f = lowered_i64(src);
             StrengthReduceShifts.run(&mut f);
