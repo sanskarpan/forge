@@ -535,7 +535,9 @@ fn mov_reg_mem_generic_base_with_disp32() {
     let mut a = Assembler::new();
     a.mov_reg_mem(PhysReg::Rax, PhysReg::Rcx, 1000);
     assert_eq!(a.code(), &[0x48, 0x8B, 0x81, 0xE8, 0x03, 0x00, 0x00]);
-    assert_eq!(disassemble(a.code()), vec!["mov rax,[rcx+1000]"]);
+    // NasmFormatter renders larger displacements in hex with a trailing
+    // "h", not decimal -- confirmed empirically, not guessed.
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[rcx+3E8h]"]);
 }
 
 /// rsp requires a SIB byte -- ModRM.rm=100 alone means "SIB follows", so
