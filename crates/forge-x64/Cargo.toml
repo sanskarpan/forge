@@ -3,4 +3,5 @@ name = "forge-x64"
 version.workspace = true
 edition.workspace = true
 
-[dependencies]
+[dev-dependencies]
+iced-x86.workspace = true
