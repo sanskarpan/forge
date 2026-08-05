@@ -469,6 +469,8 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
 - Modify: `crates/forge-x64/src/assembler.rs`
 - Modify: `crates/forge-x64/tests/round_trip.rs`
 
+**Note (found during Task 2):** `disp_mode()` and `emit_disp()` currently carry a temporary `#[allow(dead_code)]` — plain `cargo clippy --workspace -- -D warnings` (this project's actual CI invocation, no `--all-targets`) can't see their `#[cfg(test)]`-only call sites, so without the allow it reports them as unused. `modrm_mem()` below is their first production call site — remove both `#[allow(dead_code)]` attributes as part of this task, once `modrm_mem()` calls them for real.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
