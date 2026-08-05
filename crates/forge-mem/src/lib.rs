@@ -360,6 +360,72 @@ mod platform {
     }
 }
 
+/// A page of executable memory, arity-checked at the call boundary. This is
+/// the single most dangerous operation in the crate, isolated to these
+/// three methods -- the ONLY places `transmute` to a function pointer
+/// happens anywhere in this codebase.
+pub struct CompiledExpr {
+    buf: ExecutableBuffer,
+    arity: usize,
+}
+
+impl CompiledExpr {
+    pub fn from_buffer(buf: ExecutableBuffer, arity: usize) -> Self {
+        Self { buf, arity }
+    }
+
+    pub fn call1(&self, x: f64) -> f64 {
+        assert_eq!(
+            self.arity, 1,
+            "arity mismatch: compiled for {} argument(s), called via call1",
+            self.arity
+        );
+        debug_assert_eq!(self.buf.state(), ProtState::Executable);
+        // SAFETY: arity checked above; state checked above in debug builds;
+        // the buffer contains a complete function honoring AAPCS64/SysV's
+        // fn(f64) -> f64 convention by construction -- this phase's own
+        // tests are the only thing writing bytes into any buffer this type
+        // wraps (no compiler exists yet to violate that contract).
+        let f: unsafe extern "C" fn(f64) -> f64 = unsafe { std::mem::transmute(self.buf.as_ptr()) };
+        unsafe { f(x) }
+    }
+
+    pub fn call2(&self, x: f64, y: f64) -> f64 {
+        assert_eq!(
+            self.arity, 2,
+            "arity mismatch: compiled for {} argument(s), called via call2",
+            self.arity
+        );
+        debug_assert_eq!(self.buf.state(), ProtState::Executable);
+        // SAFETY: same as call1, for fn(f64, f64) -> f64.
+        let f: unsafe extern "C" fn(f64, f64) -> f64 =
+            unsafe { std::mem::transmute(self.buf.as_ptr()) };
+        unsafe { f(x, y) }
+    }
+
+    pub fn call_n(&self, args: &[f64]) -> f64 {
+        // >= rather than == : the compiled function is only guaranteed to
+        // read the first `arity` elements through the raw pointer below, so
+        // a caller-supplied slice longer than `arity` is safe (the extra
+        // elements are simply unread) -- only a slice SHORTER than `arity`
+        // would let the callee read out of bounds.
+        assert!(
+            args.len() >= self.arity,
+            "arity mismatch: compiled for {} argument(s), called via call_n with only {}",
+            self.arity,
+            args.len()
+        );
+        debug_assert_eq!(self.buf.state(), ProtState::Executable);
+        // SAFETY: same as call1, for fn(*const f64) -> f64; `args` outlives
+        // this call and its pointer is valid for at least `self.arity`
+        // reads, which is what the arity check above guarantees (and all
+        // the callee is permitted to read).
+        let f: unsafe extern "C" fn(*const f64) -> f64 =
+            unsafe { std::mem::transmute(self.buf.as_ptr()) };
+        unsafe { f(args.as_ptr()) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,4 +474,75 @@ mod tests {
     // forking safely requires being the only test running in its process
     // (see that file's doc comment) -- a guarantee this multi-test `--lib`
     // binary can't give it.
+
+    #[test]
+    fn call1_identity() {
+        let mut buf = ExecutableBuffer::new(64).unwrap();
+        // AAPCS64: fn(f64) -> f64 identity is a bare `ret` -- the argument and
+        // return value are both in d0, same register, so nothing needs moving.
+        // (Same reasoning as the i64 case in Task 1's test, just a different
+        // register file.) Independently verified: compiled
+        // `extern "C" fn identity(x: f64) -> f64 { x }` with
+        // `rustc --crate-type=lib -O --emit=obj` and disassembled with
+        // `otool -tv` / `otool -s __TEXT __text -x` -- produced a bare `ret`,
+        // raw word `d65f03c0` (little-endian bytes C0 03 5F D6), matching
+        // exactly.
+        buf.write(|mem| mem[..4].copy_from_slice(&[0xC0, 0x03, 0x5F, 0xD6]));
+        buf.make_executable().unwrap();
+        let compiled = CompiledExpr::from_buffer(buf, 1);
+        assert_eq!(compiled.call1(3.5), 3.5);
+    }
+
+    #[test]
+    fn call2_add() {
+        let mut buf = ExecutableBuffer::new(64).unwrap();
+        // fn(f64, f64) -> f64 { x + y }: `fadd d0, d0, d1; ret`.
+        // Independently verified: compiled
+        // `extern "C" fn add(x: f64, y: f64) -> f64 { x + y }` with
+        // `rustc --crate-type=lib -O --emit=obj` and disassembled with
+        // `otool -tv` / `otool -s __TEXT __text -x` -- produced
+        // `fadd d0, d0, d1; ret`, raw words `1e612800 d65f03c0`
+        // (little-endian bytes 00 28 61 1E / C0 03 5F D6), matching exactly.
+        buf.write(|mem| {
+            mem[..8].copy_from_slice(&[
+                0x00, 0x28, 0x61, 0x1E, // fadd d0, d0, d1
+                0xC0, 0x03, 0x5F, 0xD6, // ret
+            ]);
+        });
+        buf.make_executable().unwrap();
+        let compiled = CompiledExpr::from_buffer(buf, 2);
+        assert_eq!(compiled.call2(2.0, 3.0), 5.0);
+    }
+
+    #[test]
+    fn call_n_reads_first_element() {
+        let mut buf = ExecutableBuffer::new(64).unwrap();
+        // fn(*const f64) -> f64 { *ptr }: the pointer arrives in x0 (integer
+        // register, since it's a pointer not a float); load it into d0 and
+        // return. `ldr d0, [x0]; ret`. Independently verified: compiled
+        // `extern "C" fn first(ptr: *const f64) -> f64 { unsafe { *ptr } }`
+        // with `rustc --crate-type=lib -O --emit=obj` and disassembled with
+        // `otool -tv` / `otool -s __TEXT __text -x` -- produced
+        // `ldr d0, [x0]; ret`, raw words `fd400000 d65f03c0`
+        // (little-endian bytes 00 00 40 FD / C0 03 5F D6), matching exactly.
+        buf.write(|mem| {
+            mem[..8].copy_from_slice(&[
+                0x00, 0x00, 0x40, 0xFD, // ldr d0, [x0]
+                0xC0, 0x03, 0x5F, 0xD6, // ret
+            ]);
+        });
+        buf.make_executable().unwrap();
+        let compiled = CompiledExpr::from_buffer(buf, 1);
+        assert_eq!(compiled.call_n(&[9.5, 100.0]), 9.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "arity mismatch")]
+    fn call1_panics_on_arity_mismatch() {
+        let mut buf = ExecutableBuffer::new(64).unwrap();
+        buf.write(|mem| mem[..4].copy_from_slice(&[0xC0, 0x03, 0x5F, 0xD6]));
+        buf.make_executable().unwrap();
+        let compiled = CompiledExpr::from_buffer(buf, 2); // arity 2, but we call call1
+        compiled.call1(1.0);
+    }
 }
