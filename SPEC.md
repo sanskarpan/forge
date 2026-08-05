@@ -1223,7 +1223,7 @@ forge/
 8. **Instruction cache coherency.** `sys_icache_invalidate` (AArch64) is called before any generated code is executed.
 9. **SSA validity.** Every value is defined exactly once; every use is dominated by its definition. Checked by a verifier after every pass.
 10. **Vectorization equivalence.** SIMD results match scalar results element-for-element, including the tail.
-11. **No memory leaks.** Every `ExecutableBuffer` is `munmap`ped; verified under Miri and valgrind.
+11. **No memory leaks.** Every `ExecutableBuffer` is `munmap`ped. As of Phase 5: verified empirically via `getrusage(RUSAGE_SELF).ru_maxrss` high-water-mark growth staying flat across 10,000 allocate/free cycles (`crates/forge-mem/tests/no_leaks.rs`) — **not** under Miri or valgrind. Miri cannot model raw `mmap`/`mprotect`/`sysconf` syscalls or a transmute-to-function-pointer call, so it's an explicit non-goal for this crate (see `forge-mem`'s crate-level doc comment); valgrind was never run either (no macOS/Apple Silicon support to exercise it on this project's development machine) and that gap isn't yet covered by an alternative on Linux.
 12. **Tiering transparency.** Results are identical regardless of which tier serviced the call.
 
 ---

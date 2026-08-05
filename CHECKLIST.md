@@ -167,9 +167,9 @@
 - [ ] 🔴 `CompiledExpr::call1/call2/callN` with an **arity assert** and a single documented `transmute`
 - [ ] 🔴 A code cache: reuse buffers across compilations, with a free-list
 - [ ] 🔴 Test: allocate, write `mov rax, 42; ret`, execute, get 42
-- [ ] 🔴 Test: buffer is not writable after `make_executable` (expect SIGSEGV in a forked child)
+- [ ] 🔴 Test: buffer is not writable after `make_executable` (expect SIGSEGV in a forked child) — **correction (Phase 5):** on this project's macOS AArch64 dev machine, a `MAP_JIT` write-protect violation empirically raises `SIGBUS`, not `SIGSEGV`; `crates/forge-mem/tests/wx_enforcement.rs` accepts either signal, since both are valid hardware protection-fault signals and which one a given OS/kernel raises isn't part of the portable contract being tested (only that W^X is enforced at all)
 - [ ] 🔴 Test: no leaks — allocate/free 10,000 buffers, RSS stays flat
-- [ ] 🔴 Test under Miri where possible; valgrind for the rest
+- [ ] 🔴 Test under Miri where possible; valgrind for the rest — **resolved as a documented non-goal (Phase 5), not silently skipped:** Miri cannot model raw `mmap`/`mprotect`/`sysconf` syscalls or a transmute-to-function-pointer call, so it cannot meaningfully run this crate's tests at all (see `forge-mem`'s crate-level doc comment); valgrind was never run either (no Apple Silicon/macOS ARM64 support to exercise it on this machine) and remains an open gap for a future Linux CI leg. Leak-freedom instead rests on `crates/forge-mem/tests/no_leaks.rs`'s empirical high-water-mark RSS check.
 
 ---
 

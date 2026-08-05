@@ -63,7 +63,9 @@ impl CompiledExpr {
 }
 ```
 
-Each checks `arity` with a real `assert!` (not `debug_assert!` — calling with the wrong arity is a caller bug that must fail loudly in release builds too, not just in debug), `debug_assert!`s `state() == Executable`, then does the single documented `transmute` to a function pointer and calls it. This remains the one and only place in the codebase that performs this transmute, per the project's own stated invariant.
+Each checks `arity` with a real `assert!` (not `debug_assert!` — calling with the wrong arity is a caller bug that must fail loudly in release builds too, not just in debug), then does the single documented `transmute` to a function pointer and calls it. This remains the one and only place in the codebase that performs this transmute, per the project's own stated invariant.
+
+**Correction found during implementation (Task 3):** the `state() == Executable` check was originally written as a `debug_assert!`, matching this doc's original wording. It was promoted to a real `assert!` (in `CompiledExpr::from_buffer`, and again in each of `call1`/`call2`/`call_n`) because on macOS AArch64 — the only platform this crate is actually tested on — `ExecutableBuffer::new()` maps `PROT_READ|WRITE|EXEC` unconditionally via `MAP_JIT`, and `make_executable()` there is a pure state-field flip with no syscall backing it. So on that platform this assert is the *entire* protection against transmuting-and-calling into an unfinished or partially-written buffer — there is no OS-level backstop (e.g. a SIGSEGV from calling into a non-executable page) to fall back on the way there is on the generic-Unix path, which is why it can't be release-build-optional there.
 
 Since there's no code generator yet, tests build `CompiledExpr`s from small hand-written byte sequences (arch-appropriate identity/arithmetic functions), the same pattern the day-one spike already established — not real compiled output.
 
