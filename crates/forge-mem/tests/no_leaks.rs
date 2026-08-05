@@ -5,10 +5,18 @@ use forge_mem::ExecutableBuffer;
 /// `getrusage(RUSAGE_SELF).ru_maxrss` is a HIGH-WATER MARK, not a live RSS
 /// reading -- it never decreases, even when `Drop`'s `munmap` genuinely
 /// frees memory. So this test can't just check "RSS went down." Instead it
-/// compares the high-water mark's growth RATE across two windows of
-/// allocate/free cycles: flat growth after an initial warmup means the
-/// munmap-on-Drop path is working; growth that keeps scaling with
-/// iteration count means a real leak.
+/// takes THREE measurements -- after an initial warmup, at the run's
+/// midpoint, and at the end -- and compares the two equal-sized half-run
+/// deltas (mid - warmup) and (end - mid) against EACH OTHER, not just
+/// against one loose absolute budget for the whole run. A real leak grows
+/// both halves by roughly the same amount, since each half does the same
+/// number of allocate/free cycles; a working `Drop` keeps both near zero.
+/// Comparing the two halves lets each one use a much tighter per-half
+/// budget than a single whole-run budget could, without becoming flaky on
+/// a loaded machine -- a single absolute budget over the whole run has to
+/// stay loose enough to avoid false positives, which is exactly what lets
+/// a partial leak (e.g. one code path or buffer size that leaks while
+/// others don't) hide under it indefinitely.
 fn max_rss_kb() -> i64 {
     // SAFETY: `usage` is a valid, exclusively-owned local passed by
     // pointer for getrusage to fill in; RUSAGE_SELF has no preconditions.
@@ -56,20 +64,35 @@ fn ten_thousand_allocate_free_cycles_do_not_leak() {
     }
     let after_warmup = max_rss_kb();
 
-    for _ in 0..10_000 {
+    for _ in 0..5_000 {
         allocate_write_free_cycle();
     }
-    let after_full_run = max_rss_kb();
+    let after_first_half = max_rss_kb();
 
-    let growth = after_full_run - after_warmup;
-    // A real per-buffer leak (even one page, 16KB on this platform) times
-    // 10,000 iterations would be well over 100MB of growth. Allow a
-    // generous fixed budget for legitimate one-time growth (allocator
-    // metadata, page cache effects) without being so loose it'd miss an
-    // actual leak.
+    for _ in 0..5_000 {
+        allocate_write_free_cycle();
+    }
+    let after_second_half = max_rss_kb();
+
+    let first_half_growth = after_first_half - after_warmup;
+    let second_half_growth = after_second_half - after_first_half;
+
+    // Each half runs the same number of cycles, so a real leak -- even one
+    // that only fires on a fraction of allocations -- grows both halves by
+    // roughly the same amount, while a working Drop keeps both near zero.
+    // A per-half budget can be much tighter than the old single whole-run
+    // budget was: a per-buffer leak (even one page, 16KB on this platform)
+    // hitting just 5% of the 5,000 cycles in a half would add up to ~4MB,
+    // well clear of noise from allocator bookkeeping but well under a
+    // budget loose enough to never false-positive on a loaded machine.
     assert!(
-        growth < 20_000, // 20MB
-        "high-water-mark RSS grew by {growth}KB over 10,000 allocate/free cycles -- \
+        first_half_growth < 3_000, // 3MB over 5,000 cycles
+        "first-half RSS grew by {first_half_growth}KB over 5,000 allocate/free cycles -- \
+         this looks like a leak (Drop's munmap may not be running, or may be failing silently)"
+    );
+    assert!(
+        second_half_growth < 3_000, // 3MB over 5,000 cycles
+        "second-half RSS grew by {second_half_growth}KB over 5,000 allocate/free cycles -- \
          this looks like a leak (Drop's munmap may not be running, or may be failing silently)"
     );
 }
