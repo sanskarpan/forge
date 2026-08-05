@@ -507,6 +507,10 @@ pub struct CodeCache {
 }
 
 impl CodeCache {
+    /// Returns a buffer in `Writable` state, never `Executable` -- call
+    /// `write()` then `make_executable()` on it before wrapping it in a
+    /// `CompiledExpr`, whose `from_buffer` asserts on a non-`Executable`
+    /// buffer.
     pub fn acquire(&mut self, min_size: usize) -> io::Result<ExecutableBuffer> {
         if let Some(pos) = self.free.iter().position(|b| b.len() >= min_size) {
             return Ok(self.free.remove(pos));
