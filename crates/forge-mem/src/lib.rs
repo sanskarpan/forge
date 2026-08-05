@@ -371,6 +371,15 @@ pub struct CompiledExpr {
 
 impl CompiledExpr {
     pub fn from_buffer(buf: ExecutableBuffer, arity: usize) -> Self {
+        // A real assert, not debug-only: catching a never-made-executable
+        // buffer here, at construction, is strictly better than deferring
+        // to the first call1/call2/call_n (which check the same thing) --
+        // it fails at the actual site of the caller's mistake.
+        assert_eq!(
+            buf.state(),
+            ProtState::Executable,
+            "cannot build a CompiledExpr from a buffer that was never made executable"
+        );
         Self { buf, arity }
     }
 
@@ -380,12 +389,19 @@ impl CompiledExpr {
             "arity mismatch: compiled for {} argument(s), called via call1",
             self.arity
         );
-        debug_assert_eq!(self.buf.state(), ProtState::Executable);
-        // SAFETY: arity checked above; state checked above in debug builds;
-        // the buffer contains a complete function honoring AAPCS64/SysV's
-        // fn(f64) -> f64 convention by construction -- this phase's own
-        // tests are the only thing writing bytes into any buffer this type
-        // wraps (no compiler exists yet to violate that contract).
+        // A real assert, not debug-only -- see the comment on call_n's
+        // state check for why this matters on macOS AArch64 specifically.
+        assert_eq!(
+            self.buf.state(),
+            ProtState::Executable,
+            "cannot call a CompiledExpr whose buffer was never made executable"
+        );
+        // SAFETY: arity and state checked above (both real asserts, so this
+        // holds in release builds too); the buffer contains a complete
+        // function honoring AAPCS64/SysV's fn(f64) -> f64 convention by
+        // construction -- this phase's own tests are the only thing writing
+        // bytes into any buffer this type wraps (no compiler exists yet to
+        // violate that contract).
         let f: unsafe extern "C" fn(f64) -> f64 = unsafe { std::mem::transmute(self.buf.as_ptr()) };
         unsafe { f(x) }
     }
@@ -396,7 +412,13 @@ impl CompiledExpr {
             "arity mismatch: compiled for {} argument(s), called via call2",
             self.arity
         );
-        debug_assert_eq!(self.buf.state(), ProtState::Executable);
+        // A real assert, not debug-only -- see the comment on call_n's
+        // state check for why this matters on macOS AArch64 specifically.
+        assert_eq!(
+            self.buf.state(),
+            ProtState::Executable,
+            "cannot call a CompiledExpr whose buffer was never made executable"
+        );
         // SAFETY: same as call1, for fn(f64, f64) -> f64.
         let f: unsafe extern "C" fn(f64, f64) -> f64 =
             unsafe { std::mem::transmute(self.buf.as_ptr()) };
@@ -415,7 +437,23 @@ impl CompiledExpr {
             self.arity,
             args.len()
         );
-        debug_assert_eq!(self.buf.state(), ProtState::Executable);
+        // A real assert, not debug-only. On the generic-Unix platform this
+        // check is merely a nicer panic message than the SIGSEGV a still-
+        // Writable buffer's real (PROT_READ|WRITE, no PROT_EXEC) mapping
+        // would raise anyway. But on macOS AArch64 -- the only platform
+        // this crate is actually tested on -- `ExecutableBuffer::new()`
+        // maps PROT_READ|WRITE|EXEC unconditionally via MAP_JIT, and
+        // `make_executable()` there is a pure state-field flip with no
+        // syscall backing it. So on THIS platform, this assert is the
+        // entire protection against transmuting-and-calling into an
+        // unfinished or partially-written buffer -- there is no OS-level
+        // backstop to fall back on, which is why this can't be a
+        // debug-only check.
+        assert_eq!(
+            self.buf.state(),
+            ProtState::Executable,
+            "cannot call a CompiledExpr whose buffer was never made executable"
+        );
         // SAFETY: same as call1, for fn(*const f64) -> f64; `args` outlives
         // this call and its pointer is valid for at least `self.arity`
         // reads, which is what the arity check above guarantees (and all
@@ -543,6 +581,24 @@ mod tests {
         buf.write(|mem| mem[..4].copy_from_slice(&[0xC0, 0x03, 0x5F, 0xD6]));
         buf.make_executable().unwrap();
         let compiled = CompiledExpr::from_buffer(buf, 2); // arity 2, but we call call1
+        compiled.call1(1.0);
+    }
+
+    // NOTE: this exercises the "call1 on a buffer that was never made
+    // executable" scenario end to end -- but the panic actually fires
+    // inside `from_buffer`, not inside `call1`. `from_buffer` now performs
+    // the very same state check up front (see its doc comment), so there is
+    // no way to reach a live `CompiledExpr` wrapping a still-Writable
+    // buffer through the public API at all -- the checks inside
+    // call1/call2/call_n are unreachable-in-practice defense in depth, not
+    // something a black-box test can trigger independently of this one.
+    #[test]
+    #[should_panic(expected = "never made executable")]
+    fn from_buffer_panics_on_a_still_writable_buffer() {
+        let mut buf = ExecutableBuffer::new(64).unwrap();
+        buf.write(|mem| mem[..4].copy_from_slice(&[0xC0, 0x03, 0x5F, 0xD6]));
+        // Deliberately never call buf.make_executable().
+        let compiled = CompiledExpr::from_buffer(buf, 1);
         compiled.call1(1.0);
     }
 }
