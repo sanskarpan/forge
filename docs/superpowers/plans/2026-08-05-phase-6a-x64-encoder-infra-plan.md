@@ -515,7 +515,7 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
 - Modify: `crates/forge-x64/src/assembler.rs`
 - Modify: `crates/forge-x64/tests/round_trip.rs`
 
-**Note (found during Task 2):** `disp_mode()` and `emit_disp()` currently carry a temporary `#[allow(dead_code)]` — plain `cargo clippy --workspace -- -D warnings` (this project's actual CI invocation, no `--all-targets`) can't see their `#[cfg(test)]`-only call sites, so without the allow it reports them as unused. `modrm_mem()` below is their first production call site — remove both `#[allow(dead_code)]` attributes as part of this task, once `modrm_mem()` calls them for real.
+**Note (found during Task 2):** `disp_mode()`, `emit_disp()`, and `DispMode::bits()` currently carry a temporary `#[allow(dead_code)]` each — plain `cargo clippy --workspace -- -D warnings` (this project's actual CI invocation, no `--all-targets`) can't see their `#[cfg(test)]`-only call sites, so without the allow it reports them as unused. `modrm_mem()` below is their first production call site (note it calls `mode.bits()`, not the raw `DispMode` value, when building the ModRM byte) — remove all three `#[allow(dead_code)]` attributes as part of this task, once `modrm_mem()` calls them for real.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -606,7 +606,7 @@ impl Assembler {
         if base_low == 4 {
             // RSP or R12 -> SIB required
             let mode = disp_mode(disp);
-            self.code.push(mode << 6 | ((reg & 7) << 3) | 0b100);
+            self.code.push(mode.bits() << 6 | ((reg & 7) << 3) | 0b100);
             self.code.push(0b00_100_100); // scale=1, index=none, base=rsp/r12
             self.emit_disp(mode, disp);
         } else if base_low == 5 && disp == 0 {
@@ -615,7 +615,7 @@ impl Assembler {
             self.code.push(0); // explicit zero displacement
         } else {
             let mode = disp_mode(disp);
-            self.code.push(mode << 6 | ((reg & 7) << 3) | base_low);
+            self.code.push(mode.bits() << 6 | ((reg & 7) << 3) | base_low);
             self.emit_disp(mode, disp);
         }
     }
