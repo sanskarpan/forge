@@ -181,43 +181,52 @@ mod tests {
     }
 
     #[test]
-    fn disp_mode_selects_00_for_zero() {
-        assert_eq!(disp_mode(0), 0b00);
+    fn disp_mode_selects_none_for_zero() {
+        assert_eq!(disp_mode(0), DispMode::None);
     }
 
     #[test]
-    fn disp_mode_selects_01_for_values_fitting_in_i8() {
-        assert_eq!(disp_mode(5), 0b01);
-        assert_eq!(disp_mode(-128), 0b01);
-        assert_eq!(disp_mode(127), 0b01);
+    fn disp_mode_selects_disp8_for_values_fitting_in_i8() {
+        assert_eq!(disp_mode(5), DispMode::Disp8);
+        assert_eq!(disp_mode(-128), DispMode::Disp8);
+        assert_eq!(disp_mode(127), DispMode::Disp8);
     }
 
     #[test]
-    fn disp_mode_selects_10_for_values_not_fitting_in_i8() {
-        assert_eq!(disp_mode(128), 0b10);
-        assert_eq!(disp_mode(-129), 0b10);
-        assert_eq!(disp_mode(1000), 0b10);
+    fn disp_mode_selects_disp32_for_values_not_fitting_in_i8() {
+        assert_eq!(disp_mode(128), DispMode::Disp32);
+        assert_eq!(disp_mode(-129), DispMode::Disp32);
+        assert_eq!(disp_mode(1000), DispMode::Disp32);
+        assert_eq!(disp_mode(i32::MAX), DispMode::Disp32);
+        assert_eq!(disp_mode(i32::MIN), DispMode::Disp32);
     }
 
     #[test]
-    fn emit_disp_mode_00_emits_nothing() {
+    fn emit_disp_none_emits_nothing() {
         let mut a = Assembler::new();
-        a.emit_disp(0b00, 0);
+        a.emit_disp(DispMode::None, 0);
         assert_eq!(a.code(), &[] as &[u8]);
     }
 
     #[test]
-    fn emit_disp_mode_01_emits_one_byte() {
+    fn emit_disp_disp8_emits_one_byte() {
         let mut a = Assembler::new();
-        a.emit_disp(0b01, -5);
+        a.emit_disp(DispMode::Disp8, -5);
         assert_eq!(a.code(), &[(-5i8) as u8]);
     }
 
     #[test]
-    fn emit_disp_mode_10_emits_four_bytes_little_endian() {
+    fn emit_disp_disp32_emits_four_bytes_little_endian() {
         let mut a = Assembler::new();
-        a.emit_disp(0b10, 1000);
+        a.emit_disp(DispMode::Disp32, 1000);
         assert_eq!(a.code(), &[0xE8, 0x03, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn emit_disp_disp32_handles_negative_values() {
+        let mut a = Assembler::new();
+        a.emit_disp(DispMode::Disp32, -1000);
+        assert_eq!(a.code(), &(-1000i32).to_le_bytes());
     }
 }
 ```
@@ -255,32 +264,69 @@ impl Default for Assembler {
     }
 }
 
-/// Returns the ModRM `mod` bits for a given displacement: `00` (no
-/// displacement bytes), `01` (fits in a single signed byte), or `10`
-/// (needs the full 32-bit form). This function alone does not know about
-/// the rbp/r13-with-disp-0 trap (mod=00 there would collide with
-/// RIP-relative addressing) -- callers building a full ModRM/SIB byte are
-/// responsible for special-casing that themselves.
-fn disp_mode(disp: i32) -> u8 {
+/// The ModRM `mod` bits implied by a displacement value -- an enum rather
+/// than a raw `u8` so that `emit_disp` below can match exhaustively with no
+/// `unreachable!()` fallback arm, making a mismatched mode/displacement
+/// pair (e.g. a `Disp8` mode paired with a value that doesn't fit)
+/// structurally impossible to construct outside of `disp_mode` itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DispMode {
+    /// mod=00: no displacement bytes.
+    None,
+    /// mod=01: one signed byte.
+    Disp8,
+    /// mod=10: four little-endian bytes.
+    Disp32,
+}
+
+impl DispMode {
+    /// The raw 2-bit ModRM `mod` field value.
+    // `#[allow(dead_code)]`: plain `cargo clippy --workspace -- -D
+    // warnings` (this project's actual CI invocation -- see
+    // .github/workflows/ci.yml) does not compile with `--cfg test`, so it
+    // can't see this method's only call site, which is inside `#[cfg(test)]
+    // mod tests` below, until Task 4's `modrm_mem()` becomes a second,
+    // production call site. Remove this allow in Task 4 once that happens.
+    #[allow(dead_code)]
+    fn bits(self) -> u8 {
+        match self {
+            DispMode::None => 0b00,
+            DispMode::Disp8 => 0b01,
+            DispMode::Disp32 => 0b10,
+        }
+    }
+}
+
+/// Selects the smallest `DispMode` that can represent `disp`. This
+/// function alone does not know about the rbp/r13-with-disp-0 trap
+/// (mod=00 there would collide with RIP-relative addressing) -- callers
+/// building a full ModRM/SIB byte are responsible for special-casing that
+/// themselves.
+// `#[allow(dead_code)]`: same reason as `DispMode::bits` above -- only
+// called from `#[cfg(test)]` until Task 4's `modrm_mem()` wires it in.
+// Remove this allow in Task 4.
+#[allow(dead_code)]
+fn disp_mode(disp: i32) -> DispMode {
     if disp == 0 {
-        0b00
+        DispMode::None
     } else if i8::try_from(disp).is_ok() {
-        0b01
+        DispMode::Disp8
     } else {
-        0b10
+        DispMode::Disp32
     }
 }
 
 impl Assembler {
-    /// Emits the displacement bytes implied by a `disp_mode` result: zero
-    /// bytes for mode 00, one byte for mode 01, four little-endian bytes
-    /// for mode 10.
-    fn emit_disp(&mut self, mode: u8, disp: i32) {
+    /// Emits the displacement bytes implied by a `disp_mode` result.
+    // `#[allow(dead_code)]`: same reason as `disp_mode` above -- only
+    // called from `#[cfg(test)]` until Task 4's `modrm_mem()` wires it in.
+    // Remove this allow in Task 4.
+    #[allow(dead_code)]
+    fn emit_disp(&mut self, mode: DispMode, disp: i32) {
         match mode {
-            0b00 => {}
-            0b01 => self.code.push(disp as i8 as u8),
-            0b10 => self.code.extend_from_slice(&disp.to_le_bytes()),
-            _ => unreachable!("disp_mode only ever returns 0b00, 0b01, or 0b10"),
+            DispMode::None => {}
+            DispMode::Disp8 => self.code.push(disp as i8 as u8),
+            DispMode::Disp32 => self.code.extend_from_slice(&disp.to_le_bytes()),
         }
     }
 }
@@ -301,7 +347,7 @@ pub use reg::PhysReg;
 - [ ] **Step 5: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 --lib 2>&1 | tail -20`
-Expected: 3 (from Task 1) + 7 (new) = 10 tests pass.
+Expected: 3 (from Task 1) + 8 (new) = 11 tests pass.
 
 - [ ] **Step 6: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -440,7 +486,7 @@ impl Assembler {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -30`
-Expected: all pass (10 lib tests from Tasks 1-2 + 3 new integration tests). Remember Step 1's instruction: verify the `disassemble(...)` string literals empirically before trusting this "pass" — if you skipped that verification, go back and do it now.
+Expected: all pass (11 lib tests from Tasks 1-2 + 3 new integration tests). Remember Step 1's instruction: verify the `disassemble(...)` string literals empirically before trusting this "pass" — if you skipped that verification, go back and do it now.
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -588,7 +634,7 @@ impl Assembler {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -40`
-Expected: all pass (10 lib tests + 9 integration tests: 3 from Task 3 + 6 new).
+Expected: all pass (11 lib tests + 9 integration tests: 3 from Task 3 + 6 new).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -811,7 +857,7 @@ pub use reg::PhysReg;
 - [ ] **Step 5: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -50`
-Expected: all pass (10 lib tests + 12 integration tests: 9 from Tasks 3-4 + 3 new).
+Expected: all pass (11 lib tests + 12 integration tests: 9 from Tasks 3-4 + 3 new).
 
 - [ ] **Step 6: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -837,7 +883,7 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
 - [ ] **Step 1: Full workspace test run**
 
 Run: `cargo test --workspace 2>&1 | tail -50`
-Expected: every test passes, including `forge-x64`'s new tests (10 lib unit tests + 15 integration tests in `tests/round_trip.rs`). No regressions in the pre-existing 164 tests from Phases 0-5.
+Expected: every test passes, including `forge-x64`'s new tests (11 lib unit tests + 15 integration tests in `tests/round_trip.rs`). No regressions in the pre-existing 164 tests from Phases 0-5.
 
 - [ ] **Step 2: Confirm `iced-x86` never appears in a non-test path**
 
