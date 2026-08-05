@@ -181,7 +181,7 @@
 - [ ] 🔴 `Assembler { code: Vec<u8>, labels, fixups }`
 - [ ] 🔴 `PhysReg` enum for GPRs (RAX..R15) and XMM (XMM0..XMM31) with encoding numbers
 - [ ] 🔴 Label/fixup machinery for forward jumps; `bind(label)` patches all pending fixups
-- [ ] 🔴 Rel8 vs rel32 jump selection with automatic promotion when the offset doesn't fit
+- [ ] 🔴 Rel8 vs rel32 jump selection with automatic promotion when the offset doesn't fit — **correction (Phase 6a):** implemented as rel8-if-it-fits-else-rel32 for *backward* jumps (whose distance is known immediately at emit time) and unconditionally-rel32 for *forward* jumps (whose distance isn't known until the target label binds); there is no in-place "promote rel8 to rel32" byte-shifting/reflow step anywhere, since that would require adjusting every later label position and pending fixup for a JIT compiling small expressions — see `docs/superpowers/specs/2026-08-05-phase-6a-x64-encoder-infra-design.md`'s "Jump policy" section for the full justification
 
 **Prefixes — the trap zone**
 - [ ] 🔴 `rex(w, reg, index, rm)` emitting only when needed

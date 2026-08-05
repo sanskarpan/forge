@@ -861,6 +861,8 @@ pub use reg::PhysReg;
 Run: `cargo test -p forge-x64 2>&1 | tail -50`
 Expected: all pass (14 lib tests + 16 integration tests: 13 from Tasks 3-4 + 3 new). Task 4's own review added 4 extra `mov_reg_mem` layering tests beyond its original plan text, and Task 1's review added an extra `PhysReg` test beyond its original plan text — both are reflected in these higher counts, which are the real, current numbers, not the plan's original estimates.
 
+**Correction (post-Task-5 review):** this task's own review added a 17th integration test (`binding_a_label_resolves_all_pending_forward_fixups`, guarding `bind()`'s in-place `fixups` removal against an off-by-one) after the count above was written, alongside a `bind()` double-bind guard. The true final count landed by this task is 14 lib tests + 17 integration tests — see Task 6 below.
+
 - [ ] **Step 6: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
 - [ ] **Step 7: Commit**
@@ -885,7 +887,7 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
 - [ ] **Step 1: Full workspace test run**
 
 Run: `cargo test --workspace 2>&1 | tail -50`
-Expected: every test passes, including `forge-x64`'s new tests (14 lib unit tests + 16 integration tests in `tests/round_trip.rs` — higher than this plan's original per-task estimates due to extra tests added during Tasks 1's and 4's own reviews; see those tasks' final commits for the authoritative counts). No regressions in the pre-existing 164 tests from Phases 0-5.
+Expected: every test passes, including `forge-x64`'s new tests (14 lib unit tests + 17 integration tests in `tests/round_trip.rs` — higher than this plan's original per-task estimates due to extra tests added during Tasks 1's, 4's, and 5's own reviews; see those tasks' final commits for the authoritative counts). 14 + 17 = 31 new tests on top of the pre-existing 164 tests from Phases 0-5, for a workspace total of 195.
 
 - [ ] **Step 2: Confirm `iced-x86` never appears in a non-test path**
 

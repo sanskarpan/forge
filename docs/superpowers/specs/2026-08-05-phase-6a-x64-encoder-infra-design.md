@@ -51,15 +51,11 @@ pub struct Assembler {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Label(usize);
 
-#[derive(Clone, Copy, Debug)]
-enum FixupKind { Rel8, Rel32 }
-
 struct Fixup {
     /// Byte offset in `code` where the displacement bytes go (i.e., right
     /// after the opcode, not the start of the instruction).
     at: usize,
     target: Label,
-    kind: FixupKind,
 }
 
 impl Assembler {
@@ -74,6 +70,8 @@ impl Assembler {
     pub fn bind(&mut self, label: Label) { /* ... */ }
 }
 ```
+
+**Correction found during implementation (Task 5):** this sketch originally carried a `FixupKind { Rel8, Rel32 }` discriminant on `Fixup`, shown above in earlier drafts of this doc. The shipped implementation drops it: per the jump policy below, a fixup is only ever recorded for a *forward* reference, and forward references unconditionally use rel32 (backward jumps compute their distance immediately and never need a fixup at all) — so a `Rel8` variant would be permanently unconstructed dead code. `Fixup` is just `{ at: usize, target: Label }`. Reintroduce a `kind` field if a future instruction (e.g. a conditional jump, `jcc`) needs optimistic-rel8 forward-fixup behavior.
 
 `bind()` only ever *resolves* fixups recorded for *forward* references (the label wasn't bound yet when the jump to it was emitted) — it never rewrites an already-emitted rel8/rel32 *choice*, since that choice is fixed at emit time per the jump policy below. There is no byte-shifting or promotion-after-the-fact anywhere in this design.
 

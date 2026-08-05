@@ -664,7 +664,9 @@ SIB:   ss iii bbb            (present when ModRM.rm == 100 in memory mode)
 ### 8.2 Encoder
 
 ```rust
-// crates/forge-x64/src/encode.rs
+// crates/forge-x64/src/assembler.rs — file named `assembler.rs`, not
+// `encode.rs` as earlier drafts of this doc had it (corrected Phase 6a,
+// matching the design doc, plan, and actual implementation)
 
 pub struct Assembler {
     code: Vec<u8>,
@@ -709,7 +711,7 @@ impl Assembler {
 
         if base_low == 4 {                       // RSP or R12 → SIB required
             let mode = disp_mode(disp);
-            self.code.push(mode << 6 | ((reg & 7) << 3) | 0b100);
+            self.code.push(mode.bits() << 6 | ((reg & 7) << 3) | 0b100);
             self.code.push(0b00_100_100);        // scale=1, index=none, base=rsp/r12
             self.emit_disp(mode, disp);
         } else if base_low == 5 && disp == 0 {   // RBP or R13 → must use disp8
@@ -717,12 +719,14 @@ impl Assembler {
             self.code.push(0);                   // explicit zero displacement
         } else {
             let mode = disp_mode(disp);
-            self.code.push(mode << 6 | ((reg & 7) << 3) | base_low);
+            self.code.push(mode.bits() << 6 | ((reg & 7) << 3) | base_low);
             self.emit_disp(mode, disp);
         }
     }
 }
 ```
+
+`disp_mode` returns a 3-variant `DispMode` enum (`None`/`Disp8`/`Disp32`, with a `.bits()` method for the raw 2-bit ModRM `mod` field), not a bare `u8` as an earlier draft of this doc showed — corrected Phase 6a, so `emit_disp` can match `DispMode` exhaustively with no `unreachable!()` fallback arm, making a mismatched mode/displacement pair structurally impossible to construct. The bit patterns emitted are unchanged either way.
 
 ### 8.3 VEX and EVEX
 
