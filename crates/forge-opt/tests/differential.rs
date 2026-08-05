@@ -91,7 +91,12 @@ fn try_interpret(f: &forge_ir::Function, args: &[RtValue]) -> Result<RtValue, St
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(2000))]
+    // ~29% of generated cases actually survive typecheck and reach the
+    // optimizer (the rest short-circuit at lex/parse/typecheck failures --
+    // an inherent property of generating raw, possibly ill-typed source
+    // text rather than a well-typed AST directly). 8000 cases yields
+    // roughly 2300 real -O0-vs-O2 comparisons, not ~600.
+    #![proptest_config(ProptestConfig::with_cases(8000))]
 
     #[test]
     fn optimized_matches_unoptimized(src in arb_expr()) {
@@ -132,9 +137,14 @@ proptest! {
                     "both sides trapped but with different panic messages for {}: {:?} vs {:?}",
                     src, e, a
                 );
+                // Div's panic message is "attempt to divide by zero"; Rem's
+                // is the differently-worded "attempt to calculate the
+                // remainder with a divisor of zero" -- `%` isn't in
+                // arb_expr today, but check both messages now so adding it
+                // later doesn't silently fail this guard.
                 prop_assert!(
-                    e.contains("divide by zero"),
-                    "both sides trapped with matching message {:?} for {src:?}, but it isn't the known i64 div/rem-by-zero trap -- investigate before trusting this as expected",
+                    e.contains("divide by zero") || e.contains("divisor of zero"),
+                    "both sides trapped with matching message {:?} for {src:?}, but it isn't a known i64 div/rem-by-zero trap -- investigate before trusting this as expected",
                     e
                 );
             }
