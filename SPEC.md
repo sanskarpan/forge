@@ -460,8 +460,19 @@ const REDUCTIONS: &[&str] = &[
     "x * 3          → lea (x + x*2)",
     "x * 5          → lea (x + x*4)",
     "x * 9          → lea (x + x*8)",
-    "pow(x, 2)      → x * x",
-    "pow(x, 0.5)    → sqrt(x)",
+    // ⚠ Investigated during Phase 4 and NOT implemented: `pow(x, 2)`,
+    // `pow(x, 0.5)`, and `pow(x, -1)` were all empirically checked against
+    // this platform's libm across a large random sample (see forge-opt's
+    // strength.rs) and NONE are bit-exact against `x*x`/`sqrt(x)`/`1/x`
+    // respectively — general-purpose `pow()` is not guaranteed
+    // correctly-rounded the way IEEE multiply/sqrt/divide are, so this
+    // "obvious" rewrite silently changes answers by 1 ULP (or differs in
+    // sign/NaN-ness at special values) on real hardware. Listed here as the
+    // rule you'd expect a compiler to have, specifically so a reader knows
+    // it was considered and rejected, not overlooked.
+    "pow(x, 2)      → x * x           (rejected — not bit-exact, see caveat)",
+    "pow(x, 0.5)    → sqrt(x)         (rejected — not bit-exact, see caveat)",
+    "pow(x, -1)     → 1 / x           (rejected — not bit-exact, see caveat)",
     "exp(x) * exp(y)→ exp(x + y)     (fast-math only)",
 ];
 ```
