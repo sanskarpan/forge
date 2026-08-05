@@ -44,3 +44,58 @@ fn mov_reg_reg_needs_rex_r_for_an_extended_source() {
     assert_eq!(a.code(), &[0x4C, 0x89, 0xC8]);
     assert_eq!(disassemble(a.code()), vec!["mov rax,r9"]);
 }
+
+#[test]
+fn mov_reg_mem_generic_base_with_disp8() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::Rcx, 8);
+    assert_eq!(a.code(), &[0x48, 0x8B, 0x41, 0x08]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[rcx+8]"]);
+}
+
+#[test]
+fn mov_reg_mem_generic_base_with_disp32() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::Rcx, 1000);
+    assert_eq!(a.code(), &[0x48, 0x8B, 0x81, 0xE8, 0x03, 0x00, 0x00]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[rcx+3E8h]"]);
+}
+
+/// rsp requires a SIB byte -- ModRM.rm=100 alone means "SIB follows", so
+/// `[rsp]` cannot be encoded without one.
+#[test]
+fn mov_reg_mem_rsp_base_requires_sib() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::Rsp, 0);
+    assert_eq!(a.code(), &[0x48, 0x8B, 0x04, 0x24]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[rsp]"]);
+}
+
+/// r12 hits the SAME SIB-required case as rsp, via REX.B -- easy to
+/// handle rsp and forget its extended twin.
+#[test]
+fn mov_reg_mem_r12_base_requires_sib() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::R12, 0);
+    assert_eq!(a.code(), &[0x49, 0x8B, 0x04, 0x24]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[r12]"]);
+}
+
+/// rbp with disp=0 must use mod=01 disp8=0 -- mod=00 rm=101 means
+/// RIP-relative, not `[rbp]`.
+#[test]
+fn mov_reg_mem_rbp_base_with_zero_disp_forces_disp8() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::Rbp, 0);
+    assert_eq!(a.code(), &[0x48, 0x8B, 0x45, 0x00]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[rbp]"]);
+}
+
+/// r13 hits the SAME disp0 trap as rbp, via REX.B.
+#[test]
+fn mov_reg_mem_r13_base_with_zero_disp_forces_disp8() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::R13, 0);
+    assert_eq!(a.code(), &[0x49, 0x8B, 0x45, 0x00]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[r13]"]);
+}

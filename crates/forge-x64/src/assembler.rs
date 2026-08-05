@@ -40,13 +40,6 @@ enum DispMode {
 
 impl DispMode {
     /// The raw 2-bit ModRM `mod` field value.
-    // `#[allow(dead_code)]`: plain `cargo clippy --workspace -- -D
-    // warnings` (this project's actual CI invocation -- see
-    // .github/workflows/ci.yml) does not compile with `--cfg test`, so it
-    // can't see this method's only call site, which is inside `#[cfg(test)]
-    // mod tests` below, until Task 4's `modrm_mem()` becomes a second,
-    // production call site. Remove this allow in Task 4 once that happens.
-    #[allow(dead_code)]
     fn bits(self) -> u8 {
         match self {
             DispMode::None => 0b00,
@@ -61,10 +54,6 @@ impl DispMode {
 /// (mod=00 there would collide with RIP-relative addressing) -- callers
 /// building a full ModRM/SIB byte are responsible for special-casing that
 /// themselves.
-// `#[allow(dead_code)]`: same reason as `DispMode::bits` above -- only
-// called from `#[cfg(test)]` until Task 4's `modrm_mem()` wires it in.
-// Remove this allow in Task 4.
-#[allow(dead_code)]
 fn disp_mode(disp: i32) -> DispMode {
     if disp == 0 {
         DispMode::None
@@ -77,10 +66,6 @@ fn disp_mode(disp: i32) -> DispMode {
 
 impl Assembler {
     /// Emits the displacement bytes implied by a `disp_mode` result.
-    // `#[allow(dead_code)]`: same reason as `disp_mode` above -- only
-    // called from `#[cfg(test)]` until Task 4's `modrm_mem()` wires it in.
-    // Remove this allow in Task 4.
-    #[allow(dead_code)]
     fn emit_disp(&mut self, mode: DispMode, disp: i32) {
         match mode {
             DispMode::None => {}
@@ -126,6 +111,45 @@ impl Assembler {
         self.rex(true, src.encoding(), 0, dst.encoding());
         self.code.push(0x89);
         self.modrm_reg(src.encoding(), dst.encoding());
+    }
+
+    /// Memory operand encoding, with three cases that MUST be
+    /// special-cased:
+    ///   * `base == RSP (4)`: ModRM.rm=100 means "SIB follows", so `[rsp]`
+    ///     cannot be encoded directly -- a SIB byte with index=100 (none)
+    ///     is required.
+    ///   * `base == RBP (5)` with `disp == 0`: mod=00 rm=101 means
+    ///     RIP-relative, NOT `[rbp]`. Must force mod=01 disp8=0.
+    ///   * R12 and R13 hit the same two cases via REX.B -- very easy to
+    ///     handle rsp/rbp and forget their extended twins.
+    fn modrm_mem(&mut self, reg: u8, base: u8, disp: i32) {
+        let base_low = base & 7;
+
+        if base_low == 4 {
+            // RSP or R12 -> SIB required
+            let mode = disp_mode(disp);
+            self.code.push(mode.bits() << 6 | ((reg & 7) << 3) | 0b100);
+            self.code.push(0b00_100_100); // scale=1, index=none, base=rsp/r12
+            self.emit_disp(mode, disp);
+        } else if base_low == 5 && disp == 0 {
+            // RBP or R13 -> must use disp8, mod=00 would mean RIP-relative
+            self.code.push(0b01 << 6 | ((reg & 7) << 3) | base_low);
+            self.code.push(0); // explicit zero displacement
+        } else {
+            let mode = disp_mode(disp);
+            self.code
+                .push(mode.bits() << 6 | ((reg & 7) << 3) | base_low);
+            self.emit_disp(mode, disp);
+        }
+    }
+
+    /// `mov dst, [base + disp]` -- 64-bit load. Encoded as
+    /// `REX.W + 8B /r` (MOV r64, r/m64): ModRM.reg is the destination,
+    /// ModRM.rm (via `modrm_mem`) addresses the memory operand.
+    pub fn mov_reg_mem(&mut self, dst: PhysReg, base: PhysReg, disp: i32) {
+        self.rex(true, dst.encoding(), 0, base.encoding());
+        self.code.push(0x8B);
+        self.modrm_mem(dst.encoding(), base.encoding(), disp);
     }
 }
 
