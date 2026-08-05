@@ -70,6 +70,30 @@ mod platform {
         fn sys_icache_invalidate(start: *mut libc::c_void, len: libc::size_t);
     }
 
+    /// Restores write-protection and invalidates the icache when dropped --
+    /// including on unwind, if the caller's closure in `write()` panics.
+    /// `pthread_jit_write_protect_np` is a per-thread toggle affecting
+    /// every `ExecutableBuffer` live on this thread, not just the one
+    /// being written to right now, so leaving it disabled after a panic
+    /// would silently break W^X for buffers this call never touched.
+    struct WriteGuard {
+        ptr: *mut u8,
+        len: usize,
+    }
+
+    impl Drop for WriteGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores write-protection and invalidates the
+            // icache unconditionally, including on the unwind path --
+            // ptr/len describe the same MAP_JIT mapping the enclosing
+            // write() validated before constructing this guard.
+            unsafe {
+                pthread_jit_write_protect_np(1);
+                sys_icache_invalidate(self.ptr as *mut libc::c_void, self.len);
+            }
+        }
+    }
+
     impl ExecutableBuffer {
         pub fn new(size: usize) -> io::Result<Self> {
             let page = page_size();
@@ -89,11 +113,14 @@ mod platform {
                 )
             };
             if ptr == libc::MAP_FAILED {
-                return Err(io::Error::other(format!(
-                    "mmap MAP_JIT failed: {} -- is com.apple.security.cs.allow-jit present \
-                     in the entitlements, and is the binary codesigned?",
-                    io::Error::last_os_error()
-                )));
+                return Err(io::Error::new(
+                    io::Error::last_os_error().kind(),
+                    format!(
+                        "mmap MAP_JIT failed: {} -- is com.apple.security.cs.allow-jit present \
+                         in the entitlements, and is the binary codesigned?",
+                        io::Error::last_os_error()
+                    ),
+                ));
             }
             Ok(Self {
                 ptr: ptr as *mut u8,
@@ -107,16 +134,21 @@ mod platform {
             // pthread_jit_write_protect_np(0) grants THIS thread write
             // access to MAP_JIT pages (mprotect cannot be used on them --
             // it returns EACCES); f only ever sees a correctly-bounded
-            // slice; write access is revoked and the icache invalidated
-            // before this function returns, so no other thread can
-            // observe a state where the page is both writable and
-            // stale-icache at once.
+            // slice. The WriteGuard constructed below revokes write access
+            // and invalidates the icache when it drops -- on the normal
+            // return path AND on unwind if `f` panics -- so no other
+            // thread can observe a state where the page is both writable
+            // and stale-icache at once, and a panicking `f` can't leave
+            // this thread's write-protection toggle disabled.
             unsafe {
                 pthread_jit_write_protect_np(0);
+                let guard = WriteGuard {
+                    ptr: self.ptr,
+                    len: self.len,
+                };
                 let slice = std::slice::from_raw_parts_mut(self.ptr, self.len);
                 f(slice);
-                pthread_jit_write_protect_np(1);
-                sys_icache_invalidate(self.ptr as *mut libc::c_void, self.len);
+                drop(guard);
             }
         }
 
@@ -175,7 +207,7 @@ mod tests {
     #[test]
     fn a_zero_size_request_rounds_up_to_one_page() {
         let buf = ExecutableBuffer::new(0).expect("should not fail on a 0-byte request");
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 
     #[test]
@@ -184,5 +216,38 @@ mod tests {
         let buf = ExecutableBuffer::new(1).expect("allocation should succeed");
         assert_eq!(buf.len() % page, 0);
         assert!(buf.len() >= page);
+    }
+
+    #[test]
+    fn a_panicking_write_closure_still_leaves_the_buffer_usable() {
+        let mut buf = ExecutableBuffer::new(64).expect("allocation should succeed");
+
+        // A panic inside the write() closure must not leave this thread's
+        // write-protection toggle permanently disabled -- catch_unwind here
+        // keeps the panic from aborting the whole test process, the same
+        // way a caller's real panicking closure wouldn't take down anyone
+        // else's ExecutableBuffer on this thread.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buf.write(|_mem| panic!("boom"));
+        }));
+        assert!(
+            result.is_err(),
+            "expected the write() closure's panic to propagate"
+        );
+
+        // If WriteGuard's Drop genuinely ran on unwind, write-protection is
+        // re-enabled and a fresh write/execute cycle on the SAME buffer
+        // still works correctly.
+        buf.write(|mem| {
+            mem[..4].copy_from_slice(&[0xC0, 0x03, 0x5F, 0xD6]);
+        });
+        buf.make_executable()
+            .expect("make_executable should succeed");
+
+        // SAFETY: same as allocate_write_execute_roundtrip -- a complete,
+        // valid `ret`-only function body matching fn(i64) -> i64.
+        let f: unsafe extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+        let value = unsafe { f(42) };
+        assert_eq!(value, 42);
     }
 }
