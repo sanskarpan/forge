@@ -218,36 +218,9 @@ mod tests {
         assert!(buf.len() >= page);
     }
 
-    #[test]
-    fn a_panicking_write_closure_still_leaves_the_buffer_usable() {
-        let mut buf = ExecutableBuffer::new(64).expect("allocation should succeed");
-
-        // A panic inside the write() closure must not leave this thread's
-        // write-protection toggle permanently disabled -- catch_unwind here
-        // keeps the panic from aborting the whole test process, the same
-        // way a caller's real panicking closure wouldn't take down anyone
-        // else's ExecutableBuffer on this thread.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            buf.write(|_mem| panic!("boom"));
-        }));
-        assert!(
-            result.is_err(),
-            "expected the write() closure's panic to propagate"
-        );
-
-        // If WriteGuard's Drop genuinely ran on unwind, write-protection is
-        // re-enabled and a fresh write/execute cycle on the SAME buffer
-        // still works correctly.
-        buf.write(|mem| {
-            mem[..4].copy_from_slice(&[0xC0, 0x03, 0x5F, 0xD6]);
-        });
-        buf.make_executable()
-            .expect("make_executable should succeed");
-
-        // SAFETY: same as allocate_write_execute_roundtrip -- a complete,
-        // valid `ret`-only function body matching fn(i64) -> i64.
-        let f: unsafe extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(buf.as_ptr()) };
-        let value = unsafe { f(42) };
-        assert_eq!(value, 42);
-    }
+    // The panic-safety regression test for write()'s unwind path lives in
+    // tests/write_panic_protection.rs, not here: it needs fork(), and
+    // forking safely requires being the only test running in its process
+    // (see that file's doc comment) -- a guarantee this multi-test `--lib`
+    // binary can't give it.
 }
