@@ -1,4 +1,14 @@
 //! Executable memory management (ExecutableBuffer, W^X). See CHECKLIST.md Phase 5.
+//!
+//! **Miri is explicitly out of scope for this crate's CI.** Miri cannot
+//! model raw `mmap`/`mprotect`/`sysconf` syscalls or a transmute-to a
+//! function pointer followed by calling it -- there is no meaningful way
+//! to run this crate's tests under Miri, so this is a documented decision,
+//! not an oversight. Correctness here instead rests on: the macOS-AArch64
+//! path being empirically tested (allocate/write/execute, W^X-enforcement
+//! fork/SIGSEGV, and 10k-cycle leak tests all run for real on that
+//! platform), and the generic-Unix path being cross-compile-checked only
+//! (see the `platform` module in this file).
 
 use std::io;
 
