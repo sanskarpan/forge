@@ -220,6 +220,11 @@ fn binding_a_label_resolves_all_pending_forward_fixups() {
     a.jmp(l); // forward reference #1
     let second_jmp_at = a.code().len();
     a.jmp(l); // forward reference #2
+    a.mov_reg_reg(PhysReg::Rax, PhysReg::Rax); // filler so the second fixup's
+                                               // correct patched value is
+                                               // nonzero, not coincidentally
+                                               // identical to the unpatched
+                                               // placeholder bytes
     let target_pos = a.code().len();
     a.bind(l); // must resolve BOTH pending fixups
 
