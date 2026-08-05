@@ -748,7 +748,21 @@ fn writing_to_an_executable_page_segfaults() {
         "expected the child to be killed by a signal (W^X enforced), but it exited normally with status {status}"
     );
     let sig = libc::WTERMSIG(status);
-    assert_eq!(sig, libc::SIGSEGV, "expected SIGSEGV specifically, got signal {sig}");
+    // NOTE: an earlier fork-based regression test in this crate
+    // (crates/forge-mem/tests/write_panic_protection.rs, from Task 1)
+    // empirically found that a MAP_JIT write-protect violation on this
+    // machine raises SIGBUS (10), not SIGSEGV (11) -- both are valid
+    // hardware-fault signals for a protection violation, and which one a
+    // given OS/kernel chooses is not part of the portable contract we're
+    // testing here (we only care THAT the OS enforces W^X, not which
+    // signal it happens to use to do so). Accept either rather than
+    // asserting SIGSEGV specifically; if this test fails with a different
+    // signal on some future platform, that's worth investigating, but
+    // SIGBUS vs SIGSEGV specifically is already confirmed to vary.
+    assert!(
+        sig == libc::SIGSEGV || sig == libc::SIGBUS,
+        "expected SIGSEGV or SIGBUS (W^X enforcement fault), got signal {sig}"
+    );
 }
 ```
 
