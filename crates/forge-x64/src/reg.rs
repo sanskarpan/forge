@@ -128,17 +128,41 @@ mod tests {
 
     #[test]
     fn gpr_encodings_match_hardware_numbers() {
-        assert_eq!(PhysReg::Rax.encoding(), 0);
-        assert_eq!(PhysReg::Rdi.encoding(), 7);
-        assert_eq!(PhysReg::R8.encoding(), 8);
-        assert_eq!(PhysReg::R15.encoding(), 15);
+        use PhysReg::*;
+        let expected = [
+            (Rax, 0),
+            (Rcx, 1),
+            (Rdx, 2),
+            (Rbx, 3),
+            (Rsp, 4),
+            (Rbp, 5),
+            (Rsi, 6),
+            (Rdi, 7),
+            (R8, 8),
+            (R9, 9),
+            (R10, 10),
+            (R11, 11),
+            (R12, 12),
+            (R13, 13),
+            (R14, 14),
+            (R15, 15),
+        ];
+        for (reg, expected_encoding) in expected {
+            assert_eq!(reg.encoding(), expected_encoding, "{reg:?}");
+        }
     }
 
     #[test]
     fn xmm_encodings_match_hardware_numbers() {
-        assert_eq!(PhysReg::Xmm0.encoding(), 0);
-        assert_eq!(PhysReg::Xmm15.encoding(), 15);
-        assert_eq!(PhysReg::Xmm31.encoding(), 31);
+        use PhysReg::*;
+        let expected = [
+            Xmm0, Xmm1, Xmm2, Xmm3, Xmm4, Xmm5, Xmm6, Xmm7, Xmm8, Xmm9, Xmm10, Xmm11, Xmm12, Xmm13,
+            Xmm14, Xmm15, Xmm16, Xmm17, Xmm18, Xmm19, Xmm20, Xmm21, Xmm22, Xmm23, Xmm24, Xmm25,
+            Xmm26, Xmm27, Xmm28, Xmm29, Xmm30, Xmm31,
+        ];
+        for (i, reg) in expected.into_iter().enumerate() {
+            assert_eq!(reg.encoding(), i as u8, "{reg:?}");
+        }
     }
 
     #[test]
