@@ -1,19 +1,108 @@
 use crate::PhysReg;
 
-/// Emits x86-64 machine code byte by byte. The `Assembler` owns the
-/// growing byte buffer and (starting in a later task) label/fixup state
-/// for forward jump resolution.
+/// Emits x86-64 machine code byte by byte, tracking label positions and
+/// pending forward-jump fixups.
 pub struct Assembler {
     code: Vec<u8>,
+    labels: Vec<Option<usize>>,
+    fixups: Vec<Fixup>,
+}
+
+/// An opaque handle to a not-yet-necessarily-bound code position, created
+/// by `Assembler::new_label` and resolved by `Assembler::bind`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Label(usize);
+
+/// A pending forward reference: at the time this was recorded, `target`
+/// wasn't bound yet, so 4 placeholder rel32 displacement bytes were
+/// written at `at` and must be patched once `target` is bound. There is
+/// no `Rel8` variant here -- per `jmp()`'s policy below, forward jumps
+/// always use rel32 (backward jumps compute their distance immediately
+/// and never need a fixup at all), so a rel8 fixup kind would be
+/// unconstructed dead code today. Add one back if a future instruction
+/// (e.g. a conditional jump) genuinely needs optimistic-rel8 forward-fixup
+/// behavior.
+struct Fixup {
+    at: usize,
+    target: Label,
 }
 
 impl Assembler {
     pub fn new() -> Self {
-        Self { code: Vec::new() }
+        Self {
+            code: Vec::new(),
+            labels: Vec::new(),
+            fixups: Vec::new(),
+        }
     }
 
     pub fn code(&self) -> &[u8] {
         &self.code
+    }
+
+    /// Creates a new, not-yet-bound label.
+    pub fn new_label(&mut self) -> Label {
+        self.labels.push(None);
+        Label(self.labels.len() - 1)
+    }
+
+    /// Records the label's address as the current end of `code`, then
+    /// resolves every pending fixup that targets it by patching the
+    /// placeholder displacement bytes reserved at fixup-creation time.
+    pub fn bind(&mut self, label: Label) {
+        let pos = self.code.len();
+        self.labels[label.0] = Some(pos);
+
+        let mut i = 0;
+        while i < self.fixups.len() {
+            if self.fixups[i].target == label {
+                let fixup = self.fixups.remove(i);
+                self.patch_fixup(&fixup, pos);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn patch_fixup(&mut self, fixup: &Fixup, target_pos: usize) {
+        let rel = target_pos as isize - (fixup.at + 4) as isize;
+        let bytes = (rel as i32).to_le_bytes();
+        self.code[fixup.at..fixup.at + 4].copy_from_slice(&bytes);
+    }
+
+    /// `jmp label` -- unconditional jump.
+    ///
+    /// Backward jumps (label already bound): the exact byte distance is
+    /// known immediately, so this picks rel8 if it fits, else rel32 --
+    /// encoded directly, no fixup needed since nothing about a backward
+    /// jump's distance can change later.
+    ///
+    /// Forward jumps (label not yet bound): the real distance isn't
+    /// knowable until `bind()` runs later. True "promote rel8 to rel32 in
+    /// place" would require shifting every byte after the insertion point
+    /// and adjusting every later label position and pending fixup -- real
+    /// complexity this project's design doc deliberately opts out of for a
+    /// JIT compiling small expressions. So forward jumps unconditionally
+    /// emit rel32 and record a fixup, resolved once `bind()` runs.
+    pub fn jmp(&mut self, label: Label) {
+        if let Some(target_pos) = self.labels[label.0] {
+            let end_if_rel8 = self.code.len() + 2;
+            let rel = target_pos as isize - end_if_rel8 as isize;
+            if let Ok(rel8) = i8::try_from(rel) {
+                self.code.push(0xEB);
+                self.code.push(rel8 as u8);
+            } else {
+                let end_if_rel32 = self.code.len() + 5;
+                let rel32 = target_pos as isize - end_if_rel32 as isize;
+                self.code.push(0xE9);
+                self.code.extend_from_slice(&(rel32 as i32).to_le_bytes());
+            }
+        } else {
+            self.code.push(0xE9);
+            let at = self.code.len();
+            self.code.extend_from_slice(&[0, 0, 0, 0]); // placeholder, patched by bind()
+            self.fixups.push(Fixup { at, target: label });
+        }
     }
 }
 

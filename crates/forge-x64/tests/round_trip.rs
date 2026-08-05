@@ -142,3 +142,67 @@ fn mov_reg_mem_r13_base_with_nonzero_disp32_uses_normal_path() {
     assert_eq!(a.code(), &[0x49, 0x8B, 0x85, 0xE8, 0x03, 0x00, 0x00]);
     assert_eq!(disassemble(a.code()), vec!["mov rax,[r13+3E8h]"]);
 }
+
+#[test]
+fn backward_jump_that_fits_uses_rel8() {
+    let mut a = Assembler::new();
+    let l = a.new_label();
+    a.bind(l); // label at position 0
+    a.mov_reg_reg(PhysReg::Rax, PhysReg::Rax); // 3 bytes of filler: 48 89 C0
+    let len_before_jmp = a.code().len();
+    a.jmp(l); // backward reference, close enough for rel8
+
+    let expected_rel = -(len_before_jmp as i32 + 2); // rel8 measured from the end of this 2-byte instruction
+    assert_eq!(a.code()[len_before_jmp], 0xEB);
+    assert_eq!(a.code()[len_before_jmp + 1], expected_rel as i8 as u8);
+    assert_eq!(a.code().len(), len_before_jmp + 2);
+
+    let text = disassemble(a.code());
+    assert!(text.last().unwrap().starts_with("jmp"));
+}
+
+#[test]
+fn backward_jump_that_does_not_fit_uses_rel32() {
+    let mut a = Assembler::new();
+    let l = a.new_label();
+    a.bind(l); // label at position 0
+    for _ in 0..50 {
+        a.mov_reg_reg(PhysReg::Rax, PhysReg::Rax); // 3 bytes each, 150 bytes total -- far enough that rel8 can't reach
+    }
+    let len_before_jmp = a.code().len();
+    a.jmp(l); // backward reference, too far for rel8
+
+    let expected_rel = -(len_before_jmp as i32 + 5); // rel32 measured from the end of this 5-byte instruction
+    assert_eq!(a.code()[len_before_jmp], 0xE9);
+    assert_eq!(
+        &a.code()[len_before_jmp + 1..len_before_jmp + 5],
+        &expected_rel.to_le_bytes()
+    );
+    assert_eq!(a.code().len(), len_before_jmp + 5);
+
+    let text = disassemble(a.code());
+    assert!(text.last().unwrap().starts_with("jmp"));
+}
+
+#[test]
+fn forward_jump_always_uses_rel32() {
+    let mut a = Assembler::new();
+    let l = a.new_label();
+    let jmp_at = a.code().len(); // 0
+    a.jmp(l); // forward reference -- label not bound yet
+    assert_eq!(a.code()[jmp_at], 0xE9); // always rel32 for forward jumps, never rel8
+    assert_eq!(a.code().len(), jmp_at + 5);
+
+    a.mov_reg_reg(PhysReg::Rax, PhysReg::Rax); // 3 bytes of filler between the jmp and its target
+    let target_pos = a.code().len();
+    a.bind(l); // resolves the fixup recorded above
+
+    let expected_rel = target_pos as i32 - (jmp_at as i32 + 5); // rel32 measured from the end of the 5-byte jmp
+    assert_eq!(
+        &a.code()[jmp_at + 1..jmp_at + 5],
+        &expected_rel.to_le_bytes()
+    );
+
+    let text = disassemble(a.code());
+    assert!(text[0].starts_with("jmp"));
+}
