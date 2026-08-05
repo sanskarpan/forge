@@ -219,7 +219,13 @@ mod platform {
                 let slice = std::slice::from_raw_parts_mut(self.ptr, self.len);
                 f(slice);
             }
-            clear_icache_if_needed(self.ptr, self.len);
+            // SAFETY: ptr/len describe this buffer's own mapping, which is
+            // still valid and mapped at this point (new()'s mmap succeeded,
+            // and drop() -- the only thing that unmaps it -- can't have run
+            // yet since we're inside a &mut self method).
+            unsafe {
+                clear_icache_if_needed(self.ptr, self.len);
+            }
         }
 
         pub fn make_executable(&mut self) -> io::Result<()> {
@@ -250,7 +256,54 @@ mod platform {
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn clear_icache_if_needed(ptr: *mut u8, len: usize) {
+    use std::sync::OnceLock;
+
+    #[cfg(target_arch = "aarch64")]
+    fn ctr_el0() -> u64 {
+        let ctr_el0: u64;
+        // SAFETY: MRS from CTR_EL0 is a read-only, unprivileged system
+        // register read with no preconditions -- available at EL0 on all
+        // AArch64 cores.
+        unsafe {
+            std::arch::asm!("mrs {0}, ctr_el0", out(reg) ctr_el0);
+        }
+        ctr_el0
+    }
+
+    /// Instruction-cache line size in bytes, read from `CTR_EL0.IminLine`
+    /// (bits [3:0], expressed in words) rather than assumed -- cache line
+    /// size is NOT architecturally guaranteed to be any particular value,
+    /// which is exactly why this register exists and why glibc/Linux/V8/JSC
+    /// all query it at runtime instead of hardcoding a constant. Cached
+    /// after the first read since it cannot change at runtime.
+    #[cfg(target_arch = "aarch64")]
+    fn icache_line_size() -> usize {
+        static LINE: OnceLock<usize> = OnceLock::new();
+        *LINE.get_or_init(|| {
+            let imin_line = (ctr_el0() & 0xF) as u32;
+            4usize << imin_line
+        })
+    }
+
+    /// Data-cache line size in bytes, read from `CTR_EL0.DminLine` (bits
+    /// [19:16], expressed in words). Kept separate from
+    /// `icache_line_size()` -- the two can differ on some cores, even
+    /// though on most real hardware both are 64 bytes.
+    #[cfg(target_arch = "aarch64")]
+    fn dcache_line_size() -> usize {
+        static LINE: OnceLock<usize> = OnceLock::new();
+        *LINE.get_or_init(|| {
+            let dmin_line = ((ctr_el0() >> 16) & 0xF) as u32;
+            4usize << dmin_line
+        })
+    }
+
+    /// # Safety
+    /// `[ptr, ptr + len)` must be a valid, currently-mapped region that the
+    /// caller exclusively owns. The `dc`/`ic` instructions issued here can
+    /// architecturally fault on a bad or unmapped virtual address.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn clear_icache_if_needed(ptr: *mut u8, len: usize) {
         // Linux AArch64: the icache is not coherent with the dcache -- same
         // ARCHITECTURAL reason as macOS AArch64 (this is an ARM property,
         // not an Apple one), so it needs the same treatment even though
@@ -261,38 +314,46 @@ mod platform {
         // UNTESTED on real hardware (no Linux ARM64 machine available for
         // this project) -- written from documented ARM64 cache-maintenance
         // instructions (DC CVAU / IC IVAU / DSB / ISB) and cross-compile
-        // checked only. The 64-byte stride is a conservative assumption
-        // (common ARM64 L1 cache line size); a smaller-than-actual stride
-        // is always safe (just redundant work), so this errs safe even if
-        // the real hardware's line size differs.
+        // checked only. The stride/alignment for each loop is read from
+        // CTR_EL0 at runtime (see icache_line_size()/dcache_line_size())
+        // rather than assumed -- a hardcoded guess would silently skip
+        // cache lines and leave stale icache entries on any core whose
+        // real line size is smaller than the guess.
         //
-        // SAFETY: ptr/len describe a valid, currently-mapped region this
-        // ExecutableBuffer exclusively owns; the asm blocks only read
-        // `addr` and issue architecturally-defined cache-maintenance
-        // instructions -- no memory is written by this function.
+        // SAFETY: caller guarantees ptr/len describe a valid, currently-
+        // mapped region; the asm blocks only read `addr` and issue
+        // architecturally-defined cache-maintenance instructions -- no
+        // memory is written by this function.
         unsafe {
             let start = ptr as usize;
             let end = start + len;
 
-            let mut addr = start & !63;
+            let dline = dcache_line_size();
+            let mut addr = start & !(dline - 1);
             while addr < end {
                 std::arch::asm!("dc cvau, {0}", in(reg) addr);
-                addr += 64;
+                addr += dline;
             }
             std::arch::asm!("dsb ish");
 
-            let mut addr = start & !63;
+            let iline = icache_line_size();
+            let mut addr = start & !(iline - 1);
             while addr < end {
                 std::arch::asm!("ic ivau, {0}", in(reg) addr);
-                addr += 64;
+                addr += iline;
             }
             std::arch::asm!("dsb ish");
             std::arch::asm!("isb");
         }
     }
 
+    /// # Safety
+    /// `[ptr, ptr + len)` must be a valid, currently-mapped region that the
+    /// caller exclusively owns (matches the AArch64 variant's contract even
+    /// though this variant does nothing with it, so callers don't need a
+    /// `#[cfg]` split at the call site).
     #[cfg(not(target_arch = "aarch64"))]
-    fn clear_icache_if_needed(_ptr: *mut u8, _len: usize) {
+    unsafe fn clear_icache_if_needed(_ptr: *mut u8, _len: usize) {
         // x86-64: the icache is hardware-coherent with the dcache. Nothing
         // to do -- this empty fn exists so `write()`'s call site doesn't
         // need its own `#[cfg]` split.
