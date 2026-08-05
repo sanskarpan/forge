@@ -69,10 +69,25 @@ fn params_for(f: &forge_ir::Function) -> Vec<RtValue> {
 /// test, this is a genuine runtime trap that both `-O0` and `-O2` must hit
 /// identically -- the optimizer must never erase it (that would silently
 /// change program behavior) nor introduce one that wasn't there
-/// unoptimized. `Err(())` here means "trapped"; callers compare trap-for-
-/// trap rather than treating a trap as an interpreter bug.
-fn try_interpret(f: &forge_ir::Function, args: &[RtValue]) -> Result<RtValue, ()> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| interpret(f, args))).map_err(|_| ())
+/// unoptimized.
+///
+/// `Err(String)` carries the panic message, not just presence. Comparing
+/// presence alone ("both sides panicked") would conflate "both sides hit
+/// the same div-by-zero trap" with "both sides happened to panic for
+/// unrelated reasons" (e.g. one side hits the real i64/0 trap while the
+/// other panics on an unrelated interpreter bug, like an `unreachable!()`
+/// type mismatch) -- exactly the kind of interaction bug this test exists
+/// to catch, so the message itself must be compared, not thrown away.
+fn try_interpret(f: &forge_ir::Function, args: &[RtValue]) -> Result<RtValue, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| interpret(f, args))).map_err(
+        |payload| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string())
+        },
+    )
 }
 
 proptest! {
@@ -103,16 +118,33 @@ proptest! {
         std::panic::set_hook(prev_hook);
 
         match (expected, actual) {
-            // Both sides trapped (i64 div/rem by zero): the optimizer
-            // preserved the trap rather than erasing or introducing it.
-            (Err(()), Err(())) => {}
-            (Err(()), Ok(a)) => prop_assert!(
+            // Both sides trapped: require the SAME trap, not merely "both
+            // panicked" -- that distinguishes a preserved div-by-zero trap
+            // (matching messages) from two unrelated panics that happen to
+            // coincide. Also pin the message to the one known, documented
+            // trap class (i64 div/rem by zero) so a future unrelated panic
+            // that happens to fire identically on both sides -- e.g. a
+            // shared verifier bug -- still gets caught rather than
+            // silently accepted as "expected".
+            (Err(e), Err(a)) => {
+                prop_assert_eq!(
+                    &e, &a,
+                    "both sides trapped but with different panic messages for {}: {:?} vs {:?}",
+                    src, e, a
+                );
+                prop_assert!(
+                    e.contains("divide by zero"),
+                    "both sides trapped with matching message {:?} for {src:?}, but it isn't the known i64 div/rem-by-zero trap -- investigate before trusting this as expected",
+                    e
+                );
+            }
+            (Err(e), Ok(a)) => prop_assert!(
                 false,
-                "unoptimized trapped (i64 div/rem by zero) but optimized returned {a:?} for {src:?} -- optimizer erased a trap"
+                "unoptimized trapped ({e:?}) but optimized returned {a:?} for {src:?} -- optimizer erased a trap"
             ),
-            (Ok(e), Err(())) => prop_assert!(
+            (Ok(e), Err(a)) => prop_assert!(
                 false,
-                "unoptimized returned {e:?} but optimized trapped for {src:?} -- optimizer introduced a trap"
+                "unoptimized returned {e:?} but optimized trapped ({a:?}) for {src:?} -- optimizer introduced a trap"
             ),
             (Ok(RtValue::F64(e)), Ok(RtValue::F64(a))) => {
                 if e.is_nan() {
