@@ -1,3 +1,5 @@
+use crate::PhysReg;
+
 /// Emits x86-64 machine code byte by byte. The `Assembler` owns the
 /// growing byte buffer and (starting in a later task) label/fixup state
 /// for forward jump resolution.
@@ -85,6 +87,42 @@ impl Assembler {
             DispMode::Disp8 => self.code.push(disp as i8 as u8),
             DispMode::Disp32 => self.code.extend_from_slice(&disp.to_le_bytes()),
         }
+    }
+
+    /// The REX prefix is the #1 source of subtle JIT bugs, because
+    /// omitting it silently changes which register you addressed rather
+    /// than failing. Three traps, all of which produce working-looking
+    /// wrong code:
+    ///   1. Without REX.W the operation is 32-bit and ZEROES the upper 32 bits.
+    ///   2. Without REX.R/B you address rax-rdi instead of r8-r15.
+    ///   3. With ANY REX prefix, byte registers spl/bpl/sil/dil replace
+    ///      ah/ch/dh/bh -- silently different registers (not yet relevant
+    ///      to this task, since no byte-register instructions exist yet).
+    fn rex(&mut self, w: bool, reg: u8, index: u8, rm: u8) {
+        let byte = 0x40
+            | ((w as u8) << 3)
+            | (((reg >> 3) & 1) << 2) // REX.R
+            | (((index >> 3) & 1) << 1) // REX.X
+            | ((rm >> 3) & 1); // REX.B
+                               // Emit only when needed -- but ALWAYS when W, or when any register
+                               // index is >= 8.
+        if byte != 0x40 {
+            self.code.push(byte);
+        }
+    }
+
+    fn modrm_reg(&mut self, reg: u8, rm: u8) {
+        self.code.push(0b11 << 6 | ((reg & 7) << 3) | (rm & 7));
+    }
+
+    /// `mov dst, src` -- register-to-register, 64-bit. Encoded as
+    /// `REX.W + 89 /r` (MOV r/m64, r64): the ModRM.rm field is the
+    /// destination and ModRM.reg is the source, matching the day-one
+    /// spike's `48 89 F8` ("mov rax, rdi").
+    pub fn mov_reg_reg(&mut self, dst: PhysReg, src: PhysReg) {
+        self.rex(true, src.encoding(), 0, dst.encoding());
+        self.code.push(0x89);
+        self.modrm_reg(src.encoding(), dst.encoding());
     }
 }
 
