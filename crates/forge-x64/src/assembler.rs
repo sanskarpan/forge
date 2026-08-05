@@ -9,7 +9,10 @@ pub struct Assembler {
 }
 
 /// An opaque handle to a not-yet-necessarily-bound code position, created
-/// by `Assembler::new_label` and resolved by `Assembler::bind`.
+/// by `Assembler::new_label` and resolved by `Assembler::bind`. Only valid
+/// for the `Assembler` instance that created it -- it's an unowned index
+/// into that assembler's private `labels` vector, so passing one to a
+/// different `Assembler` would index the wrong vector entirely.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Label(usize);
 
@@ -49,7 +52,23 @@ impl Assembler {
     /// Records the label's address as the current end of `code`, then
     /// resolves every pending fixup that targets it by patching the
     /// placeholder displacement bytes reserved at fixup-creation time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `label` was already bound. Rebinding would silently
+    /// corrupt codegen: any jumps already resolved against the first
+    /// binding stay frozen at that (now stale) address, while jumps
+    /// recorded after this second call would resolve against the new one
+    /// -- two inconsistent notions of "where the label is" baked into the
+    /// same buffer, with no error anywhere. This is a caller bug, and in a
+    /// JIT compiler a wrong jump target is a correctness issue, so it must
+    /// fail loudly in release builds too, not just under `debug_assert!`.
     pub fn bind(&mut self, label: Label) {
+        assert!(
+            self.labels[label.0].is_none(),
+            "label {:?} was already bound -- rebinding would silently corrupt any jumps already resolved against its first position",
+            label
+        );
         let pos = self.code.len();
         self.labels[label.0] = Some(pos);
 

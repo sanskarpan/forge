@@ -206,3 +206,31 @@ fn forward_jump_always_uses_rel32() {
     let text = disassemble(a.code());
     assert!(text[0].starts_with("jmp"));
 }
+
+/// `bind()` walks `fixups` and removes entries in place while iterating --
+/// an off-by-one there (e.g. incrementing the index after a `Vec::remove`)
+/// would silently skip patching the fixup that shifted into the removed
+/// slot. Pin this down with two pending forward references to the same
+/// label before it's bound.
+#[test]
+fn binding_a_label_resolves_all_pending_forward_fixups() {
+    let mut a = Assembler::new();
+    let l = a.new_label();
+    let first_jmp_at = a.code().len();
+    a.jmp(l); // forward reference #1
+    let second_jmp_at = a.code().len();
+    a.jmp(l); // forward reference #2
+    let target_pos = a.code().len();
+    a.bind(l); // must resolve BOTH pending fixups
+
+    let expected_rel_first = target_pos as i32 - (first_jmp_at as i32 + 5);
+    let expected_rel_second = target_pos as i32 - (second_jmp_at as i32 + 5);
+    assert_eq!(
+        &a.code()[first_jmp_at + 1..first_jmp_at + 5],
+        &expected_rel_first.to_le_bytes()
+    );
+    assert_eq!(
+        &a.code()[second_jmp_at + 1..second_jmp_at + 5],
+        &expected_rel_second.to_le_bytes()
+    );
+}
