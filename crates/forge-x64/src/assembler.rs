@@ -105,7 +105,7 @@ impl Assembler {
             | (((index >> 3) & 1) << 1) // REX.X
             | ((rm >> 3) & 1); // REX.B
                                // Emit only when needed -- but ALWAYS when W, or when any register
-                               // index is >= 8.
+                               // index is >= 8, or when addressing spl/bpl/sil/dil.
         if byte != 0x40 {
             self.code.push(byte);
         }
@@ -120,6 +120,9 @@ impl Assembler {
     /// destination and ModRM.reg is the source, matching the day-one
     /// spike's `48 89 F8` ("mov rax, rdi").
     pub fn mov_reg_reg(&mut self, dst: PhysReg, src: PhysReg) {
+        // index=0 is a placeholder: register-direct addressing has no
+        // SIB/index operand, so REX.X is irrelevant here. Only matters once
+        // modrm_mem/SIB with a real index register exists (Task 4).
         self.rex(true, src.encoding(), 0, dst.encoding());
         self.code.push(0x89);
         self.modrm_reg(src.encoding(), dst.encoding());
@@ -183,5 +186,26 @@ mod tests {
         let mut a = Assembler::new();
         a.emit_disp(DispMode::Disp32, -1000);
         assert_eq!(a.code(), &(-1000i32).to_le_bytes());
+    }
+
+    #[test]
+    fn rex_is_omitted_when_nothing_needs_it() {
+        let mut a = Assembler::new();
+        a.rex(false, 0, 0, 0);
+        assert_eq!(a.code(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn rex_sets_r_and_b_together_when_both_operands_need_extension() {
+        let mut a = Assembler::new();
+        a.rex(true, 9, 0, 12); // reg=R9 (needs REX.R), rm=R12 (needs REX.B)
+        assert_eq!(a.code(), &[0x4D]); // W=1, R=1, X=0, B=1 -> 0x40|0x08|0x04|0x01
+    }
+
+    #[test]
+    fn modrm_reg_encodes_matching_reg_and_rm() {
+        let mut a = Assembler::new();
+        a.modrm_reg(0, 0); // reg==rm, e.g. the "rax,rax" case
+        assert_eq!(a.code(), &[0xC0]);
     }
 }
