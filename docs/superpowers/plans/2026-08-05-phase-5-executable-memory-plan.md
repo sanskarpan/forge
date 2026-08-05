@@ -518,11 +518,20 @@ impl CompiledExpr {
     }
 
     pub fn call_n(&self, args: &[f64]) -> f64 {
-        assert_eq!(self.arity, args.len(), "arity mismatch: compiled for {} argument(s), called via call_n with {}", self.arity, args.len());
+        // NOTE: this is `>=`, not `==` -- the callee is only guaranteed (by
+        // construction) to read the first `arity` elements through the raw
+        // pointer, so a longer slice is safe (the test below deliberately
+        // passes extra unread elements to prove this); only a SHORTER
+        // slice would be unsound. An earlier draft used `assert_eq!` here,
+        // which is stricter than the actual safety invariant requires and
+        // rejects perfectly safe calls -- caught because it made this
+        // task's own `call_n_reads_first_element` test below fail.
+        assert!(args.len() >= self.arity, "arity mismatch: compiled for {} argument(s), called via call_n with only {}", self.arity, args.len());
         debug_assert_eq!(self.buf.state(), ProtState::Executable);
         // SAFETY: same as call1, for fn(*const f64) -> f64; `args` outlives
-        // this call and its pointer is valid for `args.len()` reads, which
-        // is what the arity check above guarantees the callee expects.
+        // this call and its pointer is valid for at least `self.arity`
+        // reads, which is what the arity check above guarantees (and all
+        // the callee is permitted to read).
         let f: unsafe extern "C" fn(*const f64) -> f64 = unsafe { std::mem::transmute(self.buf.as_ptr()) };
         unsafe { f(args.as_ptr()) }
     }
