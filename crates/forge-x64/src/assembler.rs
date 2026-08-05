@@ -147,6 +147,10 @@ impl Assembler {
     /// `REX.W + 8B /r` (MOV r64, r/m64): ModRM.reg is the destination,
     /// ModRM.rm (via `modrm_mem`) addresses the memory operand.
     pub fn mov_reg_mem(&mut self, dst: PhysReg, base: PhysReg, disp: i32) {
+        // index=0 is a placeholder: this slice's memory operands are
+        // base+disp only, with no index register, so REX.X is irrelevant
+        // here. Out of scope per the design doc until a real SIB index
+        // operand is added.
         self.rex(true, dst.encoding(), 0, base.encoding());
         self.code.push(0x8B);
         self.modrm_mem(dst.encoding(), base.encoding(), disp);

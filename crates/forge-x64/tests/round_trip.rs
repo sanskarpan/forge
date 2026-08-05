@@ -99,3 +99,46 @@ fn mov_reg_mem_r13_base_with_zero_disp_forces_disp8() {
     assert_eq!(a.code(), &[0x49, 0x8B, 0x45, 0x00]);
     assert_eq!(disassemble(a.code()), vec!["mov rax,[r13]"]);
 }
+
+/// rsp still needs its forced SIB byte even with a non-zero displacement --
+/// the SIB requirement and the disp8/disp32 mode selection are independent,
+/// so this checks the two layer correctly on top of each other.
+#[test]
+fn mov_reg_mem_rsp_base_with_disp8_still_requires_sib() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::Rsp, 8);
+    assert_eq!(a.code(), &[0x48, 0x8B, 0x44, 0x24, 0x08]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[rsp+8]"]);
+}
+
+/// r12's SIB-required case with a disp32, via REX.B -- same layering check
+/// as the rsp/disp8 case above, but with the extended twin and the other
+/// displacement size.
+#[test]
+fn mov_reg_mem_r12_base_with_disp32_still_requires_sib() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::R12, 1000);
+    assert_eq!(a.code(), &[0x49, 0x8B, 0x84, 0x24, 0xE8, 0x03, 0x00, 0x00]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[r12+3E8h]"]);
+}
+
+/// rbp with a NON-zero disp8 must NOT hit the forced-disp8-for-zero special
+/// case -- it should fall through to the normal path and naturally select
+/// disp8 via `disp_mode`, landing on the same bytes a generic base would.
+#[test]
+fn mov_reg_mem_rbp_base_with_nonzero_disp8_uses_normal_path() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::Rbp, 8);
+    assert_eq!(a.code(), &[0x48, 0x8B, 0x45, 0x08]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[rbp+8]"]);
+}
+
+/// r13 with a non-zero disp32 hits the same normal-path point as rbp above,
+/// via REX.B.
+#[test]
+fn mov_reg_mem_r13_base_with_nonzero_disp32_uses_normal_path() {
+    let mut a = Assembler::new();
+    a.mov_reg_mem(PhysReg::Rax, PhysReg::R13, 1000);
+    assert_eq!(a.code(), &[0x49, 0x8B, 0x85, 0xE8, 0x03, 0x00, 0x00]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,[r13+3E8h]"]);
+}
