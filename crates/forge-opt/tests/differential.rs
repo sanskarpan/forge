@@ -52,13 +52,24 @@ fn arb_expr() -> impl Strategy<Value = String> {
     })
 }
 
+/// Assigns each parameter a value that varies by its index, so that two
+/// same-typed identifiers (e.g. `x` and `y`, both f64) never collide on the
+/// same runtime value. `arb_expr`'s leaf set (`x`, `y`, `n`) means at most a
+/// handful of params of any one type ever appear in a single generated
+/// function, so a simple per-index offset is enough to guarantee distinct
+/// values without needing randomness here -- the expression SHAPE is
+/// already randomized by proptest.
 fn params_for(f: &forge_ir::Function) -> Vec<RtValue> {
     f.params
         .iter()
-        .map(|(_, ty)| match ty {
-            forge_ir::Ty::F64 => RtValue::F64(2.5),
-            forge_ir::Ty::I64 => RtValue::I64(7),
-            forge_ir::Ty::Bool => RtValue::Bool(true),
+        .enumerate()
+        .map(|(i, (_, ty))| match ty {
+            forge_ir::Ty::F64 => RtValue::F64(2.5 + i as f64),
+            forge_ir::Ty::I64 => RtValue::I64(7 + i as i64),
+            // Bool has only two possible values, so alternate rather than
+            // offset -- this still guarantees `x` and `y` (if both bool)
+            // differ, exercising both the true and false branches.
+            forge_ir::Ty::Bool => RtValue::Bool(i % 2 == 0),
         })
         .collect()
 }
