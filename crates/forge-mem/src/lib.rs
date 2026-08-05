@@ -162,6 +162,18 @@ mod platform {
             self.state = ProtState::Executable;
             Ok(())
         }
+
+        /// Resets the buffer's nominal state to `Writable` for reuse by
+        /// `CodeCache`. No syscall needed on this platform -- `write()`
+        /// always does its own per-call protect dance regardless of the
+        /// buffer's nominal state, so there's nothing to actually
+        /// "unprotect" up front. Always succeeds; returns `io::Result<()>`
+        /// only to keep a uniform signature with the generic-Unix platform
+        /// module, where this CAN fail.
+        pub fn reset_to_writable(&mut self) -> io::Result<()> {
+            self.state = ProtState::Writable;
+            Ok(())
+        }
     }
 
     impl Drop for ExecutableBuffer {
@@ -241,6 +253,27 @@ mod platform {
                 return Err(io::Error::last_os_error());
             }
             self.state = ProtState::Executable;
+            Ok(())
+        }
+
+        /// Resets the buffer back to a real RW mapping for reuse by
+        /// `CodeCache` -- unlike the macOS-AArch64 path, this platform's
+        /// `write()` requires the page to genuinely be in `Writable` state
+        /// already (see its `debug_assert_eq!`), so this needs a real
+        /// `mprotect` call, not just a state-field reset.
+        pub fn reset_to_writable(&mut self) -> io::Result<()> {
+            // SAFETY: ptr/len are page-aligned, from a successful mmap.
+            let rc = unsafe {
+                libc::mprotect(
+                    self.ptr as *mut libc::c_void,
+                    self.len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.state = ProtState::Writable;
             Ok(())
         }
     }
@@ -464,6 +497,31 @@ impl CompiledExpr {
     }
 }
 
+/// A minimal free-list, not a size-class allocator -- there's no real
+/// compiler pipeline yet to stress this with varied allocation patterns.
+/// Reuses `mmap`'d pages across compilations instead of syscalling on every
+/// single one.
+#[derive(Default)]
+pub struct CodeCache {
+    free: Vec<ExecutableBuffer>,
+}
+
+impl CodeCache {
+    pub fn acquire(&mut self, min_size: usize) -> io::Result<ExecutableBuffer> {
+        if let Some(pos) = self.free.iter().position(|b| b.len() >= min_size) {
+            return Ok(self.free.remove(pos));
+        }
+        ExecutableBuffer::new(min_size)
+    }
+
+    pub fn release(&mut self, mut buf: ExecutableBuffer) {
+        buf.reset_to_writable().expect(
+            "failed to reset a previously-valid ExecutableBuffer back to writable during release",
+        );
+        self.free.push(buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +658,54 @@ mod tests {
         // Deliberately never call buf.make_executable().
         let compiled = CompiledExpr::from_buffer(buf, 1);
         compiled.call1(1.0);
+    }
+
+    #[test]
+    fn code_cache_reuses_a_released_buffer() {
+        let mut cache = CodeCache::default();
+        let buf1 = cache.acquire(64).unwrap();
+        let ptr1 = buf1.as_ptr();
+        cache.release(buf1);
+
+        let buf2 = cache.acquire(64).unwrap();
+        assert_eq!(
+            buf2.as_ptr(),
+            ptr1,
+            "acquire() should reuse the released buffer's mapping, not allocate a fresh one"
+        );
+    }
+
+    #[test]
+    fn code_cache_allocates_fresh_when_nothing_reusable_is_large_enough() {
+        let mut cache = CodeCache::default();
+        let small = cache.acquire(64).unwrap();
+        let small_ptr = small.as_ptr();
+        cache.release(small);
+
+        let big = cache.acquire(page_size() * 4).unwrap();
+        assert_ne!(
+            big.as_ptr(),
+            small_ptr,
+            "a too-small released buffer must not be reused for a bigger request"
+        );
+    }
+
+    #[test]
+    fn released_buffer_is_writable_again() {
+        let mut cache = CodeCache::default();
+        let mut buf = cache.acquire(64).unwrap();
+        buf.write(|mem| mem[..4].copy_from_slice(&[0xC0, 0x03, 0x5F, 0xD6]));
+        buf.make_executable().unwrap();
+        cache.release(buf);
+
+        let mut reused = cache.acquire(64).unwrap();
+        assert_eq!(
+            reused.state(),
+            ProtState::Writable,
+            "a reused buffer must come back in a writable state, ready for a fresh write()"
+        );
+        // Confirm it's genuinely usable, not just claiming to be writable:
+        reused.write(|mem| mem[..4].copy_from_slice(&[0xC0, 0x03, 0x5F, 0xD6]));
+        reused.make_executable().unwrap();
     }
 }
