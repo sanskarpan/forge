@@ -175,6 +175,130 @@ mod platform {
     }
 }
 
+#[cfg(all(unix, not(all(target_os = "macos", target_arch = "aarch64"))))]
+mod platform {
+    use super::*;
+    use std::ptr;
+
+    impl ExecutableBuffer {
+        pub fn new(size: usize) -> io::Result<Self> {
+            let page = page_size();
+            let len = round_up_to_page(size, page);
+            // SAFETY: null hint, non-zero page-multiple length, valid flag
+            // combination. Deliberately PROT_READ|WRITE only -- NEVER map
+            // RWX. Returns MAP_FAILED on error, which we check.
+            let ptr = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                ptr: ptr as *mut u8,
+                len,
+                state: ProtState::Writable,
+            })
+        }
+
+        pub fn write<F: FnOnce(&mut [u8])>(&mut self, f: F) {
+            debug_assert_eq!(
+                self.state,
+                ProtState::Writable,
+                "cannot write after make_executable on this platform -- call a fresh buffer or add a make_writable() if this becomes a real need"
+            );
+            // SAFETY: ptr/len are from a successful RW mmap in new(); f
+            // only ever sees a correctly-bounded slice.
+            unsafe {
+                let slice = std::slice::from_raw_parts_mut(self.ptr, self.len);
+                f(slice);
+            }
+            clear_icache_if_needed(self.ptr, self.len);
+        }
+
+        pub fn make_executable(&mut self) -> io::Result<()> {
+            // SAFETY: ptr/len are page-aligned, from a successful mmap.
+            let rc = unsafe {
+                libc::mprotect(
+                    self.ptr as *mut libc::c_void,
+                    self.len,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.state = ProtState::Executable;
+            Ok(())
+        }
+    }
+
+    impl Drop for ExecutableBuffer {
+        fn drop(&mut self) {
+            // SAFETY: ptr/len are from a successful mmap in new(); munmap
+            // on a mapping we exclusively own and are the only owner of.
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn clear_icache_if_needed(ptr: *mut u8, len: usize) {
+        // Linux AArch64: the icache is not coherent with the dcache -- same
+        // ARCHITECTURAL reason as macOS AArch64 (this is an ARM property,
+        // not an Apple one), so it needs the same treatment even though
+        // there's no MAP_JIT/pthread_jit_write_protect_np dance here.
+        // Clean each cache line to the point of unification, invalidate the
+        // icache, with the required barriers between each phase.
+        //
+        // UNTESTED on real hardware (no Linux ARM64 machine available for
+        // this project) -- written from documented ARM64 cache-maintenance
+        // instructions (DC CVAU / IC IVAU / DSB / ISB) and cross-compile
+        // checked only. The 64-byte stride is a conservative assumption
+        // (common ARM64 L1 cache line size); a smaller-than-actual stride
+        // is always safe (just redundant work), so this errs safe even if
+        // the real hardware's line size differs.
+        //
+        // SAFETY: ptr/len describe a valid, currently-mapped region this
+        // ExecutableBuffer exclusively owns; the asm blocks only read
+        // `addr` and issue architecturally-defined cache-maintenance
+        // instructions -- no memory is written by this function.
+        unsafe {
+            let start = ptr as usize;
+            let end = start + len;
+
+            let mut addr = start & !63;
+            while addr < end {
+                std::arch::asm!("dc cvau, {0}", in(reg) addr);
+                addr += 64;
+            }
+            std::arch::asm!("dsb ish");
+
+            let mut addr = start & !63;
+            while addr < end {
+                std::arch::asm!("ic ivau, {0}", in(reg) addr);
+                addr += 64;
+            }
+            std::arch::asm!("dsb ish");
+            std::arch::asm!("isb");
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn clear_icache_if_needed(_ptr: *mut u8, _len: usize) {
+        // x86-64: the icache is hardware-coherent with the dcache. Nothing
+        // to do -- this empty fn exists so `write()`'s call site doesn't
+        // need its own `#[cfg]` split.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
