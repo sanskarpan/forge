@@ -23,6 +23,14 @@ pub struct ExecutableBuffer {
     state: ProtState,
 }
 
+#[cfg(windows)]
+compile_error!(
+    "forge-mem does not implement Windows yet (VirtualAlloc/VirtualProtect/FlushInstructionCache) -- \
+     see CHECKLIST.md Phase 5 and the design doc's explicit scope decision to skip Windows until \
+     there's a way to actually test it. Contributions welcome, but this must not silently compile \
+     into a no-op or panic-at-runtime stub that looks like it works."
+);
+
 // SAFETY: `ExecutableBuffer` owns its mapping exclusively. Moving it to
 // another thread and calling `write()`/executing there is safe --
 // `pthread_jit_write_protect_np` (macOS AArch64) is a per-thread hardware
