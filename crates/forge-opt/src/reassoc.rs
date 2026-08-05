@@ -34,8 +34,12 @@
 // AND used again separately. Flattening through such a node and discarding
 // it would silently break that other reference. The fix: only flatten
 // THROUGH a node if it has EXACTLY ONE use in the whole function (computed
-// once, up front, over the function's original -- pre-mutation --
-// instruction list). A node with more than one use is treated as an opaque
+// once, up front, over the function's original -- pre-mutation -- LIVE
+// instructions only, i.e. `f.blocks[*].insts`, not the raw `f.insts` backing
+// array, which can still hold entries DCE has already swept from every
+// block -- see `analyze_uses`'s doc comment for why that distinction is
+// load-bearing, not cosmetic). A node with more than one use is treated as
+// an opaque
 // LEAF of the flattened chain instead -- its own instruction is left
 // completely untouched (never rewritten, never removed; this pass, like
 // GVN, never deletes an instruction outright, only redirects uses of the
@@ -43,7 +47,9 @@
 // other reference to it stays valid no matter how the rest of the chain
 // gets rebuilt.
 
-use forge_ir::{replace_value_everywhere, uses_of, Block, Function, Inst, Terminator, Ty, Value};
+use forge_ir::{
+    insert_before, replace_value_everywhere, uses_of, Block, Function, Inst, Terminator, Ty, Value,
+};
 use forge_syntax::span::Span;
 use rustc_hash::FxHashMap;
 
@@ -151,8 +157,8 @@ fn assoc_i64_op(f: &Function, v: Value) -> Option<AssocOp> {
     }
 }
 
-/// One pass over the function's ORIGINAL (pre-mutation) instructions and
-/// terminators: `counts[v]` is the total number of operand-uses of `v`
+/// One pass over the function's ORIGINAL (pre-mutation) LIVE instructions
+/// and terminators: `counts[v]` is the total number of operand-uses of `v`
 /// anywhere (instructions + terminators), and `sole_consumer[v]` is `Some(w)`
 /// only when `v` has EXACTLY one use in the whole function and that use is
 /// an instruction operand (not a terminator) -- `w` is the instruction that
@@ -161,18 +167,33 @@ fn assoc_i64_op(f: &Function, v: Value) -> Option<AssocOp> {
 /// (now-dead) root, so no existing instruction's operands change in a way
 /// that would invalidate these counts for any value other than the
 /// just-processed root itself (which is never queried again afterward).
+///
+/// MUST scan only instructions actually reachable via `f.blocks[*].insts`
+/// (walked below), never the raw `f.insts` backing array directly. DCE
+/// (`dce.rs`) deliberately leaves a swept instruction's `Inst` sitting in
+/// `f.insts` forever -- only its entry in `block.insts` is removed -- so a
+/// naive `f.insts.iter().enumerate()` scan would still "see" a dead
+/// instruction's operand references as real uses. Concretely, that bug (a
+/// real one, found by review, not hypothetical) permanently blocks
+/// reassociation from treating a value as safely flattenable even after the
+/// ONLY thing holding its use count above one has become provably
+/// unreachable: `reassoc` runs before `dce` in the pipeline (see `lib.rs`),
+/// so a since-dead binding's `Inst` gets swept from `block.insts` by the
+/// SAME round's `dce`, but a raw-`f.insts` scan would still count it in
+/// EVERY subsequent round too, since that backing-array entry never goes
+/// away -- capping the achievable rebalancing depth forever instead of
+/// letting a later round finish the job once DCE has caught up.
 fn analyze_uses(f: &Function) -> (FxHashMap<Value, u32>, FxHashMap<Value, Value>) {
     let mut counts: FxHashMap<Value, u32> = FxHashMap::default();
     let mut consumers: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
 
-    for (i, inst) in f.insts.iter().enumerate() {
-        let user = Value(i as u32);
-        for operand in uses_of(inst) {
-            *counts.entry(operand).or_insert(0) += 1;
-            consumers.entry(operand).or_default().push(user);
-        }
-    }
     for block in &f.blocks {
+        for &user in &block.insts {
+            for operand in uses_of(&f.insts[user.0 as usize]) {
+                *counts.entry(operand).or_insert(0) += 1;
+                consumers.entry(operand).or_default().push(user);
+            }
+        }
         match &block.term {
             Some(Terminator::Return(v)) => *counts.entry(*v).or_insert(0) += 1,
             Some(Terminator::Branch { cond, .. }) => *counts.entry(*cond).or_insert(0) += 1,
@@ -241,7 +262,8 @@ fn flatten_operand(
 /// Every new instruction is inserted at `*pos` (post-order: both children
 /// before the node combining them), which starts as the OLD root's own
 /// position in `block.insts` and advances by one after each insertion --
-/// exactly `strength.rs`'s `insert_before` chaining pattern. This is NOT
+/// `forge_ir::insert_before`'s chaining pattern (see its doc comment),
+/// shared with `strength.rs`'s div/rem sign-fixup sequences. This is NOT
 /// just a dominance nicety: `verify()` only checks block-granularity
 /// dominance, but `interp.rs` evaluates a block's instructions by walking
 /// `block.insts` strictly IN ORDER, filling each `Value`'s slot as it goes
@@ -273,26 +295,6 @@ fn build_balanced(
     let right = build_balanced(f, block, &leaves[mid..], op, ty, span, pos);
     let v = insert_before(f, block, *pos, op.make(left, right), ty, span);
     *pos += 1;
-    v
-}
-
-/// Inserts a brand-new instruction into `block.insts` at position `pos`
-/// (shifting everything at/after `pos` one slot to the right), returning its
-/// freshly allocated `Value`. See `build_balanced`'s doc comment for why
-/// position -- not just dominance -- matters here.
-fn insert_before(
-    f: &mut Function,
-    block: Block,
-    pos: usize,
-    inst: Inst,
-    ty: Ty,
-    span: Span,
-) -> Value {
-    let v = Value(f.insts.len() as u32);
-    f.insts.push(inst);
-    f.types.push(ty);
-    f.spans.push(span);
-    f.blocks[block.0 as usize].insts.insert(pos, v);
     v
 }
 
@@ -456,5 +458,61 @@ mod tests {
         let mut f = lowered_i64("(a + b) + c");
         let changed = Reassociate.run(&mut f);
         assert!(!changed);
+    }
+
+    #[test]
+    fn stale_use_counts_across_dce_do_not_permanently_cap_rebalancing_depth() {
+        // Regression test (found by code review) for a real bug:
+        // `analyze_uses` used to scan the raw `f.insts` backing array
+        // instead of each block's LIVE `insts` list. Since DCE (`dce.rs`)
+        // deliberately leaves a swept instruction's `Inst` sitting in
+        // `f.insts` forever (only removing it from `block.insts`), a
+        // since-dead multi-use reference kept "counting" as a real use
+        // FOREVER, even in pipeline rounds run long after DCE had already
+        // removed it from live code -- permanently capping how far a chain
+        // could be rebalanced, not just missing one round's worth of
+        // optimization.
+        //
+        // `x` is defined as a 4-leaf chain and used TWICE: once by `dead`
+        // (never read by the returned expression, so DCE removes it) and
+        // once as the first leaf of a further, otherwise-unrelated 3-leaf
+        // chain. With the bug, `x` stays permanently walled off as an
+        // opaque leaf of the outer chain (its use count never drops back to
+        // 1), capping the achievable depth at 4 (2 for the outer 4-leaf
+        // split `[x, q1, q2, q3]` + 2 for x's own independently-rebalanced
+        // 4-leaf subtree) even after `dead` is long gone -- confirmed
+        // empirically by temporarily reverting the fix and re-running this
+        // exact case, not just derived on paper. Fixed, `reassoc`
+        // eventually (a later round, once DCE has caught up) sees `x` drop
+        // to a single use and fully merges its 4 leaves into the outer
+        // chain for one flat 7-leaf balanced tree, depth 3.
+        //
+        // Each leaf is forced to I64 individually via `& -1` (rather than
+        // wrapping the whole expression once, as `lowered_i64` does) so the
+        // function's return value IS the chain root directly -- no wrapper
+        // node to unwrap before measuring `dependency_depth`.
+        let src = "let x = (((p1 & -1) + (p2 & -1)) + (p3 & -1)) + (p4 & -1) in \
+                   let dead = x + 99 in \
+                   (((x + (q1 & -1)) + (q2 & -1)) + (q3 & -1))";
+        let mut f = lowered(src);
+
+        // Run the FULL pipeline (multiple rounds), not `Reassociate.run()`
+        // standalone -- the bug only manifests ACROSS rounds, once DCE has
+        // had a chance to remove `dead` between two `Reassociate`
+        // invocations.
+        crate::optimize(&mut f);
+
+        let Terminator::Return(root) = f.blocks[f.entry.0 as usize].term.clone().unwrap() else {
+            panic!()
+        };
+        let depth = dependency_depth(&f, root);
+        assert_eq!(
+            depth, 3,
+            "chain should converge to the fully-balanced depth (3) for its 7 total leaves \
+             (p1..p4, q1..q3) once `dead` is swept and `x` is no longer wrongly seen as \
+             multi-use; got {depth} -- a regression to 4 means `analyze_uses` is counting \
+             stale/dead uses again"
+        );
+        assert!(forge_ir::verify::verify(&f).is_ok());
     }
 }

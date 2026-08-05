@@ -247,6 +247,53 @@ pub fn replace_value_everywhere(f: &mut Function, old: Value, new: Value) {
     }
 }
 
+/// Insert a new instruction into `block` at position `pos` (shifting
+/// everything at/after `pos` — including the value that used to sit there —
+/// one slot to the right) and return its freshly allocated `Value`. Unlike
+/// `Vec::push`, this lets us splice helper instructions in BEFORE an
+/// existing instruction whose own `Value` identity must be preserved (later
+/// code may already reference it). Shared by `forge-opt`'s `strength.rs`
+/// (the div/rem sign-fixup sequences: several new instructions have to be
+/// defined, in program order, before the position the original `Div`/`Rem`
+/// occupied) and `reassoc.rs` (rebuilding a balanced tree in place of a
+/// flattened chain, at the old chain root's own position — see that
+/// module's `build_balanced` for why position, not just dominance, matters
+/// there).
+///
+/// ## Chaining several calls in a row
+///
+/// Each call only shifts things right by one slot, so inserting a whole
+/// SEQUENCE of `n` new instructions before some original position requires
+/// threading a mutable `pos` through `n` calls, incrementing it by one after
+/// each: the first call inserts at the original `pos`; every following call
+/// must insert at the now-updated `pos` too, since that's where the
+/// still-pending original instruction (and everything after it) has been
+/// pushed to. After all `n` calls, the original instruction's own new
+/// position is `pos` (i.e. `old_pos + n`) — not `old_pos + n + 1`, since
+/// `pos` was already advanced past the last inserted instruction; callers
+/// that also rewrite the original instruction's own slot afterward, and then
+/// need to know where to resume scanning the block, use `pos + 1` for that
+/// (skip past the rewritten original too). See `strength.rs`'s
+/// `emit_div_bias` for the reference implementation of this pattern (six
+/// calls in a row, `pos` incremented after each), and `div_pow2`/`rem_pow2`
+/// for how its returned `pos` is subsequently used both to insert further
+/// instructions and to compute the caller's resume position.
+pub fn insert_before(
+    f: &mut Function,
+    block: Block,
+    pos: usize,
+    inst: Inst,
+    ty: Ty,
+    span: forge_syntax::span::Span,
+) -> Value {
+    let v = Value(f.insts.len() as u32);
+    f.insts.push(inst);
+    f.types.push(ty);
+    f.spans.push(span);
+    f.blocks[block.0 as usize].insts.insert(pos, v);
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
