@@ -362,3 +362,54 @@ fn imul_reg_reg_imm32_three_operand_form() {
     // same convention already found for alu_reg_imm's immediates.
     assert_eq!(disassemble(a.code()), vec!["imul rax,rbx,0Ah"]);
 }
+
+#[test]
+fn mov_reg_imm_uses_the_compact_form_when_the_value_fits_in_i32() {
+    let mut a = Assembler::new();
+    a.mov_reg_imm(PhysReg::Rax, 42);
+    assert_eq!(a.code(), &[0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00]);
+    // Verified empirically: iced-x86 renders the immediate in hex ("2Ah"),
+    // not decimal, same convention already found for alu_reg_imm.
+    assert_eq!(disassemble(a.code()), vec!["mov rax,2Ah"]);
+}
+
+#[test]
+fn mov_reg_imm_compact_form_handles_a_negative_value() {
+    let mut a = Assembler::new();
+    a.mov_reg_imm(PhysReg::Rbx, -1);
+    assert_eq!(a.code(), &[0x48, 0xC7, 0xC3, 0xFF, 0xFF, 0xFF, 0xFF]);
+    // Verified empirically: iced-x86 renders the sign-extended 64-bit
+    // immediate as its hex pattern, not as decimal "-1" -- same finding as
+    // alu_reg_imm_sub_imm8_handles_a_negative_value.
+    assert_eq!(disassemble(a.code()), vec!["mov rbx,0FFFFFFFFFFFFFFFFh"]);
+}
+
+#[test]
+fn mov_reg_imm_uses_movabs_for_a_value_that_does_not_fit_in_i32() {
+    let mut a = Assembler::new();
+    a.mov_reg_imm(PhysReg::Rax, i64::MAX);
+    assert_eq!(
+        a.code(),
+        &[0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]
+    );
+    // Verified empirically: iced-x86's NasmFormatter names this mnemonic
+    // "mov", not "movabs", even for the B8+rd/REX.W imm64 form.
+    assert_eq!(disassemble(a.code()), vec!["mov rax,7FFFFFFFFFFFFFFFh"]);
+}
+
+/// The movabs form has NO ModRM byte -- the destination register is
+/// encoded directly into the opcode byte's low 3 bits, with REX.B (not
+/// REX.R) covering extension. This test specifically confirms that still
+/// works correctly for an extended register with no ModRM byte present to
+/// normally carry that signal.
+#[test]
+fn mov_reg_imm_movabs_with_an_extended_register_still_sets_rex_b() {
+    let mut a = Assembler::new();
+    a.mov_reg_imm(PhysReg::R9, i64::MAX);
+    assert_eq!(
+        a.code(),
+        &[0x49, 0xB9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]
+    );
+    // Verified empirically: same "mov", not "movabs", naming as above.
+    assert_eq!(disassemble(a.code()), vec!["mov r9,7FFFFFFFFFFFFFFFh"]);
+}

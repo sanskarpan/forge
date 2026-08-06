@@ -354,6 +354,25 @@ impl Assembler {
         self.modrm_reg(dst.encoding(), src.encoding());
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
+
+    /// `mov dst, value` -- auto-selects the compact sign-extended-imm32
+    /// form (REX.W + C7 /0 id) when `value` fits in i32, else the full
+    /// 10-byte "movabs" form (REX.W + B8+rd io). The movabs form has NO
+    /// ModRM byte at all -- the destination register is encoded directly
+    /// into the low 3 bits of the opcode byte, with REX.B (not REX.R)
+    /// covering register extension.
+    pub fn mov_reg_imm(&mut self, dst: PhysReg, value: i64) {
+        if let Ok(imm32) = i32::try_from(value) {
+            self.rex(true, 0, 0, dst.encoding());
+            self.code.push(0xC7);
+            self.modrm_reg(0, dst.encoding());
+            self.code.extend_from_slice(&imm32.to_le_bytes());
+        } else {
+            self.rex(true, 0, 0, dst.encoding());
+            self.code.push(0xB8 + (dst.encoding() & 7));
+            self.code.extend_from_slice(&value.to_le_bytes());
+        }
+    }
 }
 
 #[cfg(test)]
