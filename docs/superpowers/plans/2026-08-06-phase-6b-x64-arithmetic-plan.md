@@ -546,7 +546,7 @@ impl Assembler {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -40`
-Expected: all pass (14 lib + 34 existing integration + 2 new = 36 integration).
+Expected: all pass (14 lib + 38 existing integration + 2 new = 40 integration). Note: Task 4's own review added 4 more tests beyond its original plan estimate (pinning `mov_reg_imm`'s i32 boundary, commit `90ca4b4`), so the real baseline here is 38, not 34 -- trust the actual running count from `cargo test`, not this plan's per-task arithmetic.
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
