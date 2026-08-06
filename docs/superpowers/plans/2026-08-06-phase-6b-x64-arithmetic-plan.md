@@ -172,6 +172,8 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
 - Modify: `crates/forge-x64/src/assembler.rs`
 - Modify: `crates/forge-x64/tests/round_trip.rs`
 
+**Note (found during Task 1):** `AluOp::extension()` currently carries a temporary `#[allow(dead_code)]` — Task 1's `alu_reg_reg` only calls `AluOp::rr_opcode()`, so `extension()` has no caller yet, which trips `cargo clippy --workspace -- -D warnings`'s dead-code lint without the allow. `alu_reg_imm()` below is `extension()`'s first real call site — remove the `#[allow(dead_code)]` from `AluOp::extension()` as part of this task, once `alu_reg_imm()` calls it for real.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
