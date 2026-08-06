@@ -301,9 +301,9 @@ fn imul_reg_reg_imm32_three_operand_form() {
     let mut a = Assembler::new();
     a.imul_reg_reg_imm32(PhysReg::Rax, PhysReg::Rbx, 10);
     assert_eq!(a.code(), &[0x48, 0x69, 0xC3, 0x0A, 0x00, 0x00, 0x00]);
-    // NOTE: verify this string empirically -- not checked against a live
-    // compile when this plan was written.
-    assert_eq!(disassemble(a.code()), vec!["imul rax,rbx,10"]);
+    // Confirmed empirically: iced-x86 renders it in hex ("0Ah"), not
+    // decimal ("10"), consistent with alu_reg_imm's earlier finding.
+    assert_eq!(disassemble(a.code()), vec!["imul rax,rbx,0Ah"]);
 }
 ```
 
@@ -346,7 +346,7 @@ impl Assembler {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -40`
-Expected: all pass (14 lib + 25 existing integration + 3 new = 28 integration).
+Expected: all pass (14 lib + 27 existing integration + 3 new = 30 integration). Note: Task 2's own review added 2 extra tests beyond its original plan estimate, so the real baseline here is 27, not 25 -- trust the actual running count from `cargo test`, not this plan's per-task arithmetic.
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -468,7 +468,7 @@ impl Assembler {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -40`
-Expected: all pass (14 lib + 28 existing integration + 4 new = 32 integration).
+Expected: all pass (14 lib + 30 existing integration + 4 new = 34 integration).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -544,7 +544,7 @@ impl Assembler {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -40`
-Expected: all pass (14 lib + 32 existing integration + 2 new = 34 integration).
+Expected: all pass (14 lib + 34 existing integration + 2 new = 36 integration).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
