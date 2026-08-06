@@ -329,3 +329,36 @@ fn alu_reg_imm_xor() {
     assert_eq!(a.code(), &[0x48, 0x83, 0xF0, 0x05]);
     assert_eq!(disassemble(a.code()), vec!["xor rax,5"]);
 }
+
+/// Direction check, part 1: dst=R9 (needs REX.R since it's in the reg
+/// slot), src=Rax.
+#[test]
+fn imul_reg_reg_direction_dst_r9_src_rax() {
+    let mut a = Assembler::new();
+    a.imul_reg_reg(PhysReg::R9, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x4C, 0x0F, 0xAF, 0xC8]);
+    assert_eq!(disassemble(a.code()), vec!["imul r9,rax"]);
+}
+
+/// Direction check, part 2: the operands from part 1 swapped (dst=Rax,
+/// src=R9, needing REX.B instead of REX.R this time) -- together these two
+/// tests prove imul_reg_reg's reg/rm assignment isn't accidentally
+/// swapped, since a swap bug would make one of these two cases produce
+/// the OTHER case's bytes instead of its own.
+#[test]
+fn imul_reg_reg_direction_dst_rax_src_r9() {
+    let mut a = Assembler::new();
+    a.imul_reg_reg(PhysReg::Rax, PhysReg::R9);
+    assert_eq!(a.code(), &[0x49, 0x0F, 0xAF, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["imul rax,r9"]);
+}
+
+#[test]
+fn imul_reg_reg_imm32_three_operand_form() {
+    let mut a = Assembler::new();
+    a.imul_reg_reg_imm32(PhysReg::Rax, PhysReg::Rbx, 10);
+    assert_eq!(a.code(), &[0x48, 0x69, 0xC3, 0x0A, 0x00, 0x00, 0x00]);
+    // Verified empirically: iced-x86 renders the immediate operand in hex,
+    // same convention already found for alu_reg_imm's immediates.
+    assert_eq!(disassemble(a.code()), vec!["imul rax,rbx,0Ah"]);
+}

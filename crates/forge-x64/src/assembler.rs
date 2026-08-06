@@ -331,6 +331,29 @@ impl Assembler {
             self.code.extend_from_slice(&imm.to_le_bytes());
         }
     }
+
+    /// `imul dst, src` -- dst *= src. REX.W + 0F AF /r. Unlike
+    /// `alu_reg_reg`'s group-1 ops, this is a LOAD-direction opcode:
+    /// ModRM.reg is the destination, ModRM.rm is the source. This isn't a
+    /// design choice -- it's the only two-operand IMUL r64,r/m64 encoding
+    /// x86-64 has. Do not copy `alu_reg_reg`'s reg/rm assignment here.
+    pub fn imul_reg_reg(&mut self, dst: PhysReg, src: PhysReg) {
+        self.rex(true, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0xAF);
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
+
+    /// `imul dst, src, imm` -- dst = src * imm (three-operand,
+    /// non-destructive). REX.W + 69 /r id. Same reg=dst/rm=src direction
+    /// as `imul_reg_reg` (consistent with itself, still opposite to
+    /// group-1's convention).
+    pub fn imul_reg_reg_imm32(&mut self, dst: PhysReg, src: PhysReg, imm: i32) {
+        self.rex(true, dst.encoding(), 0, src.encoding());
+        self.code.push(0x69);
+        self.modrm_reg(dst.encoding(), src.encoding());
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
