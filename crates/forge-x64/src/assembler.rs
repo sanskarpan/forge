@@ -368,6 +368,10 @@ impl Assembler {
             self.modrm_reg(0, dst.encoding());
             self.code.extend_from_slice(&imm32.to_le_bytes());
         } else {
+            // reg=0 here is fictitious, not an extension digit: the movabs
+            // form has no ModRM byte, so there's nothing for REX.R to
+            // cover. dst's extension is carried entirely through REX.B via
+            // the `rm` argument below and the opcode byte's low 3 bits.
             self.rex(true, 0, 0, dst.encoding());
             self.code.push(0xB8 + (dst.encoding() & 7));
             self.code.extend_from_slice(&value.to_le_bytes());

@@ -413,3 +413,48 @@ fn mov_reg_imm_movabs_with_an_extended_register_still_sets_rex_b() {
     // Verified empirically: same "mov", not "movabs", naming as above.
     assert_eq!(disassemble(a.code()), vec!["mov r9,7FFFFFFFFFFFFFFFh"]);
 }
+
+/// `mov_reg_imm`'s `i32::try_from(value)` (i64 -> i32) is the only
+/// conversion of this shape anywhere in the crate -- unlike
+/// `alu_reg_imm`'s i32->i8 conversion, which is exercised near its
+/// boundary indirectly via `disp_mode`'s i32::MAX/MIN/128/-129 tests,
+/// nothing else here would catch an off-by-one at this specific boundary.
+/// This test and the three below pin all four edges: MAX/MIN exactly (both
+/// still compact) and one past each (both must switch to movabs).
+#[test]
+fn mov_reg_imm_uses_compact_form_at_the_i32_max_boundary() {
+    let mut a = Assembler::new();
+    a.mov_reg_imm(PhysReg::Rax, i32::MAX as i64);
+    assert_eq!(a.code(), &[0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0x7F]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,7FFFFFFFh"]);
+}
+
+#[test]
+fn mov_reg_imm_uses_movabs_just_past_the_i32_max_boundary() {
+    let mut a = Assembler::new();
+    a.mov_reg_imm(PhysReg::Rax, i32::MAX as i64 + 1);
+    assert_eq!(
+        a.code(),
+        &[0x48, 0xB8, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00]
+    );
+    assert_eq!(disassemble(a.code()), vec!["mov rax,80000000h"]);
+}
+
+#[test]
+fn mov_reg_imm_uses_compact_form_at_the_i32_min_boundary() {
+    let mut a = Assembler::new();
+    a.mov_reg_imm(PhysReg::Rax, i32::MIN as i64);
+    assert_eq!(a.code(), &[0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x80]);
+    assert_eq!(disassemble(a.code()), vec!["mov rax,0FFFFFFFF80000000h"]);
+}
+
+#[test]
+fn mov_reg_imm_uses_movabs_just_past_the_i32_min_boundary() {
+    let mut a = Assembler::new();
+    a.mov_reg_imm(PhysReg::Rax, i32::MIN as i64 - 1);
+    assert_eq!(
+        a.code(),
+        &[0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF]
+    );
+    assert_eq!(disassemble(a.code()), vec!["mov rax,0FFFFFFFF7FFFFFFFh"]);
+}
