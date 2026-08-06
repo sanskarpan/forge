@@ -458,3 +458,22 @@ fn mov_reg_imm_uses_movabs_just_past_the_i32_min_boundary() {
     );
     assert_eq!(disassemble(a.code()), vec!["mov rax,0FFFFFFFF7FFFFFFFh"]);
 }
+
+#[test]
+fn mov_mem_reg_generic_base_stores_correctly() {
+    let mut a = Assembler::new();
+    a.mov_mem_reg(PhysReg::Rcx, 8, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x48, 0x89, 0x41, 0x08]);
+    // Confirms genuine STORE direction -- if reg/mem were accidentally
+    // swapped with mov_reg_mem's LOAD semantics, this would disassemble
+    // as "mov rax,[rcx+8]" instead.
+    assert_eq!(disassemble(a.code()), vec!["mov [rcx+8],rax"]);
+}
+
+#[test]
+fn mov_mem_reg_rsp_base_requires_sib() {
+    let mut a = Assembler::new();
+    a.mov_mem_reg(PhysReg::Rsp, 0, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x48, 0x89, 0x04, 0x24]);
+    assert_eq!(disassemble(a.code()), vec!["mov [rsp],rax"]);
+}

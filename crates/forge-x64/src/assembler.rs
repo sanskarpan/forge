@@ -377,6 +377,16 @@ impl Assembler {
             self.code.extend_from_slice(&value.to_le_bytes());
         }
     }
+
+    /// `mov [base + disp], src` -- 64-bit store. REX.W + 89 /r: the
+    /// mirror image of `mov_reg_mem` (which uses 0x8B, load direction).
+    /// Reuses `modrm_mem` directly, just swapping which operand is
+    /// register vs. memory relative to `mov_reg_mem`'s call shape.
+    pub fn mov_mem_reg(&mut self, base: PhysReg, disp: i32, src: PhysReg) {
+        self.rex(true, src.encoding(), 0, base.encoding());
+        self.code.push(0x89);
+        self.modrm_mem(src.encoding(), base.encoding(), disp);
+    }
 }
 
 #[cfg(test)]
