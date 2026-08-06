@@ -381,7 +381,10 @@ fn mov_reg_imm_uses_the_compact_form_when_the_value_fits_in_i32() {
     let mut a = Assembler::new();
     a.mov_reg_imm(PhysReg::Rax, 42);
     assert_eq!(a.code(), &[0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00]);
-    assert_eq!(disassemble(a.code()), vec!["mov rax,42"]);
+    // Confirmed empirically: iced-x86 renders it in hex ("2Ah"), not
+    // decimal ("42"), consistent with every other immediate/displacement
+    // rendering found so far in Phases 6a/6b.
+    assert_eq!(disassemble(a.code()), vec!["mov rax,2Ah"]);
 }
 
 #[test]
@@ -389,11 +392,9 @@ fn mov_reg_imm_compact_form_handles_a_negative_value() {
     let mut a = Assembler::new();
     a.mov_reg_imm(PhysReg::Rbx, -1);
     assert_eq!(a.code(), &[0x48, 0xC7, 0xC3, 0xFF, 0xFF, 0xFF, 0xFF]);
-    // NOTE: verify this string empirically -- the sign-extended 64-bit
-    // value is all-ones (u64::MAX / -1i64); iced-x86's exact rendering
-    // (decimal -1, or its 64-bit hex pattern) was not checked against a
-    // live compile when this plan was written.
-    assert_eq!(disassemble(a.code()), vec!["mov rbx,-1"]);
+    // Confirmed empirically: iced-x86 renders the sign-extended 64-bit
+    // value as its all-ones hex pattern, not decimal -1.
+    assert_eq!(disassemble(a.code()), vec!["mov rbx,0FFFFFFFFFFFFFFFFh"]);
 }
 
 #[test]
@@ -404,9 +405,9 @@ fn mov_reg_imm_uses_movabs_for_a_value_that_does_not_fit_in_i32() {
         a.code(),
         &[0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]
     );
-    // NOTE: verify this string empirically -- iced-x86 may name this
-    // mnemonic "mov" or "movabs" depending on formatter conventions; this
-    // was not checked against a live compile when this plan was written.
+    // Confirmed empirically: iced-x86's NasmFormatter names the B8+rd
+    // (REX.W, imm64) form "mov", never "movabs" -- resolved, not just
+    // guessed.
     assert_eq!(
         disassemble(a.code()),
         vec!["mov rax,7FFFFFFFFFFFFFFFh"]
@@ -426,12 +427,13 @@ fn mov_reg_imm_movabs_with_an_extended_register_still_sets_rex_b() {
         a.code(),
         &[0x49, 0xB9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]
     );
-    // NOTE: verify this string empirically, same caveat as above.
+    // Confirmed empirically: matches, same "mov"-not-"movabs" mnemonic and
+    // hex rendering as the previous test.
     assert_eq!(disassemble(a.code()), vec!["mov r9,7FFFFFFFFFFFFFFFh"]);
 }
 ```
 
-**IMPORTANT**: three of these four tests have unverified string guesses (marked `NOTE`). Per the usual discipline, verify all of them empirically before committing — this task in particular introduces a brand-new encoding shape (no ModRM byte) that 6a's tests never exercised, so don't assume iced-x86's formatting behaves the same way it did for ModRM-based instructions.
+**Resolved during implementation:** of the four originally-flagged unverified strings, two were wrong (the compact-form tests — hex-not-decimal rendering, consistent with every other immediate found so far) and two matched the guess (the movabs tests). This also resolved the mnemonic-naming uncertainty: iced-x86's `NasmFormatter` names the B8+rd/REX.W imm64 form `"mov"`, never `"movabs"`. All four strings above are now the empirically-confirmed values, not guesses.
 
 - [ ] **Step 2: Run to confirm failure**
 
