@@ -1,4 +1,4 @@
-use forge_x64::{Assembler, PhysReg};
+use forge_x64::{AluOp, Assembler, PhysReg};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, NasmFormatter};
 
 /// Assembles into a fresh, disposable buffer and returns each decoded
@@ -238,4 +238,44 @@ fn binding_a_label_resolves_all_pending_forward_fixups() {
         &a.code()[second_jmp_at + 1..second_jmp_at + 5],
         &expected_rel_second.to_le_bytes()
     );
+}
+
+#[test]
+fn alu_reg_reg_add() {
+    let mut a = Assembler::new();
+    a.alu_reg_reg(AluOp::Add, PhysReg::Rax, PhysReg::Rbx);
+    assert_eq!(a.code(), &[0x48, 0x01, 0xD8]);
+    assert_eq!(disassemble(a.code()), vec!["add rax,rbx"]);
+}
+
+#[test]
+fn alu_reg_reg_or_needs_rex_b_for_extended_destination() {
+    let mut a = Assembler::new();
+    a.alu_reg_reg(AluOp::Or, PhysReg::R12, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x49, 0x09, 0xC4]);
+    assert_eq!(disassemble(a.code()), vec!["or r12,rax"]);
+}
+
+#[test]
+fn alu_reg_reg_and_needs_rex_r_for_extended_source() {
+    let mut a = Assembler::new();
+    a.alu_reg_reg(AluOp::And, PhysReg::Rax, PhysReg::R9);
+    assert_eq!(a.code(), &[0x4C, 0x21, 0xC8]);
+    assert_eq!(disassemble(a.code()), vec!["and rax,r9"]);
+}
+
+#[test]
+fn alu_reg_reg_sub_still_emits_rex_w_when_no_other_rex_bit_is_needed() {
+    let mut a = Assembler::new();
+    a.alu_reg_reg(AluOp::Sub, PhysReg::Rbx, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x48, 0x29, 0xC3]);
+    assert_eq!(disassemble(a.code()), vec!["sub rbx,rax"]);
+}
+
+#[test]
+fn alu_reg_reg_xor_same_register_is_the_zero_idiom() {
+    let mut a = Assembler::new();
+    a.alu_reg_reg(AluOp::Xor, PhysReg::Rax, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x48, 0x31, 0xC0]);
+    assert_eq!(disassemble(a.code()), vec!["xor rax,rax"]);
 }

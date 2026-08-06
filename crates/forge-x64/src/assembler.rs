@@ -1,5 +1,54 @@
 use crate::PhysReg;
 
+/// A group-1 arithmetic/logic operation: `add`/`or`/`and`/`sub`/`xor` share
+/// real x86-64 encoding structure (the same "ModRM.reg as opcode
+/// extension" trick for immediate forms, r/r opcodes offset by a fixed
+/// stride) -- this enum carries each operation's two opcode facts instead
+/// of duplicating the encoding logic five times. `adc`(/2) and `sbb`(/3)
+/// exist in the same family but aren't part of this crate's instruction
+/// set yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AluOp {
+    Add,
+    Or,
+    And,
+    Sub,
+    Xor,
+}
+
+impl AluOp {
+    /// The ModRM.reg "opcode extension" digit used by the immediate forms
+    /// (0x81/0x83 /n).
+    ///
+    /// Unused until `alu_reg_imm` (Task 2) is added -- allowed dead code
+    /// for this task only, since the whole point of putting both opcode
+    /// facts on `AluOp` together is that they arrive as one designed unit,
+    /// not two separately-justified ones.
+    #[allow(dead_code)]
+    fn extension(self) -> u8 {
+        match self {
+            AluOp::Add => 0,
+            AluOp::Or => 1,
+            AluOp::And => 4,
+            AluOp::Sub => 5,
+            AluOp::Xor => 6,
+        }
+    }
+
+    /// The direct r/r opcode -- store-direction, same convention as
+    /// `mov_reg_reg`'s 0x89 (ModRM.rm is the destination, ModRM.reg is
+    /// the source).
+    fn rr_opcode(self) -> u8 {
+        match self {
+            AluOp::Add => 0x01,
+            AluOp::Or => 0x09,
+            AluOp::And => 0x21,
+            AluOp::Sub => 0x29,
+            AluOp::Xor => 0x31,
+        }
+    }
+}
+
 /// Emits x86-64 machine code byte by byte, tracking label positions and
 /// pending forward-jump fixups.
 pub struct Assembler {
@@ -262,6 +311,14 @@ impl Assembler {
         self.rex(true, dst.encoding(), 0, base.encoding());
         self.code.push(0x8B);
         self.modrm_mem(dst.encoding(), base.encoding(), disp);
+    }
+
+    /// `op dst, src` -- e.g. `add rax, rbx`. Same shape as `mov_reg_reg`:
+    /// ModRM.rm is the destination, ModRM.reg is the source.
+    pub fn alu_reg_reg(&mut self, op: AluOp, dst: PhysReg, src: PhysReg) {
+        self.rex(true, src.encoding(), 0, dst.encoding());
+        self.code.push(op.rr_opcode());
+        self.modrm_reg(src.encoding(), dst.encoding());
     }
 }
 
