@@ -19,12 +19,6 @@ pub enum AluOp {
 impl AluOp {
     /// The ModRM.reg "opcode extension" digit used by the immediate forms
     /// (0x81/0x83 /n).
-    ///
-    /// Unused until `alu_reg_imm` (Task 2) is added -- allowed dead code
-    /// for this task only, since the whole point of putting both opcode
-    /// facts on `AluOp` together is that they arrive as one designed unit,
-    /// not two separately-justified ones.
-    #[allow(dead_code)]
     fn extension(self) -> u8 {
         match self {
             AluOp::Add => 0,
@@ -319,6 +313,23 @@ impl Assembler {
         self.rex(true, src.encoding(), 0, dst.encoding());
         self.code.push(op.rr_opcode());
         self.modrm_reg(src.encoding(), dst.encoding());
+    }
+
+    /// `op dst, imm` -- e.g. `add rax, 5`. ModRM.reg holds the opcode
+    /// extension digit (not a register), ModRM.rm holds dst. Auto-selects
+    /// the compact `83 /n ib` (imm8) form when `imm` fits in i8, else the
+    /// general `81 /n id` (imm32) form -- both sign-extend to 64 bits.
+    pub fn alu_reg_imm(&mut self, op: AluOp, dst: PhysReg, imm: i32) {
+        self.rex(true, 0, 0, dst.encoding());
+        if let Ok(imm8) = i8::try_from(imm) {
+            self.code.push(0x83);
+            self.modrm_reg(op.extension(), dst.encoding());
+            self.code.push(imm8 as u8);
+        } else {
+            self.code.push(0x81);
+            self.modrm_reg(op.extension(), dst.encoding());
+            self.code.extend_from_slice(&imm.to_le_bytes());
+        }
     }
 }
 
