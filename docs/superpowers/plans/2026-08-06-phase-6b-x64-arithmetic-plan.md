@@ -192,11 +192,9 @@ fn alu_reg_imm_sub_imm8_handles_a_negative_value() {
     let mut a = Assembler::new();
     a.alu_reg_imm(AluOp::Sub, PhysReg::Rbx, -1);
     assert_eq!(a.code(), &[0x48, 0x83, 0xEB, 0xFF]);
-    // NOTE: verify this string empirically -- iced-x86 may render a
-    // sign-extended negative immediate as "-1" or as its 64-bit hex
-    // pattern (e.g. "0FFFFFFFFFFFFFFFFh"); this was not checked against a
-    // live compile when this plan was written.
-    assert_eq!(disassemble(a.code()), vec!["sub rbx,-1"]);
+    // Confirmed empirically: iced-x86 renders a sign-extended negative
+    // immediate as its 64-bit hex pattern, not decimal.
+    assert_eq!(disassemble(a.code()), vec!["sub rbx,0FFFFFFFFFFFFFFFFh"]);
 }
 
 #[test]
@@ -204,11 +202,9 @@ fn alu_reg_imm_and_falls_back_to_imm32_when_it_does_not_fit_in_i8() {
     let mut a = Assembler::new();
     a.alu_reg_imm(AluOp::And, PhysReg::Rax, 1000);
     assert_eq!(a.code(), &[0x48, 0x81, 0xE0, 0xE8, 0x03, 0x00, 0x00]);
-    // NOTE: verify this string empirically -- 6a's plan found iced-x86
-    // renders larger displacements/immediates in hex ("3E8h"), not
-    // decimal ("1000"); the same is likely true here but was not checked
-    // against a live compile when this plan was written.
-    assert_eq!(disassemble(a.code()), vec!["and rax,1000"]);
+    // Confirmed empirically: iced-x86 renders it in hex ("3E8h"), not
+    // decimal ("1000"), consistent with 6a's earlier finding.
+    assert_eq!(disassemble(a.code()), vec!["and rax,3E8h"]);
 }
 ```
 
