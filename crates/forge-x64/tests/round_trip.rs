@@ -307,3 +307,25 @@ fn alu_reg_imm_and_falls_back_to_imm32_when_it_does_not_fit_in_i8() {
     // for displacements applies to immediates too.
     assert_eq!(disassemble(a.code()), vec!["and rax,3E8h"]);
 }
+
+/// Or and Xor's r/imm forms aren't covered by the three tests above (which
+/// only exercise Add/Sub/And) -- their opcode-extension digits (/1 and /6)
+/// are otherwise never checked through a real disassembler in the
+/// immediate form, so a transposition in `AluOp::extension()` for either
+/// one would go uncaught (their r/r opcodes are completely different
+/// bytes, so `alu_reg_reg`'s tests don't cover this).
+#[test]
+fn alu_reg_imm_or() {
+    let mut a = Assembler::new();
+    a.alu_reg_imm(AluOp::Or, PhysReg::Rax, 5);
+    assert_eq!(a.code(), &[0x48, 0x83, 0xC8, 0x05]);
+    assert_eq!(disassemble(a.code()), vec!["or rax,5"]);
+}
+
+#[test]
+fn alu_reg_imm_xor() {
+    let mut a = Assembler::new();
+    a.alu_reg_imm(AluOp::Xor, PhysReg::Rax, 5);
+    assert_eq!(a.code(), &[0x48, 0x83, 0xF0, 0x05]);
+    assert_eq!(disassemble(a.code()), vec!["xor rax,5"]);
+}
