@@ -582,3 +582,72 @@ fn cmovcc_direction_dst_rax_src_r9() {
     assert_eq!(a.code(), &[0x49, 0x0F, 0x4F, 0xC1]);
     assert_eq!(disassemble(a.code()), vec!["cmovg rax,r9"]);
 }
+
+#[test]
+fn jcc_backward_short_uses_rel8() {
+    let mut a = Assembler::new();
+    let l = a.new_label();
+    a.bind(l); // label at position 0
+    a.mov_reg_reg(PhysReg::Rax, PhysReg::Rax); // 3 bytes of filler: 48 89 C0
+    let len_before_jcc = a.code().len();
+    a.jcc(ConditionCode::Equal, l); // backward reference, close enough for rel8
+
+    let expected_rel = -(len_before_jcc as i32 + 2); // rel8 measured from the end of this 2-byte instruction
+    assert_eq!(a.code()[len_before_jcc], 0x70 + 4); // Equal's nibble is 4
+    assert_eq!(a.code()[len_before_jcc + 1], expected_rel as i8 as u8);
+    assert_eq!(a.code().len(), len_before_jcc + 2);
+
+    let text = disassemble(a.code());
+    assert!(text.last().unwrap().starts_with('j'));
+}
+
+#[test]
+fn jcc_backward_near_uses_a_six_byte_form() {
+    let mut a = Assembler::new();
+    let l = a.new_label();
+    a.bind(l); // label at position 0
+    for _ in 0..50 {
+        a.mov_reg_reg(PhysReg::Rax, PhysReg::Rax); // 3 bytes each, 150 bytes total -- far enough that rel8 can't reach
+    }
+    let len_before_jcc = a.code().len();
+    a.jcc(ConditionCode::NotEqual, l); // backward reference, too far for rel8
+
+    // jcc's near form is 6 bytes (0F 80+cc + rel32), one byte longer than
+    // jmp's 5-byte near form (E9 + rel32), since the conditional opcode
+    // is 2 bytes, not 1.
+    let expected_rel = -(len_before_jcc as i32 + 6);
+    assert_eq!(a.code()[len_before_jcc], 0x0F);
+    assert_eq!(a.code()[len_before_jcc + 1], 0x80 + 5); // NotEqual's nibble is 5
+    assert_eq!(
+        &a.code()[len_before_jcc + 2..len_before_jcc + 6],
+        &expected_rel.to_le_bytes()
+    );
+    assert_eq!(a.code().len(), len_before_jcc + 6);
+
+    let text = disassemble(a.code());
+    assert!(text.last().unwrap().starts_with('j'));
+}
+
+#[test]
+fn jcc_forward_always_uses_the_near_form() {
+    let mut a = Assembler::new();
+    let l = a.new_label();
+    let jcc_at = a.code().len(); // 0
+    a.jcc(ConditionCode::Less, l); // forward reference -- label not bound yet
+    assert_eq!(a.code()[jcc_at], 0x0F);
+    assert_eq!(a.code()[jcc_at + 1], 0x80 + 12); // Less's nibble is 12
+    assert_eq!(a.code().len(), jcc_at + 6); // always the 6-byte near form for forward jumps, never the 2-byte short form
+
+    a.mov_reg_reg(PhysReg::Rax, PhysReg::Rax); // 3 bytes of filler between the jcc and its target
+    let target_pos = a.code().len();
+    a.bind(l); // resolves the fixup recorded above
+
+    let expected_rel = target_pos as i32 - (jcc_at as i32 + 6);
+    assert_eq!(
+        &a.code()[jcc_at + 2..jcc_at + 6],
+        &expected_rel.to_le_bytes()
+    );
+
+    let text = disassemble(a.code());
+    assert!(text[0].starts_with('j'));
+}

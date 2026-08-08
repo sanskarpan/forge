@@ -169,6 +169,37 @@ impl Assembler {
             self.fixups.push(Fixup { at, target: label });
         }
     }
+
+    /// `jcc label` -- conditional jump. Mirrors jmp's rel8/rel32
+    /// auto-selection and Fixup reuse exactly, except for length: the
+    /// short form is 2 bytes (70+cc, rel8), the near form is 6 bytes
+    /// (0F 80+cc, rel32) -- one byte longer than jmp's 5-byte near form,
+    /// since the conditional opcode is 2 bytes, not 1. patch_fixup()
+    /// needs no changes: it only depends on fixup.at (the position of
+    /// the 4 placeholder bytes), not on how long the preceding opcode
+    /// was.
+    pub fn jcc(&mut self, cc: ConditionCode, label: Label) {
+        if let Some(target_pos) = self.labels[label.0] {
+            let end_if_short = self.code.len() + 2;
+            let rel = target_pos as isize - end_if_short as isize;
+            if let Ok(rel8) = i8::try_from(rel) {
+                self.code.push(0x70 + cc.nibble());
+                self.code.push(rel8 as u8);
+            } else {
+                let end_if_near = self.code.len() + 6;
+                let rel32 = target_pos as isize - end_if_near as isize;
+                self.code.push(0x0F);
+                self.code.push(0x80 + cc.nibble());
+                self.code.extend_from_slice(&(rel32 as i32).to_le_bytes());
+            }
+        } else {
+            self.code.push(0x0F);
+            self.code.push(0x80 + cc.nibble());
+            let at = self.code.len();
+            self.code.extend_from_slice(&[0, 0, 0, 0]); // placeholder, patched by bind()
+            self.fixups.push(Fixup { at, target: label });
+        }
+    }
 }
 
 impl Default for Assembler {
