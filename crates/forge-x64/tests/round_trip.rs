@@ -477,3 +477,19 @@ fn mov_mem_reg_rsp_base_requires_sib() {
     assert_eq!(a.code(), &[0x48, 0x89, 0x04, 0x24]);
     assert_eq!(disassemble(a.code()), vec!["mov [rsp],rax"]);
 }
+
+#[test]
+fn alu_reg_reg_cmp() {
+    let mut a = Assembler::new();
+    a.alu_reg_reg(AluOp::Cmp, PhysReg::Rax, PhysReg::Rbx);
+    assert_eq!(a.code(), &[0x48, 0x39, 0xD8]);
+    assert_eq!(disassemble(a.code()), vec!["cmp rax,rbx"]);
+}
+
+#[test]
+fn alu_reg_imm_cmp() {
+    let mut a = Assembler::new();
+    a.alu_reg_imm(AluOp::Cmp, PhysReg::Rax, 5);
+    assert_eq!(a.code(), &[0x48, 0x83, 0xF8, 0x05]);
+    assert_eq!(disassemble(a.code()), vec!["cmp rax,5"]);
+}

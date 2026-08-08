@@ -14,6 +14,7 @@ pub enum AluOp {
     And,
     Sub,
     Xor,
+    Cmp,
 }
 
 impl AluOp {
@@ -26,6 +27,7 @@ impl AluOp {
             AluOp::And => 4,
             AluOp::Sub => 5,
             AluOp::Xor => 6,
+            AluOp::Cmp => 7,
         }
     }
 
@@ -39,6 +41,7 @@ impl AluOp {
             AluOp::And => 0x21,
             AluOp::Sub => 0x29,
             AluOp::Xor => 0x31,
+            AluOp::Cmp => 0x39,
         }
     }
 }
