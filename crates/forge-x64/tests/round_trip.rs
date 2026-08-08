@@ -725,3 +725,15 @@ fn shift_reg_cl_takes_the_count_from_cl() {
     assert_eq!(a.code(), &[0x48, 0xD3, 0xE0]);
     assert_eq!(disassemble(a.code()), vec!["shl rax,cl"]);
 }
+
+#[test]
+fn lea_reg_mem_computes_an_address_not_a_dereference() {
+    let mut a = Assembler::new();
+    a.lea_reg_mem(PhysReg::Rax, PhysReg::Rcx, 8);
+    assert_eq!(a.code(), &[0x48, 0x8D, 0x41, 0x08]);
+    // Confirms genuinely `lea`, not `mov` -- if the opcode were
+    // accidentally 0x8B (mov_reg_mem's load opcode) instead of 0x8D,
+    // the bytes would differ by exactly one byte and this string would
+    // read "mov rax,[rcx+8]" instead.
+    assert_eq!(disassemble(a.code()), vec!["lea rax,[rcx+8]"]);
+}

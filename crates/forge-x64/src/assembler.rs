@@ -424,6 +424,15 @@ impl Assembler {
         self.modrm_mem(src.encoding(), base.encoding(), disp);
     }
 
+    /// `lea dst, [base + disp]` -- REX.W + 8D /r. Computes an address
+    /// without dereferencing it. Reuses modrm_mem exactly like
+    /// mov_reg_mem does, just with opcode 0x8D.
+    pub fn lea_reg_mem(&mut self, dst: PhysReg, base: PhysReg, disp: i32) {
+        self.rex(true, dst.encoding(), 0, base.encoding());
+        self.code.push(0x8D);
+        self.modrm_mem(dst.encoding(), base.encoding(), disp);
+    }
+
     /// `test a, b` -- computes `a & b`, discards the result, sets flags
     /// only. REX.W + 85 /r. Symmetric: unlike mov/alu's store-direction
     /// convention, there's no meaningful "which operand is destination"
