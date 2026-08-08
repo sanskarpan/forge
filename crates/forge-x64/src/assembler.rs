@@ -412,6 +412,86 @@ impl Assembler {
     }
 }
 
+/// One of x86-64's 16 condition codes, usable with `setcc`/`cmovcc`/`jcc`.
+/// forge's current i64 comparisons only need Equal/NotEqual/Less/
+/// GreaterOrEqual/LessOrEqual/Greater, but all 16 are implemented now --
+/// the other 10 (unsigned, sign, overflow, parity) will matter once
+/// forge grows unsigned or float comparisons.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConditionCode {
+    Overflow,
+    NotOverflow,
+    Below,
+    AboveOrEqual,
+    Equal,
+    NotEqual,
+    BelowOrEqual,
+    Above,
+    Sign,
+    NotSign,
+    Parity,
+    NotParity,
+    Less,
+    GreaterOrEqual,
+    LessOrEqual,
+    Greater,
+}
+
+impl ConditionCode {
+    /// The 4-bit "cc" nibble -- the low 4 bits of the corresponding
+    /// Jcc/SETcc/CMOVcc opcode byte, matching Intel's canonical ordering.
+    fn nibble(self) -> u8 {
+        use ConditionCode::*;
+        match self {
+            Overflow => 0,
+            NotOverflow => 1,
+            Below => 2,
+            AboveOrEqual => 3,
+            Equal => 4,
+            NotEqual => 5,
+            BelowOrEqual => 6,
+            Above => 7,
+            Sign => 8,
+            NotSign => 9,
+            Parity => 10,
+            NotParity => 11,
+            Less => 12,
+            GreaterOrEqual => 13,
+            LessOrEqual => 14,
+            Greater => 15,
+        }
+    }
+}
+
+impl Assembler {
+    /// Forces a REX prefix (even a "no-op" 0x40) when `dst` is in the
+    /// 4-7 encoding range, to select spl/bpl/sil/dil instead of
+    /// ah/ch/dh/bh for byte-sized operations -- the third REX trap
+    /// SPEC.md warns about, and the first place in this crate that
+    /// writes a byte-sized destination. Encodings 0-3 are unambiguous
+    /// either way (al/cl/dl/bl); encodings 8-15 already force a REX
+    /// prefix via their extension bit through the normal rex() path.
+    fn rex_for_byte_dst(&mut self, dst: u8) {
+        if (4..=7).contains(&dst) {
+            self.code.push(0x40);
+        } else {
+            self.rex(false, 0, 0, dst);
+        }
+    }
+
+    /// `setcc dst` -- writes 0 or 1 to the low byte of `dst` based on
+    /// `cc`. 0F 90+cc /0. Writes ONLY one byte -- the upper bits of
+    /// `dst` are left as whatever was there before; producing a clean
+    /// full-width 0/1 is instruction-selection's job (e.g. an xor
+    /// before this call), not this method's.
+    pub fn setcc(&mut self, cc: ConditionCode, dst: PhysReg) {
+        self.rex_for_byte_dst(dst.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x90 + cc.nibble());
+        self.modrm_reg(0, dst.encoding());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,4 @@
-use forge_x64::{AluOp, Assembler, PhysReg};
+use forge_x64::{AluOp, Assembler, ConditionCode, PhysReg};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, NasmFormatter};
 
 /// Assembles into a fresh, disposable buffer and returns each decoded
@@ -518,4 +518,44 @@ fn test_reg_imm_checks_a_bit_pattern() {
     // Verified empirically: iced-x86 renders the immediate in hex ("3E8h"),
     // not decimal, same convention already found for alu_reg_imm/mov_reg_imm.
     assert_eq!(disassemble(a.code()), vec!["test rax,3E8h"]);
+}
+
+#[test]
+fn setcc_low_register_needs_no_rex() {
+    let mut a = Assembler::new();
+    a.setcc(ConditionCode::Equal, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x0F, 0x94, 0xC0]);
+    // NOTE: verify this string empirically -- iced-x86's exact mnemonic
+    // naming for this condition code (e.g. "sete" vs "setz") was not
+    // checked against a live compile when this plan was written.
+    assert_eq!(disassemble(a.code()), vec!["sete al"]);
+}
+
+/// THE critical test: rsp/rbp/rsi/rdi (encoding 4-7) as a setcc
+/// destination need a REX prefix FORCED, even though nothing else about
+/// this instruction would otherwise need one, to select spl/bpl/sil/dil
+/// instead of ah/ch/dh/bh. If `rex_for_byte_dst` is missing or wrong,
+/// this test's golden bytes stay the same length either way (0x40 is a
+/// single byte) but the DISASSEMBLED NAME changes -- this is exactly the
+/// kind of bug that produces a plausible-looking, silently wrong
+/// encoding, per this project's repeated warnings about REX traps.
+#[test]
+fn setcc_rsp_encoding_forces_rex_to_avoid_ah_ch_dh_bh() {
+    let mut a = Assembler::new();
+    a.setcc(ConditionCode::NotEqual, PhysReg::Rsp);
+    assert_eq!(a.code(), &[0x40, 0x0F, 0x95, 0xC4]);
+    // NOTE: verify this string empirically. If the REX-forcing logic is
+    // broken, the bytes might still be [0x0F, 0x95, 0xC4] (no 0x40) and
+    // this assertion would need to change to "setne ah" instead -- if
+    // that happens, the bug is in rex_for_byte_dst, not in this test.
+    assert_eq!(disassemble(a.code()), vec!["setne spl"]);
+}
+
+#[test]
+fn setcc_extended_register_already_forces_rex() {
+    let mut a = Assembler::new();
+    a.setcc(ConditionCode::Less, PhysReg::R9);
+    assert_eq!(a.code(), &[0x41, 0x0F, 0x9C, 0xC1]);
+    // NOTE: verify this string empirically.
+    assert_eq!(disassemble(a.code()), vec!["setl r9b"]);
 }
