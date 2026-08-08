@@ -216,7 +216,7 @@
 - [ ] 🔴 `andpd`/`xorpd` for `abs` and `neg` via sign-mask constants
 - [ ] 🔴 `ucomisd` + `setcc` for comparisons
 - [ ] 🔴 `cvtsi2sd` `cvttsd2si`
-- [ ] 🔴 `roundsd` (SSE4.1) for floor/ceil/round/trunc
+- [ ] 🔴 `roundsd` (SSE4.1) for floor/ceil/round/trunc — **note (Phase 6e):** all of this section built: `movsd_reg_reg`/`movsd_reg_mem`/`movsd_mem_reg`, `movapd_reg_reg`, `movq_gpr_to_xmm`/`movq_xmm_to_gpr` (bullet above); the `SseOp`-driven `addsd`/`subsd`/`mulsd`/`divsd`/`sqrtsd`/`minsd`/`maxsd` family via `sse_reg_reg`; `andpd_reg_reg`/`xorpd_reg_reg` as raw 2-operand bitwise primitives ONLY — composing them into actual `abs`/`neg` (materializing a sign-mask constant via `mov_reg_imm` + `movq_gpr_to_xmm`, or eventually a RIP-relative constant pool) is deliberately deferred to Phase 7's instruction-selection layer, not built in this slice; `ucomisd_reg_reg` (reusing 6c's `ConditionCode`/`setcc`/`jcc`/`cmovcc` machinery entirely unmodified, documented for use with the unsigned condition codes float comparisons require); and `cvtsi2sd`/`cvttsd2si`. `roundsd` itself is genuinely SSE4.1 not SSE2, as this bullet's own parenthetical already says; the encoder was still built here since CHECKLIST groups it with the SSE2 bullets — runtime CPUID feature detection gating its availability is a separate, later concern (Phase 10's `CpuFeatures`), not addressed by this slice. Details: `docs/superpowers/specs/2026-08-09-phase-6e-x64-sse2-scalar-float-design.md`
 
 **VEX / AVX**
 - [ ] 🟡 2-byte and 3-byte VEX emitters
