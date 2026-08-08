@@ -643,6 +643,33 @@ impl Assembler {
         self.code.push(0x7E);
         self.modrm_reg(src.encoding(), dst.encoding());
     }
+
+    /// `andpd dst, src` -- 66 0F 54 /r. Raw bitwise-AND primitive, used
+    /// (by a caller, not this method) to implement float `abs` by
+    /// clearing the sign bit against a materialized sign-mask constant.
+    /// This method does NOT materialize any mask itself -- that's
+    /// instruction-selection's job (mov_reg_imm + movq_gpr_to_xmm),
+    /// matching this crate's established "thin composable primitives"
+    /// philosophy (see idiv_reg's cqo precondition, setcc's undone
+    /// zero-extension).
+    pub fn andpd_reg_reg(&mut self, dst: PhysReg, src: PhysReg) {
+        self.code.push(0x66);
+        self.rex(false, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x54);
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
+
+    /// `xorpd dst, src` -- 66 0F 57 /r. Same raw-primitive philosophy as
+    /// andpd_reg_reg, used to implement float `neg` by flipping the sign
+    /// bit against a materialized mask.
+    pub fn xorpd_reg_reg(&mut self, dst: PhysReg, src: PhysReg) {
+        self.code.push(0x66);
+        self.rex(false, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x57);
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
 }
 
 /// A group-2 shift operation: `shl`/`shr`/`sar` share the same opcode

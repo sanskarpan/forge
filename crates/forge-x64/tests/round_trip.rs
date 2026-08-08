@@ -963,3 +963,19 @@ fn sse_reg_reg_max() {
     assert_eq!(a.code(), &[0xF2, 0x0F, 0x5F, 0xC1]);
     assert_eq!(disassemble(a.code()), vec!["maxsd xmm0,xmm1"]);
 }
+
+#[test]
+fn andpd_reg_reg_encodes_correctly() {
+    let mut a = Assembler::new();
+    a.andpd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x54, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["andpd xmm0,xmm1"]);
+}
+
+#[test]
+fn xorpd_reg_reg_encodes_correctly() {
+    let mut a = Assembler::new();
+    a.xorpd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x57, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["xorpd xmm0,xmm1"]);
+}
