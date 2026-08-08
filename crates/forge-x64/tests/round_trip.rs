@@ -771,3 +771,49 @@ fn lea_reg_scaled_rbp_base_with_zero_disp_still_forces_disp8() {
     // NOTE: verify this string empirically.
     assert_eq!(disassemble(a.code()), vec!["lea rax,[rbp+rax*2]"]);
 }
+
+/// All 3 prior lea_reg_scaled tests use index registers with encoding
+/// <8 (Rbx=3, Rax=0), so REX.X ((index.encoding()>>3)&1) is always 0 in
+/// every one of them -- an undetected bug swapping REX.X with REX.B, or
+/// mis-shifting the index encoding into the SIB byte, would pass all of
+/// them. R9's encoding is 9 (>=8), forcing REX.X=1 while base/dst stay
+/// low, isolating REX.X from REX.R/REX.B.
+#[test]
+fn lea_reg_scaled_extended_index_sets_rex_x() {
+    let mut a = Assembler::new();
+    a.lea_reg_scaled(PhysReg::Rax, PhysReg::Rax, PhysReg::R9, 4, 0);
+    // REX = 0x40 | W(0x08) | R(0, dst=rax) | X(0x02, index=r9 encoding
+    // 9 >= 8) | B(0, base=rax) = 0x4A. SIB's index field carries r9's
+    // encoding masked to its low 3 bits (9 & 7 = 1).
+    assert_eq!(a.code(), &[0x4A, 0x8D, 0x04, 0x88]);
+    // NOTE: verify this string empirically.
+    assert_eq!(disassemble(a.code()), vec!["lea rax,[rax+r9*4]"]);
+}
+
+/// scale must be one of 1/2/4/8 -- anything else hits the `_ =>
+/// panic!(...)` arm. Only 2 and 4 are exercised by the tests above;
+/// this pins the invalid-input path down explicitly rather than
+/// trusting it by inspection, matching this crate's established
+/// discipline of proving panic paths (e.g. the RSP-as-index test above).
+#[test]
+#[should_panic(expected = "scale must be 1, 2, 4, or 8, got 3")]
+fn lea_reg_scaled_panics_on_invalid_scale() {
+    let mut a = Assembler::new();
+    a.lea_reg_scaled(PhysReg::Rax, PhysReg::Rax, PhysReg::Rbx, 3, 0);
+}
+
+/// Closes the scale boundary gap: the 3 non-panic tests above only hit
+/// scale=2 and scale=4, leaving scale=1 (0b00) and scale=8 (0b11) --
+/// the two ends of the valid range -- unexercised. This covers scale=8.
+#[test]
+fn lea_reg_scaled_scale_of_eight() {
+    let mut a = Assembler::new();
+    a.lea_reg_scaled(PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx, 8, 0);
+    // REX = 0x48 (W only, all operands low). ModRM = 00 000 100 = 0x04
+    // (mod=00 since disp=0 and base=rcx isn't the rbp/r13 trap case).
+    // SIB = scale_bits(0b11 for *8)<<6 | rdx's encoding(2)<<3 |
+    // rcx's encoding(1) = 0xC0 | 0x10 | 0x01 = 0xD1.
+    assert_eq!(a.code(), &[0x48, 0x8D, 0x04, 0xD1]);
+    // NOTE: verify this string empirically.
+    assert_eq!(disassemble(a.code()), vec!["lea rax,[rcx+rdx*8]"]);
+}
