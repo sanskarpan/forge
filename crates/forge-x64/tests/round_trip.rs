@@ -1026,3 +1026,47 @@ fn cvttsd2si_converts_xmm_to_gpr_truncating() {
     assert_eq!(a.code(), &[0xF2, 0x4C, 0x0F, 0x2C, 0xC8]);
     assert_eq!(disassemble(a.code()), vec!["cvttsd2si r9,xmm0"]);
 }
+
+use forge_x64::RoundMode;
+
+#[test]
+fn roundsd_nearest() {
+    let mut a = Assembler::new();
+    a.roundsd(RoundMode::Nearest, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x08]);
+    // NOTE: verify this string empirically -- this crate's established
+    // pattern (6b/6c) is that iced-x86 sometimes renders small
+    // immediates in hex, sometimes decimal, and the exact threshold
+    // isn't known; this was not checked against a live compile when
+    // this plan was written.
+    assert_eq!(disassemble(a.code()), vec!["roundsd xmm0,xmm1,8"]);
+}
+
+#[test]
+fn roundsd_floor() {
+    let mut a = Assembler::new();
+    a.roundsd(RoundMode::Floor, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x09]);
+    // NOTE: verify this string empirically, same caveat as above.
+    assert_eq!(disassemble(a.code()), vec!["roundsd xmm0,xmm1,9"]);
+}
+
+#[test]
+fn roundsd_ceil() {
+    let mut a = Assembler::new();
+    a.roundsd(RoundMode::Ceil, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x0A]);
+    // NOTE: verify this string empirically -- 0x0A (10 decimal) is
+    // exactly the kind of value that has flipped between hex and
+    // decimal rendering in past findings; treat this as fully unverified.
+    assert_eq!(disassemble(a.code()), vec!["roundsd xmm0,xmm1,0Ah"]);
+}
+
+#[test]
+fn roundsd_truncate() {
+    let mut a = Assembler::new();
+    a.roundsd(RoundMode::Truncate, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x0B]);
+    // NOTE: verify this string empirically, same caveat as roundsd_ceil.
+    assert_eq!(disassemble(a.code()), vec!["roundsd xmm0,xmm1,0Bh"]);
+}

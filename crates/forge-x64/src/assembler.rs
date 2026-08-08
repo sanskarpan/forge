@@ -898,6 +898,49 @@ impl Assembler {
     }
 }
 
+/// The four rounding modes CHECKLIST asks for (floor/ceil/round/trunc).
+/// `roundsd`'s control byte also always sets bit 3 (0x08, "suppress
+/// precision exception") -- the standard convention every mainstream
+/// compiler uses, since without it a rounding operation that loses
+/// precision raises a floating-point exception most code doesn't want.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoundMode {
+    Nearest,
+    Floor,
+    Ceil,
+    Truncate,
+}
+
+impl RoundMode {
+    fn control_byte(self) -> u8 {
+        let mode = match self {
+            RoundMode::Nearest => 0x00,
+            RoundMode::Floor => 0x01,
+            RoundMode::Ceil => 0x02,
+            RoundMode::Truncate => 0x03,
+        };
+        mode | 0x08
+    }
+}
+
+impl Assembler {
+    /// `roundsd dst, src, mode` -- 66 0F 3A 0B /r ib. SSE4.1, not pure
+    /// SSE2 (CHECKLIST's own bullet notes this) -- a 3-byte opcode
+    /// (0F 3A escape + 0B) plus an immediate control byte, the most
+    /// novel encoding shape in this slice. Runtime CPUID feature
+    /// detection for SSE4.1 availability is a separate, later concern
+    /// (this task only builds the encoder).
+    pub fn roundsd(&mut self, mode: RoundMode, dst: PhysReg, src: PhysReg) {
+        self.code.push(0x66);
+        self.rex(false, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x3A);
+        self.code.push(0x0B);
+        self.modrm_reg(dst.encoding(), src.encoding());
+        self.code.push(mode.control_byte());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
