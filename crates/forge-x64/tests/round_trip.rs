@@ -817,3 +817,27 @@ fn lea_reg_scaled_scale_of_eight() {
     // NOTE: verify this string empirically.
     assert_eq!(disassemble(a.code()), vec!["lea rax,[rcx+rdx*8]"]);
 }
+
+#[test]
+fn imul128_reg_encodes_the_one_operand_form() {
+    let mut a = Assembler::new();
+    a.imul128_reg(PhysReg::Rbx);
+    assert_eq!(a.code(), &[0x48, 0xF7, 0xEB]);
+    assert_eq!(disassemble(a.code()), vec!["imul rbx"]);
+}
+
+#[test]
+fn idiv_reg_encodes_the_divisor_operand() {
+    let mut a = Assembler::new();
+    a.idiv_reg(PhysReg::R9);
+    assert_eq!(a.code(), &[0x49, 0xF7, 0xF9]);
+    assert_eq!(disassemble(a.code()), vec!["idiv r9"]);
+}
+
+#[test]
+fn cqo_sign_extends_rax_into_rdx_rax() {
+    let mut a = Assembler::new();
+    a.cqo();
+    assert_eq!(a.code(), &[0x48, 0x99]);
+    assert_eq!(disassemble(a.code()), vec!["cqo"]);
+}

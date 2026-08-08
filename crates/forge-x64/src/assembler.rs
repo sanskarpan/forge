@@ -545,6 +545,35 @@ impl Assembler {
         self.code.push(0xFF);
         self.modrm_reg(1, dst.encoding());
     }
+
+    /// `imul src` (one-operand form) -- RDX:RAX = RAX * src, signed,
+    /// full 128-bit product. REX.W + F7 /5. Unlike every ModRM-based
+    /// instruction so far, this has no explicit destination -- the
+    /// result always lands in the implicit RDX:RAX pair.
+    pub fn imul128_reg(&mut self, src: PhysReg) {
+        self.rex(true, 0, 0, src.encoding());
+        self.code.push(0xF7);
+        self.modrm_reg(5, src.encoding());
+    }
+
+    /// `idiv src` -- RAX = RDX:RAX / src, RDX = RDX:RAX % src, signed.
+    /// REX.W + F7 /7. PRECONDITION: RDX must already be the correct
+    /// sign-extension of RAX (call cqo() first) -- otherwise this
+    /// computes garbage or traps with #DE, even for divisions that
+    /// don't actually overflow.
+    pub fn idiv_reg(&mut self, src: PhysReg) {
+        self.rex(true, 0, 0, src.encoding());
+        self.code.push(0xF7);
+        self.modrm_reg(7, src.encoding());
+    }
+
+    /// Sign-extends RAX into RDX:RAX -- the required precondition for
+    /// idiv_reg. REX.W + 0x99. No ModRM, no operands -- the simplest
+    /// instruction in this crate.
+    pub fn cqo(&mut self) {
+        self.rex(true, 0, 0, 0);
+        self.code.push(0x99);
+    }
 }
 
 /// A group-2 shift operation: `shl`/`shr`/`sar` share the same opcode
