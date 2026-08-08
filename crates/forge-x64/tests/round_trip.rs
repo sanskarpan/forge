@@ -691,3 +691,37 @@ fn dec_reg_uses_the_modrm_form() {
     assert_eq!(a.code(), &[0x48, 0xFF, 0xC8]);
     assert_eq!(disassemble(a.code()), vec!["dec rax"]);
 }
+
+use forge_x64::ShiftOp;
+
+#[test]
+fn shift_reg_imm8_shl() {
+    let mut a = Assembler::new();
+    a.shift_reg_imm8(ShiftOp::Shl, PhysReg::Rax, 3);
+    assert_eq!(a.code(), &[0x48, 0xC1, 0xE0, 0x03]);
+    assert_eq!(disassemble(a.code()), vec!["shl rax,3"]);
+}
+
+#[test]
+fn shift_reg_imm8_shr() {
+    let mut a = Assembler::new();
+    a.shift_reg_imm8(ShiftOp::Shr, PhysReg::Rbx, 5);
+    assert_eq!(a.code(), &[0x48, 0xC1, 0xEB, 0x05]);
+    assert_eq!(disassemble(a.code()), vec!["shr rbx,5"]);
+}
+
+#[test]
+fn shift_reg_imm8_sar() {
+    let mut a = Assembler::new();
+    a.shift_reg_imm8(ShiftOp::Sar, PhysReg::R9, 1);
+    assert_eq!(a.code(), &[0x49, 0xC1, 0xF9, 0x01]);
+    assert_eq!(disassemble(a.code()), vec!["sar r9,1"]);
+}
+
+#[test]
+fn shift_reg_cl_takes_the_count_from_cl() {
+    let mut a = Assembler::new();
+    a.shift_reg_cl(ShiftOp::Shl, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x48, 0xD3, 0xE0]);
+    assert_eq!(disassemble(a.code()), vec!["shl rax,cl"]);
+}

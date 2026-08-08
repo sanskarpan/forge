@@ -482,6 +482,52 @@ impl Assembler {
     }
 }
 
+/// A group-2 shift operation: `shl`/`shr`/`sar` share the same opcode
+/// pair (C1 /n for the immediate-shift-amount form, D3 /n for the
+/// CL-count form), differing only by the ModRM.reg extension digit --
+/// the same justification `AluOp` has for existing. /0-3 (rotate) and /6
+/// (an unused alias for /4) aren't part of this crate's instruction set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShiftOp {
+    Shl,
+    Shr,
+    Sar,
+}
+
+impl ShiftOp {
+    fn extension(self) -> u8 {
+        match self {
+            ShiftOp::Shl => 4,
+            ShiftOp::Shr => 5,
+            ShiftOp::Sar => 7,
+        }
+    }
+}
+
+impl Assembler {
+    /// `op dst, shift` -- REX.W + C1 /n ib. NOTE: x86 masks the shift
+    /// count to the low 6 bits for 64-bit operands at EXECUTION time --
+    /// this method does not mask `shift` itself, it encodes whatever
+    /// byte it's given. A caller passing 64 encodes literally 64, which
+    /// the CPU then treats as a shift by 0 at runtime, not as "shift out
+    /// everything."
+    pub fn shift_reg_imm8(&mut self, op: ShiftOp, dst: PhysReg, shift: u8) {
+        self.rex(true, 0, 0, dst.encoding());
+        self.code.push(0xC1);
+        self.modrm_reg(op.extension(), dst.encoding());
+        self.code.push(shift);
+    }
+
+    /// `op dst, cl` -- REX.W + D3 /n. Shift count comes from CL (the low
+    /// byte of RCX); the caller is responsible for having loaded the
+    /// count into CL beforehand.
+    pub fn shift_reg_cl(&mut self, op: ShiftOp, dst: PhysReg) {
+        self.rex(true, 0, 0, dst.encoding());
+        self.code.push(0xD3);
+        self.modrm_reg(op.extension(), dst.encoding());
+    }
+}
+
 /// One of x86-64's 16 condition codes, usable with `setcc`/`cmovcc`/`jcc`.
 /// forge's current i64 comparisons only need Equal/NotEqual/Less/
 /// GreaterOrEqual/LessOrEqual/Greater, but all 16 are implemented now --
