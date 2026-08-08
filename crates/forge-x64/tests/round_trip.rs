@@ -901,3 +901,65 @@ fn movq_xmm_to_gpr_transfers_into_the_gpr() {
     assert_eq!(a.code(), &[0x66, 0x4C, 0x0F, 0x7E, 0xC8]);
     assert_eq!(disassemble(a.code()), vec!["movq rax,xmm9"]);
 }
+
+use forge_x64::SseOp;
+
+#[test]
+fn sse_reg_reg_add() {
+    let mut a = Assembler::new();
+    a.sse_reg_reg(SseOp::Add, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x58, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["addsd xmm0,xmm1"]);
+}
+
+#[test]
+fn sse_reg_reg_sub() {
+    let mut a = Assembler::new();
+    a.sse_reg_reg(SseOp::Sub, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x5C, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["subsd xmm0,xmm1"]);
+}
+
+#[test]
+fn sse_reg_reg_mul() {
+    let mut a = Assembler::new();
+    a.sse_reg_reg(SseOp::Mul, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x59, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["mulsd xmm0,xmm1"]);
+}
+
+#[test]
+fn sse_reg_reg_div() {
+    let mut a = Assembler::new();
+    a.sse_reg_reg(SseOp::Div, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x5E, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["divsd xmm0,xmm1"]);
+}
+
+#[test]
+fn sse_reg_reg_sqrt() {
+    let mut a = Assembler::new();
+    a.sse_reg_reg(SseOp::Sqrt, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x51, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["sqrtsd xmm0,xmm1"]);
+}
+
+/// minsd/maxsd are NOT commutative w.r.t. NaN -- this test only exists
+/// to prove the encoding (opcode 0x5D) is correct, not to demonstrate
+/// that semantic fact, which belongs to instruction-selection/the
+/// interpreter, not the encoder.
+#[test]
+fn sse_reg_reg_min() {
+    let mut a = Assembler::new();
+    a.sse_reg_reg(SseOp::Min, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x5D, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["minsd xmm0,xmm1"]);
+}
+
+#[test]
+fn sse_reg_reg_max() {
+    let mut a = Assembler::new();
+    a.sse_reg_reg(SseOp::Max, PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x5F, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["maxsd xmm0,xmm1"]);
+}

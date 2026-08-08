@@ -784,6 +784,50 @@ impl Assembler {
     }
 }
 
+/// A scalar-double arithmetic operation sharing identical F2-prefix,
+/// 0F-escape structure, differing only by the final opcode byte -- the
+/// same justification AluOp/ShiftOp have for existing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SseOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Sqrt,
+    Min,
+    Max,
+}
+
+impl SseOp {
+    fn opcode(self) -> u8 {
+        match self {
+            SseOp::Add => 0x58,
+            SseOp::Sub => 0x5C,
+            SseOp::Mul => 0x59,
+            SseOp::Div => 0x5E,
+            SseOp::Sqrt => 0x51,
+            SseOp::Min => 0x5D,
+            SseOp::Max => 0x5F,
+        }
+    }
+}
+
+impl Assembler {
+    /// `op dst, src` -- F2 0F <op.opcode()> /r, load direction.
+    /// minsd/maxsd are NOT commutative with respect to NaN (matching
+    /// CHECKLIST's explicit warning and this project's interpreter's
+    /// existing semantics) -- the encoder doesn't need to do anything
+    /// special about this, but it's a real correctness fact worth
+    /// documenting for whoever calls this with Min/Max.
+    pub fn sse_reg_reg(&mut self, op: SseOp, dst: PhysReg, src: PhysReg) {
+        self.code.push(0xF2);
+        self.rex(false, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(op.opcode());
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
