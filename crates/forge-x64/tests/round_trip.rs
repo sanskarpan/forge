@@ -493,3 +493,29 @@ fn alu_reg_imm_cmp() {
     assert_eq!(a.code(), &[0x48, 0x83, 0xF8, 0x05]);
     assert_eq!(disassemble(a.code()), vec!["cmp rax,5"]);
 }
+
+#[test]
+fn test_reg_reg_self_test_is_the_zero_check_idiom() {
+    let mut a = Assembler::new();
+    a.test_reg_reg(PhysReg::Rax, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x48, 0x85, 0xC0]);
+    assert_eq!(disassemble(a.code()), vec!["test rax,rax"]);
+}
+
+#[test]
+fn test_reg_reg_with_extended_registers() {
+    let mut a = Assembler::new();
+    a.test_reg_reg(PhysReg::Rbx, PhysReg::R9);
+    assert_eq!(a.code(), &[0x4C, 0x85, 0xCB]);
+    assert_eq!(disassemble(a.code()), vec!["test rbx,r9"]);
+}
+
+#[test]
+fn test_reg_imm_checks_a_bit_pattern() {
+    let mut a = Assembler::new();
+    a.test_reg_imm(PhysReg::Rax, 1000);
+    assert_eq!(a.code(), &[0x48, 0xF7, 0xC0, 0xE8, 0x03, 0x00, 0x00]);
+    // Verified empirically: iced-x86 renders the immediate in hex ("3E8h"),
+    // not decimal, same convention already found for alu_reg_imm/mov_reg_imm.
+    assert_eq!(disassemble(a.code()), vec!["test rax,3E8h"]);
+}

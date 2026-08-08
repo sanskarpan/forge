@@ -390,6 +390,26 @@ impl Assembler {
         self.code.push(0x89);
         self.modrm_mem(src.encoding(), base.encoding(), disp);
     }
+
+    /// `test a, b` -- computes `a & b`, discards the result, sets flags
+    /// only. REX.W + 85 /r. Symmetric: unlike mov/alu's store-direction
+    /// convention, there's no meaningful "which operand is destination"
+    /// distinction to get backward, since neither operand is written.
+    pub fn test_reg_reg(&mut self, a: PhysReg, b: PhysReg) {
+        self.rex(true, b.encoding(), 0, a.encoding());
+        self.code.push(0x85);
+        self.modrm_reg(b.encoding(), a.encoding());
+    }
+
+    /// `test dst, imm` -- REX.W + F7 /0 id. A completely separate opcode
+    /// from group-1's 0x81/0x83 -- no imm8 form exists for `test` in
+    /// real x86-64.
+    pub fn test_reg_imm(&mut self, dst: PhysReg, imm: i32) {
+        self.rex(true, 0, 0, dst.encoding());
+        self.code.push(0xF7);
+        self.modrm_reg(0, dst.encoding());
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
