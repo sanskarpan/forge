@@ -1004,3 +1004,25 @@ fn ucomisd_followed_by_setcc_below_encodes_the_less_than_comparison() {
     assert_eq!(a.code(), &[0x66, 0x0F, 0x2E, 0xC1, 0x0F, 0x92, 0xC0]);
     assert_eq!(disassemble(a.code()), vec!["ucomisd xmm0,xmm1", "setb al"]);
 }
+
+/// Uses R9 as the GPR operand so REX.B correctly threading through as
+/// the `rm` field is genuinely exercised, not just assumed.
+#[test]
+fn cvtsi2sd_converts_gpr_to_xmm() {
+    let mut a = Assembler::new();
+    a.cvtsi2sd(PhysReg::Xmm0, PhysReg::R9);
+    assert_eq!(a.code(), &[0xF2, 0x49, 0x0F, 0x2A, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["cvtsi2sd xmm0,r9"]);
+}
+
+/// Uses R9 as the GPR operand so REX.R correctly threading through as
+/// the `reg` field is genuinely exercised (opposite REX bit from
+/// cvtsi2sd's test, since the GPR is the destination here, not the
+/// source -- a real place to get the direction backward).
+#[test]
+fn cvttsd2si_converts_xmm_to_gpr_truncating() {
+    let mut a = Assembler::new();
+    a.cvttsd2si(PhysReg::R9, PhysReg::Xmm0);
+    assert_eq!(a.code(), &[0xF2, 0x4C, 0x0F, 0x2C, 0xC8]);
+    assert_eq!(disassemble(a.code()), vec!["cvttsd2si r9,xmm0"]);
+}

@@ -688,6 +688,31 @@ impl Assembler {
         self.code.push(0x2E);
         self.modrm_reg(a.encoding(), b.encoding());
     }
+
+    /// `cvtsi2sd dst(xmm), src(gpr)` -- F2 REX.W 0F 2A /r, load direction
+    /// (reg=dst xmm, rm=src gpr). REX.W selects the 64-bit GPR source
+    /// form (forge's i64), matching the AAPCS64/SysV convention this
+    /// project always widens to.
+    pub fn cvtsi2sd(&mut self, dst: PhysReg, src: PhysReg) {
+        self.code.push(0xF2);
+        self.rex(true, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x2A);
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
+
+    /// `cvttsd2si dst(gpr), src(xmm)` -- F2 REX.W 0F 2C /r, load
+    /// direction with the GPR as ModRM.reg (the destination) this time --
+    /// direction is opposite to cvtsi2sd's, a real place to get backward.
+    /// Truncating (toward zero), NOT rounding -- cvtsd2si (a different
+    /// opcode, 0x2D) is the rounding variant and isn't built here.
+    pub fn cvttsd2si(&mut self, dst: PhysReg, src: PhysReg) {
+        self.code.push(0xF2);
+        self.rex(true, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x2C);
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
 }
 
 /// A group-2 shift operation: `shl`/`shr`/`sar` share the same opcode
