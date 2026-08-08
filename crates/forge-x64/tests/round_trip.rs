@@ -661,6 +661,14 @@ fn not_reg_flips_all_bits() {
 }
 
 #[test]
+fn not_reg_with_extended_register_sets_rex_b() {
+    let mut a = Assembler::new();
+    a.not_reg(PhysReg::R8);
+    assert_eq!(a.code(), &[0x49, 0xF7, 0xD0]);
+    assert_eq!(disassemble(a.code()), vec!["not r8"]);
+}
+
+#[test]
 fn neg_reg_negates() {
     let mut a = Assembler::new();
     a.neg_reg(PhysReg::Rbx);

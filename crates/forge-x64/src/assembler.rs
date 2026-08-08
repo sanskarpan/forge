@@ -444,6 +444,11 @@ impl Assembler {
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
 
+    // not/neg share opcode 0xF7 (differing only by extension digit, like
+    // ShiftOp's pattern), but inc/dec use the unrelated opcode 0xFF --
+    // there's no single shared structure across all four to abstract
+    // over, so these stay as four standalone methods rather than one enum.
+
     /// `not dst` -- REX.W + F7 /2, one's complement in place.
     pub fn not_reg(&mut self, dst: PhysReg) {
         self.rex(true, 0, 0, dst.encoding());
@@ -467,7 +472,9 @@ impl Assembler {
         self.modrm_reg(0, dst.encoding());
     }
 
-    /// `dec dst` -- REX.W + FF /1. Same 64-bit-mode note as inc_reg.
+    /// `dec dst` -- REX.W + FF /1. Like inc_reg, this is the only encoding
+    /// that exists in 64-bit mode: the classic single-byte DEC opcodes
+    /// (0x48-0x4F) were repurposed as REX prefixes.
     pub fn dec_reg(&mut self, dst: PhysReg) {
         self.rex(true, 0, 0, dst.encoding());
         self.code.push(0xFF);
