@@ -443,6 +443,36 @@ impl Assembler {
         self.modrm_reg(0, dst.encoding());
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
+
+    /// `not dst` -- REX.W + F7 /2, one's complement in place.
+    pub fn not_reg(&mut self, dst: PhysReg) {
+        self.rex(true, 0, 0, dst.encoding());
+        self.code.push(0xF7);
+        self.modrm_reg(2, dst.encoding());
+    }
+
+    /// `neg dst` -- REX.W + F7 /3, two's complement negation in place.
+    pub fn neg_reg(&mut self, dst: PhysReg) {
+        self.rex(true, 0, 0, dst.encoding());
+        self.code.push(0xF7);
+        self.modrm_reg(3, dst.encoding());
+    }
+
+    /// `inc dst` -- REX.W + FF /0. In 64-bit mode the old single-byte
+    /// INC opcodes (0x40-0x47) were repurposed as REX prefixes, so this
+    /// ModRM-based form (group 5) is the only encoding that exists.
+    pub fn inc_reg(&mut self, dst: PhysReg) {
+        self.rex(true, 0, 0, dst.encoding());
+        self.code.push(0xFF);
+        self.modrm_reg(0, dst.encoding());
+    }
+
+    /// `dec dst` -- REX.W + FF /1. Same 64-bit-mode note as inc_reg.
+    pub fn dec_reg(&mut self, dst: PhysReg) {
+        self.rex(true, 0, 0, dst.encoding());
+        self.code.push(0xFF);
+        self.modrm_reg(1, dst.encoding());
+    }
 }
 
 /// One of x86-64's 16 condition codes, usable with `setcc`/`cmovcc`/`jcc`.

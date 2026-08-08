@@ -651,3 +651,35 @@ fn jcc_forward_always_uses_the_near_form() {
     let text = disassemble(a.code());
     assert!(text[0].starts_with('j'));
 }
+
+#[test]
+fn not_reg_flips_all_bits() {
+    let mut a = Assembler::new();
+    a.not_reg(PhysReg::Rax);
+    assert_eq!(a.code(), &[0x48, 0xF7, 0xD0]);
+    assert_eq!(disassemble(a.code()), vec!["not rax"]);
+}
+
+#[test]
+fn neg_reg_negates() {
+    let mut a = Assembler::new();
+    a.neg_reg(PhysReg::Rbx);
+    assert_eq!(a.code(), &[0x48, 0xF7, 0xDB]);
+    assert_eq!(disassemble(a.code()), vec!["neg rbx"]);
+}
+
+#[test]
+fn inc_reg_uses_the_modrm_form_not_a_rex_conflicting_opcode() {
+    let mut a = Assembler::new();
+    a.inc_reg(PhysReg::R9);
+    assert_eq!(a.code(), &[0x49, 0xFF, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["inc r9"]);
+}
+
+#[test]
+fn dec_reg_uses_the_modrm_form() {
+    let mut a = Assembler::new();
+    a.dec_reg(PhysReg::Rax);
+    assert_eq!(a.code(), &[0x48, 0xFF, 0xC8]);
+    assert_eq!(disassemble(a.code()), vec!["dec rax"]);
+}
