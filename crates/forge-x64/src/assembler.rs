@@ -610,6 +610,39 @@ impl Assembler {
         self.code.push(0x11);
         self.modrm_mem(src.encoding(), base.encoding(), disp);
     }
+
+    /// `movapd dst, src` -- 66 0F 28 /r. Register-register only -- its
+    /// most common real use; a memory-operand form is a small future
+    /// addition if ever needed, not built now.
+    pub fn movapd_reg_reg(&mut self, dst: PhysReg, src: PhysReg) {
+        self.code.push(0x66);
+        self.rex(false, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x28);
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
+
+    /// `movq dst(xmm), src(gpr)` -- 66 REX.W 0F 6E /r, load direction.
+    /// REX.W matters here (and for movq_xmm_to_gpr/cvtsi2sd/cvttsd2si)
+    /// since a real 64-bit GPR value is being moved -- unlike every
+    /// other SSE2 method in this slice, where W is unused.
+    pub fn movq_gpr_to_xmm(&mut self, dst: PhysReg, src: PhysReg) {
+        self.code.push(0x66);
+        self.rex(true, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x6E);
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
+
+    /// `movq dst(gpr), src(xmm)` -- 66 REX.W 0F 7E /r, store direction
+    /// (rm=dst, reg=src) -- the mirror image of movq_gpr_to_xmm.
+    pub fn movq_xmm_to_gpr(&mut self, dst: PhysReg, src: PhysReg) {
+        self.code.push(0x66);
+        self.rex(true, src.encoding(), 0, dst.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x7E);
+        self.modrm_reg(src.encoding(), dst.encoding());
+    }
 }
 
 /// A group-2 shift operation: `shl`/`shr`/`sar` share the same opcode

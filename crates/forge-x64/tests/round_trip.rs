@@ -874,3 +874,30 @@ fn movsd_mem_reg_stores_to_memory() {
     // Confirms genuine STORE direction -- opcode 0x11, not 0x10.
     assert_eq!(disassemble(a.code()), vec!["movsd [rcx+8],xmm0"]);
 }
+
+#[test]
+fn movapd_reg_reg_uses_the_0x66_prefix() {
+    let mut a = Assembler::new();
+    a.movapd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x28, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["movapd xmm0,xmm1"]);
+}
+
+#[test]
+fn movq_gpr_to_xmm_transfers_into_the_xmm_register() {
+    let mut a = Assembler::new();
+    a.movq_gpr_to_xmm(PhysReg::Xmm9, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x66, 0x4C, 0x0F, 0x6E, 0xC8]);
+    assert_eq!(disassemble(a.code()), vec!["movq xmm9,rax"]);
+}
+
+/// Confirms genuine STORE direction (opcode 0x7E, not 0x6E) -- the
+/// mirror image of movq_gpr_to_xmm, same pairing discipline as
+/// mov_reg_mem/mov_mem_reg's load/store pair from 6a/6b.
+#[test]
+fn movq_xmm_to_gpr_transfers_into_the_gpr() {
+    let mut a = Assembler::new();
+    a.movq_xmm_to_gpr(PhysReg::Rax, PhysReg::Xmm9);
+    assert_eq!(a.code(), &[0x66, 0x4C, 0x0F, 0x7E, 0xC8]);
+    assert_eq!(disassemble(a.code()), vec!["movq rax,xmm9"]);
+}
