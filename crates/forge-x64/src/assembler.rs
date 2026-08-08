@@ -68,9 +68,11 @@ pub struct Label(usize);
 /// no `Rel8` variant here -- per `jmp()`'s policy below, forward jumps
 /// always use rel32 (backward jumps compute their distance immediately
 /// and never need a fixup at all), so a rel8 fixup kind would be
-/// unconstructed dead code today. Add one back if a future instruction
-/// (e.g. a conditional jump) genuinely needs optimistic-rel8 forward-fixup
-/// behavior.
+/// unconstructed dead code today. `jcc()` (Phase 6c) confirmed this holds
+/// for conditional jumps too -- it reuses this same struct unmodified,
+/// with the identical rel32-only forward policy. Add a `Rel8` variant
+/// back only if some future instruction genuinely needs optimistic-rel8
+/// forward-fixup behavior.
 struct Fixup {
     at: usize,
     target: Label,
