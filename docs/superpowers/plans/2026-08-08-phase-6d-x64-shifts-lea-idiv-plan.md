@@ -246,7 +246,7 @@ pub use reg::PhysReg;
 - [ ] **Step 5: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -40`
-Expected: all pass (14 lib + 57 existing integration + 4 new = 61 integration).
+Expected: all pass (14 lib + 58 existing integration + 4 new = 62 integration). Note: Task 1's own review added 1 extra test beyond its original plan estimate, so the real baseline here is 58, not 57 -- trust the actual running count from `cargo test`, not this plan's per-task arithmetic.
 
 - [ ] **Step 6: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -316,7 +316,7 @@ impl Assembler {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -40`
-Expected: all pass (14 lib + 61 existing integration + 1 new = 62 integration).
+Expected: all pass (14 lib + 62 existing integration + 1 new = 63 integration).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -453,7 +453,7 @@ impl Assembler {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -40`
-Expected: all pass (14 lib + 62 existing integration + 3 new = 65 integration).
+Expected: all pass (14 lib + 63 existing integration + 3 new = 66 integration).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -555,7 +555,7 @@ impl Assembler {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 2>&1 | tail -40`
-Expected: all pass (14 lib + 65 existing integration + 3 new = 68 integration).
+Expected: all pass (14 lib + 66 existing integration + 3 new = 69 integration).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
