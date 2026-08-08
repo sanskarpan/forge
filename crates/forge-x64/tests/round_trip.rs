@@ -979,3 +979,28 @@ fn xorpd_reg_reg_encodes_correctly() {
     assert_eq!(a.code(), &[0x66, 0x0F, 0x57, 0xC1]);
     assert_eq!(disassemble(a.code()), vec!["xorpd xmm0,xmm1"]);
 }
+
+#[test]
+fn ucomisd_reg_reg_encodes_correctly() {
+    let mut a = Assembler::new();
+    a.ucomisd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x2E, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["ucomisd xmm0,xmm1"]);
+}
+
+/// Demonstrates the unsigned-condition-code usage the doc comment
+/// requires: ucomisd sets flags the same way an UNSIGNED integer cmp
+/// does, so `setcc` after it must use an unsigned ConditionCode
+/// (Below/BelowOrEqual/Above/AboveOrEqual/Equal/NotEqual), never a
+/// signed one (Less/Greater/etc). This is as close as a disassembly-only
+/// test suite can get to proving the semantic claim -- it can't verify
+/// the actual runtime flag behavior, only that the combination encodes
+/// as intended.
+#[test]
+fn ucomisd_followed_by_setcc_below_encodes_the_less_than_comparison() {
+    let mut a = Assembler::new();
+    a.ucomisd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
+    a.setcc(ConditionCode::Below, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x2E, 0xC1, 0x0F, 0x92, 0xC0]);
+    assert_eq!(disassemble(a.code()), vec!["ucomisd xmm0,xmm1", "setb al"]);
+}

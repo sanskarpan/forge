@@ -670,6 +670,24 @@ impl Assembler {
         self.code.push(0x57);
         self.modrm_reg(dst.encoding(), src.encoding());
     }
+
+    /// `ucomisd a, b` -- 66 0F 2E /r. Compares `a` and `b`, sets EFLAGS.
+    ///
+    /// IMPORTANT: ucomisd sets ZF/PF/CF the same way an UNSIGNED integer
+    /// `cmp` does, not the SF/OF-based signed comparison flags. Use the
+    /// unsigned ConditionCode variants with setcc/jcc/cmovcc after this
+    /// (Below/BelowOrEqual/Above/AboveOrEqual/Equal/NotEqual), NOT the
+    /// signed ones (Less/LessOrEqual/Greater/GreaterOrEqual) -- using the
+    /// signed codes after a float comparison produces a plausible-looking
+    /// but wrong result. No changes are needed in setcc/jcc/cmovcc
+    /// themselves; this is purely a caller-facing usage note.
+    pub fn ucomisd_reg_reg(&mut self, a: PhysReg, b: PhysReg) {
+        self.code.push(0x66);
+        self.rex(false, a.encoding(), 0, b.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x2E);
+        self.modrm_reg(a.encoding(), b.encoding());
+    }
 }
 
 /// A group-2 shift operation: `shl`/`shr`/`sar` share the same opcode
