@@ -1,12 +1,12 @@
 use crate::PhysReg;
 
-/// A group-1 arithmetic/logic operation: `add`/`or`/`and`/`sub`/`xor` share
-/// real x86-64 encoding structure (the same "ModRM.reg as opcode
-/// extension" trick for immediate forms, r/r opcodes offset by a fixed
-/// stride) -- this enum carries each operation's two opcode facts instead
-/// of duplicating the encoding logic five times. `adc`(/2) and `sbb`(/3)
-/// exist in the same family but aren't part of this crate's instruction
-/// set yet.
+/// A group-1 arithmetic/logic/compare operation: `add`/`or`/`and`/`sub`/
+/// `xor`/`cmp` share real x86-64 encoding structure (the same "ModRM.reg
+/// as opcode extension" trick for immediate forms, r/r opcodes offset by
+/// a fixed stride) -- this enum carries each operation's two opcode facts
+/// instead of duplicating the encoding logic once per operation. `adc`(/2)
+/// and `sbb`(/3) exist in the same family but aren't part of this crate's
+/// instruction set yet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AluOp {
     Add,
