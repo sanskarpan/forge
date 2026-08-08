@@ -495,6 +495,8 @@ pub enum ShiftOp {
 }
 
 impl ShiftOp {
+    /// The ModRM.reg opcode-extension digit (group 2). /6 is an unused
+    /// alias slot, not implemented here.
     fn extension(self) -> u8 {
         match self {
             ShiftOp::Shl => 4,
