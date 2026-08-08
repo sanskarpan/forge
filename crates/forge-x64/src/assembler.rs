@@ -490,6 +490,17 @@ impl Assembler {
         self.code.push(0x90 + cc.nibble());
         self.modrm_reg(0, dst.encoding());
     }
+
+    /// `cmovcc dst, src` -- dst = src if cc holds, else dst unchanged.
+    /// REX.W + 0F 40+cc /r. Load-direction (reg=dst, rm=src), same
+    /// convention as imul_reg_reg. No byte-register concern -- x86 has
+    /// no 8-bit CMOVcc.
+    pub fn cmovcc(&mut self, cc: ConditionCode, dst: PhysReg, src: PhysReg) {
+        self.rex(true, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x40 + cc.nibble());
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
 }
 
 #[cfg(test)]

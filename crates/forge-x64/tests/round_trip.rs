@@ -559,3 +559,26 @@ fn setcc_extended_register_already_forces_rex() {
     // NOTE: verify this string empirically.
     assert_eq!(disassemble(a.code()), vec!["setl r9b"]);
 }
+
+/// Direction check, part 1: dst=R9 (needs REX.R), src=Rax.
+#[test]
+fn cmovcc_direction_dst_r9_src_rax() {
+    let mut a = Assembler::new();
+    a.cmovcc(ConditionCode::Greater, PhysReg::R9, PhysReg::Rax);
+    assert_eq!(a.code(), &[0x4C, 0x0F, 0x4F, 0xC8]);
+    // NOTE: verify this string empirically -- iced-x86's mnemonic naming
+    // for Greater (e.g. "cmovg" vs "cmovnle") was not checked against a
+    // live compile when this plan was written.
+    assert_eq!(disassemble(a.code()), vec!["cmovg r9,rax"]);
+}
+
+/// Direction check, part 2: the operands from part 1 swapped -- together
+/// these two tests prove cmovcc's reg/rm assignment isn't accidentally
+/// swapped, mirroring imul_reg_reg's direction-check pair from 6b.
+#[test]
+fn cmovcc_direction_dst_rax_src_r9() {
+    let mut a = Assembler::new();
+    a.cmovcc(ConditionCode::Greater, PhysReg::Rax, PhysReg::R9);
+    assert_eq!(a.code(), &[0x49, 0x0F, 0x4F, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["cmovg rax,r9"]);
+}
