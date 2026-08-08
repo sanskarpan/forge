@@ -841,3 +841,36 @@ fn cqo_sign_extends_rax_into_rdx_rax() {
     assert_eq!(a.code(), &[0x48, 0x99]);
     assert_eq!(disassemble(a.code()), vec!["cqo"]);
 }
+
+#[test]
+fn movsd_reg_reg_needs_no_rex_for_low_registers() {
+    let mut a = Assembler::new();
+    a.movsd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x10, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["movsd xmm0,xmm1"]);
+}
+
+#[test]
+fn movsd_reg_reg_extended_register_sets_rex_r() {
+    let mut a = Assembler::new();
+    a.movsd_reg_reg(PhysReg::Xmm9, PhysReg::Xmm0);
+    assert_eq!(a.code(), &[0xF2, 0x44, 0x0F, 0x10, 0xC8]);
+    assert_eq!(disassemble(a.code()), vec!["movsd xmm9,xmm0"]);
+}
+
+#[test]
+fn movsd_reg_mem_loads_from_memory() {
+    let mut a = Assembler::new();
+    a.movsd_reg_mem(PhysReg::Xmm0, PhysReg::Rcx, 8);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x10, 0x41, 0x08]);
+    assert_eq!(disassemble(a.code()), vec!["movsd xmm0,[rcx+8]"]);
+}
+
+#[test]
+fn movsd_mem_reg_stores_to_memory() {
+    let mut a = Assembler::new();
+    a.movsd_mem_reg(PhysReg::Rcx, 8, PhysReg::Xmm0);
+    assert_eq!(a.code(), &[0xF2, 0x0F, 0x11, 0x41, 0x08]);
+    // Confirms genuine STORE direction -- opcode 0x11, not 0x10.
+    assert_eq!(disassemble(a.code()), vec!["movsd [rcx+8],xmm0"]);
+}

@@ -576,6 +576,42 @@ impl Assembler {
     }
 }
 
+impl Assembler {
+    /// `movsd dst, src` -- F2 0F 10 /r, load direction (reg=dst, rm=src).
+    /// REX.W is always false -- unused/undefined for this opcode. The
+    /// mandatory `0xF2` legacy prefix is emitted BEFORE the REX prefix --
+    /// this ordering (prefix, then REX, then escape byte `0x0F`, then
+    /// opcode, then ModRM/SIB/disp) applies to every SSE2 instruction in
+    /// this crate, not just this one.
+    pub fn movsd_reg_reg(&mut self, dst: PhysReg, src: PhysReg) {
+        self.code.push(0xF2);
+        self.rex(false, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x10);
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
+
+    /// `movsd dst, [base + disp]` -- F2 0F 10 /r, load direction, reuses
+    /// modrm_mem exactly like mov_reg_mem/lea_reg_mem do.
+    pub fn movsd_reg_mem(&mut self, dst: PhysReg, base: PhysReg, disp: i32) {
+        self.code.push(0xF2);
+        self.rex(false, dst.encoding(), 0, base.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x10);
+        self.modrm_mem(dst.encoding(), base.encoding(), disp);
+    }
+
+    /// `movsd [base + disp], src` -- F2 0F 11 /r, store direction, the
+    /// mirror image of movsd_reg_mem (0x11 not 0x10).
+    pub fn movsd_mem_reg(&mut self, base: PhysReg, disp: i32, src: PhysReg) {
+        self.code.push(0xF2);
+        self.rex(false, src.encoding(), 0, base.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x11);
+        self.modrm_mem(src.encoding(), base.encoding(), disp);
+    }
+}
+
 /// A group-2 shift operation: `shl`/`shr`/`sar` share the same opcode
 /// pair (C1 /n for the immediate-shift-amount form, D3 /n for the
 /// CL-count form), differing only by the ModRM.reg extension digit --
