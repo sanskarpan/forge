@@ -205,9 +205,9 @@
 - [ ] 🔴 `neg` `not` `inc` `dec`
 - [ ] 🔴 `shl` `shr` `sar` — imm8 and CL forms
 - [ ] 🔴 `lea` — including the 3-operand `lea r, [a + b*k]` used by strength reduction
-- [ ] 🔴 `cmp` `test`; `setcc`; `cmovcc`
+- [ ] 🔴 `cmp` `test`; `setcc`; `cmovcc` — **note (Phase 6c):** all four built (`cmp` as a new `AluOp` variant, `test` via its own `test_reg_reg`/`test_reg_imm`), plus a shared `ConditionCode` enum covering all 16 x86-64 condition codes (not just the 6 forge's current i64 comparisons need) reused by `setcc`/`cmovcc` and by `jcc` below. `jcc` itself shipped in this same slice, not bundled with `push`/`pop`/`call`/`ret` per this bullet's original wording — see the next bullet's correction. Details: `docs/superpowers/specs/2026-08-08-phase-6c-x64-comparisons-design.md`
 - [ ] 🔴 `imul` 128-bit form for magic division; `idiv`
-- [ ] 🔴 `push` `pop` `call` `ret` `jmp` `jcc`
+- [ ] 🔴 `push` `pop` `call` `ret` `jmp` `jcc` — **correction (Phase 6c):** `jmp` (Phase 6a) and `jcc` (Phase 6c) are both implemented; `push`/`pop`/`call`/`ret` are not. This bullet's original grouping doesn't reflect how the work was actually split: `jcc` was deliberately pulled out and built alongside `cmp`/`test`/`setcc`/`cmovcc` instead, since a conditional branch plus a comparison is the coherent unit forge's `if`/`else` needs to compile at all, whereas `push`/`pop`/`call`/`ret` are real calling-convention work closer in spirit to Phase 7 ("Instruction Selection & Prologue"). See `docs/superpowers/specs/2026-08-08-phase-6c-x64-comparisons-design.md`'s scope note.
 
 **SSE2 scalar float**
 - [ ] 🔴 `movsd` `movapd` `movq` (xmm↔gpr)
