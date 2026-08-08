@@ -713,6 +713,22 @@ impl Assembler {
         self.code.push(0x2C);
         self.modrm_reg(dst.encoding(), src.encoding());
     }
+
+    /// `roundsd dst, src, mode` -- 66 0F 3A 0B /r ib. SSE4.1, not pure
+    /// SSE2 (CHECKLIST's own bullet notes this) -- a 3-byte opcode
+    /// (0F 3A escape + 0B) plus an immediate control byte, the most
+    /// novel encoding shape in this slice. Runtime CPUID feature
+    /// detection for SSE4.1 availability is a separate, later concern
+    /// (this task only builds the encoder).
+    pub fn roundsd(&mut self, mode: RoundMode, dst: PhysReg, src: PhysReg) {
+        self.code.push(0x66);
+        self.rex(false, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x3A);
+        self.code.push(0x0B);
+        self.modrm_reg(dst.encoding(), src.encoding());
+        self.code.push(mode.control_byte());
+    }
 }
 
 /// A group-2 shift operation: `shl`/`shr`/`sar` share the same opcode
@@ -920,24 +936,6 @@ impl RoundMode {
             RoundMode::Truncate => 0x03,
         };
         mode | 0x08
-    }
-}
-
-impl Assembler {
-    /// `roundsd dst, src, mode` -- 66 0F 3A 0B /r ib. SSE4.1, not pure
-    /// SSE2 (CHECKLIST's own bullet notes this) -- a 3-byte opcode
-    /// (0F 3A escape + 0B) plus an immediate control byte, the most
-    /// novel encoding shape in this slice. Runtime CPUID feature
-    /// detection for SSE4.1 availability is a separate, later concern
-    /// (this task only builds the encoder).
-    pub fn roundsd(&mut self, mode: RoundMode, dst: PhysReg, src: PhysReg) {
-        self.code.push(0x66);
-        self.rex(false, dst.encoding(), 0, src.encoding());
-        self.code.push(0x0F);
-        self.code.push(0x3A);
-        self.code.push(0x0B);
-        self.modrm_reg(dst.encoding(), src.encoding());
-        self.code.push(mode.control_byte());
     }
 }
 
