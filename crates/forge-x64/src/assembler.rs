@@ -433,6 +433,62 @@ impl Assembler {
         self.modrm_mem(dst.encoding(), base.encoding(), disp);
     }
 
+    /// `lea dst, [base + index*scale + disp]` -- REX.W + 8D /r with a
+    /// real SIB byte (scale/index/base, not the "no index" pattern
+    /// modrm_mem always emits for the rsp/r12 special case). First real
+    /// use of rex()'s `index` parameter -- REX.X has been plumbed
+    /// through since Phase 6a but never actually exercised until now.
+    ///
+    /// Two traps:
+    ///   * `index == RSP` is architecturally unencodable: SIB.index=100
+    ///     always means "no index," so there's no way to name RSP as a
+    ///     scaled-index register. Asserted against.
+    ///   * `base` in the rbp/r13 family (encoding low bits == 101) with
+    ///     disp==0 still means RIP-relative unless forced to disp8, the
+    ///     exact same trap modrm_mem handles for the base+disp-only
+    ///     case -- it reapplies here identically, now combined with a
+    ///     real index/scale in the SIB byte.
+    pub fn lea_reg_scaled(
+        &mut self,
+        dst: PhysReg,
+        base: PhysReg,
+        index: PhysReg,
+        scale: u8,
+        disp: i32,
+    ) {
+        assert_ne!(
+            index,
+            PhysReg::Rsp,
+            "RSP cannot be used as a scaled-index register -- x86 reserves \
+             SIB.index=100 to mean \"no index\", so this combination is \
+             architecturally unencodable"
+        );
+        let scale_bits = match scale {
+            1 => 0b00,
+            2 => 0b01,
+            4 => 0b10,
+            8 => 0b11,
+            _ => panic!("scale must be 1, 2, 4, or 8, got {scale}"),
+        };
+        self.rex(true, dst.encoding(), index.encoding(), base.encoding());
+        self.code.push(0x8D);
+        let base_low = base.encoding() & 7;
+        if base_low == 5 && disp == 0 {
+            self.code
+                .push(0b01 << 6 | ((dst.encoding() & 7) << 3) | 0b100);
+            self.code
+                .push(scale_bits << 6 | ((index.encoding() & 7) << 3) | base_low);
+            self.code.push(0);
+        } else {
+            let mode = disp_mode(disp);
+            self.code
+                .push(mode.bits() << 6 | ((dst.encoding() & 7) << 3) | 0b100);
+            self.code
+                .push(scale_bits << 6 | ((index.encoding() & 7) << 3) | base_low);
+            self.emit_disp(mode, disp);
+        }
+    }
+
     /// `test a, b` -- computes `a & b`, discards the result, sets flags
     /// only. REX.W + 85 /r. Symmetric: unlike mov/alu's store-direction
     /// convention, there's no meaningful "which operand is destination"

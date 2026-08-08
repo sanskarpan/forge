@@ -737,3 +737,37 @@ fn lea_reg_mem_computes_an_address_not_a_dereference() {
     // read "mov rax,[rcx+8]" instead.
     assert_eq!(disassemble(a.code()), vec!["lea rax,[rcx+8]"]);
 }
+
+#[test]
+fn lea_reg_scaled_encodes_a_real_sib_index() {
+    let mut a = Assembler::new();
+    a.lea_reg_scaled(PhysReg::Rax, PhysReg::Rax, PhysReg::Rbx, 4, 0);
+    assert_eq!(a.code(), &[0x48, 0x8D, 0x04, 0x98]);
+    // NOTE: verify this string empirically -- this is the first real
+    // scaled-index disassembly in this crate, not checked against a
+    // live compile when this plan was written.
+    assert_eq!(disassemble(a.code()), vec!["lea rax,[rax+rbx*4]"]);
+}
+
+/// RSP cannot be a scaled-index register -- x86 reserves SIB.index=100
+/// to mean "no index," so this combination is architecturally
+/// unencodable. Must panic loudly, not silently emit a wrong encoding.
+#[test]
+#[should_panic(expected = "RSP cannot be used as a scaled-index register")]
+fn lea_reg_scaled_panics_when_index_is_rsp() {
+    let mut a = Assembler::new();
+    a.lea_reg_scaled(PhysReg::Rax, PhysReg::Rax, PhysReg::Rsp, 1, 0);
+}
+
+/// The rbp/r13-base-disp0-forces-disp8 trap (established in 6a's
+/// modrm_mem) must still apply even when a real SIB index/scale is
+/// also present -- these are two independent rules that both act on
+/// the same instruction.
+#[test]
+fn lea_reg_scaled_rbp_base_with_zero_disp_still_forces_disp8() {
+    let mut a = Assembler::new();
+    a.lea_reg_scaled(PhysReg::Rax, PhysReg::Rbp, PhysReg::Rax, 2, 0);
+    assert_eq!(a.code(), &[0x48, 0x8D, 0x44, 0x45, 0x00]);
+    // NOTE: verify this string empirically.
+    assert_eq!(disassemble(a.code()), vec!["lea rax,[rbp+rax*2]"]);
+}
