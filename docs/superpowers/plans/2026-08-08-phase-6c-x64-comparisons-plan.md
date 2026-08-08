@@ -142,11 +142,9 @@ fn test_reg_imm_checks_a_bit_pattern() {
     let mut a = Assembler::new();
     a.test_reg_imm(PhysReg::Rax, 1000);
     assert_eq!(a.code(), &[0x48, 0xF7, 0xC0, 0xE8, 0x03, 0x00, 0x00]);
-    // NOTE: verify this string empirically -- 6b's plan repeatedly found
-    // iced-x86 renders larger immediates in hex ("3E8h"), not decimal
-    // ("1000"); the same is likely true here but was not checked against
-    // a live compile when this plan was written.
-    assert_eq!(disassemble(a.code()), vec!["test rax,1000"]);
+    // Confirmed empirically: iced-x86 renders it in hex ("3E8h"), not
+    // decimal ("1000"), consistent with 6b's alu_reg_imm/mov_reg_imm findings.
+    assert_eq!(disassemble(a.code()), vec!["test rax,3E8h"]);
 }
 ```
 
