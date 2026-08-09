@@ -197,6 +197,61 @@ impl<'a> LinearScan<'a> {
             .find(|r| self.free_regs.contains(r) && !excluded.contains(r))
             .copied()
     }
+
+    /// Satisfies a `fixed` requirement (`CHECKLIST bullet 10`: "ABI
+    /// argument positions and idiv's implicit rax/rdx force eviction of
+    /// whoever holds them"). `Interval::fixed` is ALWAYS `None` for
+    /// anything `build_intervals` (Phase 8a) currently produces -- this
+    /// is CHECKLIST-required plumbing with no real producer yet, the
+    /// same "parameterized, tested with synthetic values" pattern Phase
+    /// 7d used for emit_prologue/emit_epilogue.
+    ///
+    /// Deliberately narrow: handles ONLY the no-victim case. A genuine
+    /// eviction (some OTHER active interval already holds `phys`) needs
+    /// a real reassignment strategy this slice does not have cheaply --
+    /// choosing the victim's replacement register from the CURRENT
+    /// free_regs snapshot would be unsound (free_regs reflects
+    /// availability at the CURRENT scan position, not across the
+    /// victim's own [start, end]). Since there's no real producer to
+    /// correctness-test a reassignment against, this is deferred with a
+    /// clear panic rather than built unsoundly -- exactly like
+    /// spill_at_interval below.
+    fn evict_and_assign(&mut self, i: usize, phys: PhysReg) {
+        if let Some(&victim) = self
+            .active
+            .iter()
+            .find(|&&j| self.location_of(j) == Some(Location::Reg(phys)))
+        {
+            unimplemented!(
+                "evicting an active interval to satisfy a fixed-register requirement needs a \
+                 real reassignment strategy (not built -- see the Phase 8b design doc's \
+                 'evict_and_assign' section for why this is deliberately deferred rather than \
+                 built unsoundly) -- Interval {:?} at {:?} would need to be evicted from \
+                 {phys:?} to satisfy Interval {i} ({:?})'s fixed requirement, and no real \
+                 Interval::fixed producer exists yet to force this path outside a hand-constructed \
+                 test, so there is no pressure to solve it correctly before Phase 8c exists to \
+                 inform the right approach (likely: treat it as a spill of the victim)",
+                victim,
+                self.intervals[victim].value,
+                self.intervals[i].value
+            );
+        }
+        self.free_regs.remove(&phys);
+        self.assign(i, Location::Reg(phys));
+        self.active.push(i);
+        self.active.sort_by_key(|&j| self.intervals[j].end);
+    }
+
+    /// Explicitly stubbed, not built -- spilling ships in Phase 8c. This
+    /// slice's own test corpus is verified (by construction, via the
+    /// real max-simultaneous-liveness numbers measured during design
+    /// review: 9 for both classes, against pools of 14/16) never to
+    /// reach this path through real `build_intervals` output.
+    fn spill_at_interval(&mut self, _i: usize) {
+        unimplemented!(
+            "spilling ships in Phase 8c -- see docs/superpowers/specs/2026-08-09-phase-8-decomposition-design.md"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -446,5 +501,48 @@ mod tests {
             "only the target leaves active, and active stays sorted by end"
         );
         assert!(!scan.free_regs.contains(&PhysReg::Rcx));
+    }
+
+    #[test]
+    fn evict_and_assign_no_victim_succeeds() {
+        let fixed_iv = {
+            let mut v = iv(0, 0, 5, crate::interval::RegClass::Gpr);
+            v.fixed = Some(PhysReg::Rax);
+            v
+        };
+        let mut scan = LinearScan::new(vec![fixed_iv], &HashMap::new(), ALLOCATABLE_GPR);
+
+        scan.evict_and_assign(0, PhysReg::Rax);
+
+        assert_eq!(
+            scan.assignment.get(&Value(0)),
+            Some(&Location::Reg(PhysReg::Rax))
+        );
+        assert!(!scan.free_regs.contains(&PhysReg::Rax));
+        assert_eq!(scan.active, vec![0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "evicting an active interval")]
+    fn evict_and_assign_with_a_victim_panics() {
+        let occupant = iv(0, 0, 10, crate::interval::RegClass::Gpr);
+        let fixed_iv = {
+            let mut v = iv(1, 3, 5, crate::interval::RegClass::Gpr);
+            v.fixed = Some(PhysReg::Rax);
+            v
+        };
+        let mut scan = LinearScan::new(vec![occupant, fixed_iv], &HashMap::new(), ALLOCATABLE_GPR);
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.active.push(0);
+
+        scan.evict_and_assign(1, PhysReg::Rax); // must panic -- Rax already occupied
+    }
+
+    #[test]
+    #[should_panic(expected = "spilling ships in Phase 8c")]
+    fn spill_at_interval_panics_with_a_clear_deferral_message() {
+        let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
+        let mut scan = LinearScan::new(vec![a], &HashMap::new(), ALLOCATABLE_GPR);
+        scan.spill_at_interval(0);
     }
 }
