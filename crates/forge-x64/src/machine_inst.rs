@@ -405,6 +405,44 @@ mod tests {
         );
     }
 
+    /// Genuinely discriminates real reverse-postorder from naive
+    /// block-creation-order iteration -- the previous test above can't,
+    /// since its blocks happen to be created in the same order the CFG
+    /// visits them. Here `x` is created BEFORE `y`, but the CFG only
+    /// reaches `x` THROUGH `y` (entry -> y -> x), so creation order is
+    /// `[entry, x, y]` while real RPO is `[entry, y, x]`. If `select()`
+    /// ever regressed to iterating `func.blocks` in creation order instead
+    /// of calling `reverse_postorder`, this test would catch it: `x`'s
+    /// body would wrongly appear before `y`'s `Jump` in the output.
+    #[test]
+    fn select_visits_blocks_in_true_rpo_not_creation_order() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        let x = b.create_block(); // created 2nd, but visited LAST
+        let y = b.create_block(); // created 3rd, but visited 2nd
+        b.add_pred(y, entry);
+        b.add_pred(x, y);
+        b.seal_block(entry);
+        b.seal_block(y);
+        b.seal_block(x);
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Jump(y));
+        b.f.blocks[y.0 as usize].term = Some(Terminator::Jump(x));
+        let c = b.emit(x, Inst::ConstI64(9), Ty::I64, dummy_span());
+        b.f.blocks[x.0 as usize].term = Some(Terminator::Return(c));
+
+        let selected = select(&b.f);
+
+        assert_eq!(
+            selected.insts,
+            vec![
+                MachineInst::Jump { target: y },
+                MachineInst::Jump { target: x },
+                MachineInst::LoadImmI64 { dst: c, imm: 9 },
+                MachineInst::Return { value: c },
+            ]
+        );
+    }
+
     #[test]
     fn select_lowers_branch() {
         let mut b = Builder::new();
