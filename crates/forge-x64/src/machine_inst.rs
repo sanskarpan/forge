@@ -334,6 +334,20 @@ impl<'a> Selector<'a> {
             Inst::IToF(a) => self.insts.push(MachineInst::IntToFloat { dst, src: *a }),
             Inst::FToI(a) => self.insts.push(MachineInst::FloatToInt { dst, src: *a }),
 
+            Inst::Abs(a) => {
+                let mask_tmp = self.fresh(Ty::I64);
+                self.insts.push(MachineInst::LoadImmI64 {
+                    dst: mask_tmp,
+                    imm: 0x7FFF_FFFF_FFFF_FFFFi64,
+                });
+                self.insts.push(MachineInst::FloatAbs { dst, src: *a, mask_tmp });
+            }
+            Inst::Fma { a, b, c } => {
+                let mul_tmp = self.fresh(Ty::F64);
+                self.insts.push(MachineInst::FloatMul { dst: mul_tmp, lhs: *a, rhs: *b });
+                self.insts.push(MachineInst::FloatAdd { dst, lhs: mul_tmp, rhs: *c });
+            }
+
             // Remaining variants are filled in by later tasks in this plan.
             _ => todo!("filled in by Tasks 4-6 of the Phase 7a plan"),
         }
@@ -1175,5 +1189,105 @@ mod tests {
             selected.insts[1],
             MachineInst::FloatToInt { dst: r, src: x }
         );
+    }
+
+    #[test]
+    fn select_lowers_abs_via_a_synthetic_mask_temp() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, Inst::Abs(x), Ty::F64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        // insts[0] = Param x, insts[1] = LoadImmI64 for the mask temp,
+        // insts[2] = FloatAbs, insts[3] = Return.
+        let mask_tmp = match &selected.insts[1] {
+            MachineInst::LoadImmI64 { dst, imm } => {
+                assert_eq!(*imm, 0x7FFF_FFFF_FFFF_FFFFi64);
+                *dst
+            }
+            other => panic!("expected LoadImmI64 for the mask temp, got {:?}", other),
+        };
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::FloatAbs {
+                dst: r,
+                src: x,
+                mask_tmp
+            }
+        );
+        assert_eq!(selected.synthetic_types.get(&mask_tmp), Some(&Ty::I64));
+        // The mask temp's Value must not collide with any real IR value --
+        // the highest real Value index is `r` (the Abs instruction itself).
+        assert!(mask_tmp.0 > r.0);
+    }
+
+    #[test]
+    fn select_lowers_fma_as_mul_then_add() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let y = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let z = b.emit(
+            entry,
+            Inst::Param {
+                index: 2,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, Inst::Fma { a: x, b: y, c: z }, Ty::F64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        // insts[0..3] = the three Params, insts[3] = FloatMul into a
+        // synthetic temp, insts[4] = FloatAdd combining that temp with z.
+        let mul_tmp = match &selected.insts[3] {
+            MachineInst::FloatMul { dst, lhs, rhs } => {
+                assert_eq!(*lhs, x);
+                assert_eq!(*rhs, y);
+                *dst
+            }
+            other => panic!("expected FloatMul, got {:?}", other),
+        };
+        assert_eq!(
+            selected.insts[4],
+            MachineInst::FloatAdd {
+                dst: r,
+                lhs: mul_tmp,
+                rhs: z
+            }
+        );
+        assert_eq!(selected.synthetic_types.get(&mul_tmp), Some(&Ty::F64));
     }
 }
