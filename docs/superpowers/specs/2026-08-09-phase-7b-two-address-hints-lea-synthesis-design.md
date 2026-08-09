@@ -153,7 +153,7 @@ fn match_scaled_index(func: &Function, candidate: Value, other: Value) -> Option
                 return None;
             }
             match &func.insts[shift_amount.0 as usize] {
-                Inst::ConstI64(s) if matches!(s, 1 | 2 | 3) => {
+                Inst::ConstI64(s) if matches!(s, 1..=3) => {
                     Some((other, *index, 1u8 << s))
                 }
                 _ => None,

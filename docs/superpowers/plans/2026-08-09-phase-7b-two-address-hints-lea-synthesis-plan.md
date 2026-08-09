@@ -229,8 +229,8 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
         let selected = select(&b.f);
 
         assert_eq!(
-            selected.insts.last(),
-            Some(&MachineInst::Lea { dst: add, base: base_v, index: idx, scale: 4, disp: 0 })
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea { dst: add, base: base_v, index: idx, scale: 4, disp: 0 }
         );
         // No standalone IntMul for `mul` -- it was fully subsumed by fusion.
         assert!(!selected.insts.iter().any(
@@ -253,8 +253,8 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
         let selected = select(&b.f);
 
         assert_eq!(
-            selected.insts.last(),
-            Some(&MachineInst::Lea { dst: add, base: base_v, index: idx, scale: 4, disp: 0 })
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea { dst: add, base: base_v, index: idx, scale: 4, disp: 0 }
         );
         assert!(!selected.insts.iter().any(
             |i| matches!(i, MachineInst::IntMul { dst, .. } if *dst == mul)
@@ -276,8 +276,8 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
         let selected = select(&b.f);
 
         assert_eq!(
-            selected.insts.last(),
-            Some(&MachineInst::Lea { dst: add, base: base_v, index: idx, scale: 4, disp: 0 })
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea { dst: add, base: base_v, index: idx, scale: 4, disp: 0 }
         );
         assert!(!selected.insts.iter().any(
             |i| matches!(i, MachineInst::Shl { dst, .. } if *dst == shl)
@@ -408,8 +408,8 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
         // (the `b` operand) remains an ordinary Value used as `base`, and
         // gets its own independent, non-suppressed computation.
         assert_eq!(
-            selected.insts.last(),
-            Some(&MachineInst::Lea { dst: add, base: shl_y, index: x, scale: 4, disp: 0 })
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea { dst: add, base: shl_y, index: x, scale: 4, disp: 0 }
         );
         assert!(selected.insts.iter().any(
             |i| matches!(i, MachineInst::Shl { dst, .. } if *dst == shl_y)
@@ -433,8 +433,8 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
         let selected = select(&b.f);
 
         assert_eq!(
-            selected.insts.last(),
-            Some(&MachineInst::Lea { dst: add, base: mul, index: idx, scale: 4, disp: 0 })
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea { dst: add, base: mul, index: idx, scale: 4, disp: 0 }
         );
         // mul's own register genuinely still needs to exist (it's the
         // Lea's `base` operand too) -- must NOT be suppressed.
@@ -506,7 +506,7 @@ fn match_scaled_index(func: &Function, candidate: Value, other: Value) -> Option
                 return None;
             }
             match &func.insts[shift_amount.0 as usize] {
-                Inst::ConstI64(s) if matches!(s, 1 | 2 | 3) => Some((other, *index, 1u8 << s)),
+                Inst::ConstI64(s) if matches!(s, 1..=3) => Some((other, *index, 1u8 << s)),
                 _ => None,
             }
         }
@@ -659,7 +659,7 @@ pub fn select(func: &Function) -> SelectedFunction {
             }
 ```
 
-**IMPORTANT**: `find_fully_fusable_scaled_indices` uses `HashMap`, which is already imported at the top of the file (`use std::collections::HashMap;`) — only `HashSet` needs a new `use std::collections::HashSet;` (or keep it fully-qualified as `std::collections::HashSet` matching the design doc's style; either is fine, pick whichever matches how the rest of the file handles similar cases — check the existing imports before deciding).
+`HashMap` is already imported at the top of the file (`use std::collections::HashMap;`) and used unqualified throughout, matching the code above. `HashSet` is used fully-qualified (`std::collections::HashSet`) everywhere it appears (the `Selector` field, `find_fully_fusable_scaled_indices`'s return type) — no new `use` statement is needed; this is a deliberate, self-consistent choice, not an open decision.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
@@ -714,4 +714,4 @@ Confirm all 7 exit criteria from the design doc are met:
 4. Tests cover both operand orderings for both shapes, all negative cases, the shared-consumer case, the escaping-use case, the mixed-shape preference-order case, and the self-referential case.
 5. `cargo test --workspace` green, clippy/fmt clean.
 6. No regressions in any Phase 6 `forge-x64` test, Phase 7a's `machine_inst` tests, or any other crate's tests.
-7. CHECKLIST.md annotated (see Task 4 below — this happens as part of the final holistic review, not this task).
+7. CHECKLIST.md annotated — this happens as part of the separate final holistic review dispatched after this plan's Task 3 completes, not as a task within this plan document.
