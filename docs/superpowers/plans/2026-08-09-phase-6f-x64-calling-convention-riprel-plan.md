@@ -243,7 +243,7 @@ impl Assembler {
     }
 
     /// `ret` -- C3, no operands. The rare imm16 stack-cleanup form
-    /// (cdecl-style callee cleanup) is not used by SysV or Win64 and
+    /// (stdcall-style callee cleanup) is not used by SysV or Win64 and
     /// isn't built.
     pub fn ret(&mut self) {
         self.code.push(0xC3);
