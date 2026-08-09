@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the `MachineInst` enum and a baseline tree-tiling selector (`select(&Function) -> SelectedFunction`) in `forge-x64`, lowering every `forge_ir::Inst` variant except `Call` (explicitly deferred to Phase 7e) into `MachineInst`s over virtual registers (`forge_ir::Value`, reused directly).
+**Goal:** Build the `MachineInst` enum and a baseline tree-tiling selector (`select(&Function) -> SelectedFunction`) in `forge-x64`, lowering every `forge_ir::Inst` variant except `Call` (explicitly deferred to Phase 7e) and `Rem` on `f64` operands (explicitly deferred — no native x86 instruction, no libm route yet) into `MachineInst`s over virtual registers (`forge_ir::Value`, reused directly).
 
 **Architecture:** New file `crates/forge-x64/src/machine_inst.rs`. `MachineInst` is a flat enum, one variant per real operation family, always in 3-address SSA form. Selection walks blocks in reverse postorder (`forge_ir::dominance::reverse_postorder`, already implemented) and lowers each block's instructions in order, minting fresh synthetic `Value`s (via a `next_value` counter seeded from `func.insts.len()`, collision-free since `Value` numbering is append-only across this codebase's whole optimizer pipeline) for the few cases (`Fma`, `Abs`, `Neg` on floats) needing an intermediate result. `Phi` emits nothing (deferred to Phase 8's SSA deconstruction); `Call` panics with a clear "ships in 7e" message via an exhaustive match.
 
@@ -38,7 +38,11 @@ forge-ir = { path = "../forge-ir" }
 
 [dev-dependencies]
 iced-x86.workspace = true
+forge-syntax = { path = "../forge-syntax" }
+smallvec.workspace = true
 ```
+
+`forge-syntax` and `smallvec` are dev-only here (`select()`'s own implementation never constructs a `Span` or uses `smallvec!` directly — only the test module does, via `dummy_span()` and, starting in Task 6, `smallvec::smallvec![...]` for `Inst::Call`/`Inst::Phi` fixtures). `forge-syntax` is needed because Rust's extern prelude only exposes *direct* dependencies by crate name — `forge_syntax::span::Span` is otherwise only reachable transitively through `forge-ir`'s public API, which isn't enough to write `use forge_syntax::span::Span;` in this crate's own test code (confirmed by checking how `forge-opt`'s `Cargo.toml`, which needs the same thing, already lists `forge-syntax` directly).
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -48,7 +52,8 @@ iced-x86.workspace = true
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_ir::{Builder, Inst, Terminator, Ty};
+    use forge_ir::builder::Builder;
+    use forge_ir::{Inst, Terminator, Ty};
     use forge_syntax::span::Span;
 
     fn dummy_span() -> Span {
@@ -240,7 +245,7 @@ pub enum MachineInst {
     FloatSqrt { dst: Value, src: Value },
     FloatMin { dst: Value, lhs: Value, rhs: Value },
     FloatMax { dst: Value, lhs: Value, rhs: Value },
-    FloatRound { dst: Value, src: Value, mode: forge_x64_round_mode::RoundModeShim },
+    FloatRound { dst: Value, src: Value, mode: crate::RoundMode },
 
     // Abs/Neg on floats: mask_tmp is a synthetic I64 Value holding the
     // sign-mask constant, minted by the selector -- see machine_inst.rs's
@@ -357,15 +362,9 @@ pub fn select(func: &Function) -> SelectedFunction {
 }
 ```
 
-**IMPORTANT — placeholder note**: the `FloatRound` variant's `mode` field type above (`forge_x64_round_mode::RoundModeShim`) is a deliberately obviously-wrong placeholder name — replace it with the crate's real `RoundMode` type (`crate::assembler::RoundMode`, re-exported as `crate::RoundMode` per `lib.rs`) before compiling. This was written this way so it's impossible to miss; do not leave it as `RoundModeShim`. The `select_inst` match's `_ => todo!(...)` arm makes this task's implementation intentionally incomplete — Rust will not warn about this since `todo!()` satisfies exhaustiveness, but every test in Step 2 above only exercises the variants already implemented (`ConstF64`/`ConstI64`/`ConstBool`/`Param` plus terminators), so they must all pass without hitting the `todo!()`.
+The `select_inst` match's `_ => todo!(...)` arm makes this task's implementation intentionally incomplete — Rust will not warn about this since `todo!()` satisfies exhaustiveness, but every test in Step 2 above only exercises the variants already implemented (`ConstF64`/`ConstI64`/`ConstBool`/`Param` plus terminators), so they must all pass without hitting the `todo!()`.
 
-- [ ] **Step 5: Fix the `RoundMode` type and wire the module into `lib.rs`**
-
-```rust
-// crates/forge-x64/src/machine_inst.rs — replace the FloatRound variant's mode field type
-
-    FloatRound { dst: Value, src: Value, mode: crate::RoundMode },
-```
+- [ ] **Step 5: Wire the module into `lib.rs`**
 
 ```rust
 // crates/forge-x64/src/lib.rs — full file contents
@@ -402,7 +401,7 @@ git commit -m "feat(forge-x64): MachineInst enum, SelectedFunction, select() ske
 
 This is the foundational task for the whole Phase 7a slice — every later task in this plan extends `select_inst`'s `match` (replacing pieces of the `_ => todo!(...)` catch-all with real arms) rather than restructuring anything here. `Selector::ty_of`/`fresh` are the two mechanisms every later task relies on: `ty_of` for dispatching int-vs-float lowering strategies, `fresh` for minting synthetic temporaries (`Fma`'s `mul_tmp`, `Abs`/`Neg`'s `mask_tmp`).
 
-If the `use forge_ir::{Builder, ...}` import in the test module doesn't compile, check `crates/forge-ir/src/lib.rs`'s actual re-export list — `Builder` lives in `builder.rs`; confirm whether `lib.rs` re-exports it at the crate root or whether it needs `forge_ir::builder::Builder` instead, and use whichever form actually resolves.
+`use forge_ir::builder::Builder;` (rather than `use forge_ir::Builder;`) is required — `Builder` lives in `builder.rs` and is NOT re-exported at `forge-ir`'s crate root (only `ir.rs`'s contents are, via `pub use ir::*;`), confirmed by reading `crates/forge-ir/src/lib.rs` directly before this plan was finalized.
 
 Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
 
@@ -462,6 +461,23 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
     fn select_lowers_int_rem() {
         let (selected, x, y, r) = select_i64_binop(Inst::Rem);
         assert_eq!(selected.insts[2], MachineInst::IntRem { dst: r, lhs: x, rhs: y });
+    }
+
+    /// Float remainder (`x % y` on f64) is a real, exercised language
+    /// feature (see interp.rs's oracle) but has no native x86 instruction
+    /// and no libm route yet (LibFunc has no Fmod variant) -- deferred
+    /// with a clear panic, exactly like Call. This is NOT the same kind
+    /// of "acceptable interim approximation" as Fma's Mul+Add decomposition:
+    /// a naive `x - trunc(x/y)*y` software sequence can diverge
+    /// arbitrarily (catastrophic cancellation) from Rust's `%` for large
+    /// x/y ratios, which would be a real, unbounded correctness bug, not
+    /// a bounded/documented precision difference -- so it's deferred
+    /// entirely rather than approximated.
+    #[test]
+    #[should_panic(expected = "float remainder")]
+    fn select_panics_on_float_rem_with_a_clear_deferral_message() {
+        let (selected, ..) = select_f64_binop(Inst::Rem);
+        let _ = selected; // unreachable if select_f64_binop itself panics, which it must
     }
 
     #[test]
@@ -630,13 +646,13 @@ Expected: FAIL — every new test panics inside the `todo!("filled in by Tasks 2
                 Ty::I64 => self.insts.push(MachineInst::IntDiv { dst, lhs: *a, rhs: *b }),
                 Ty::Bool => unreachable!("Div never applies to Bool"),
             },
-            Inst::Rem(a, b) => {
-                // Rem is I64-only (no FloatRem MachineInst exists -- forge's
-                // language has no f64 remainder operator per the type
-                // checker); asserted here rather than silently mis-lowering.
-                debug_assert_eq!(self.ty_of(*a), Ty::I64, "Rem is I64-only");
-                self.insts.push(MachineInst::IntRem { dst, lhs: *a, rhs: *b });
-            }
+            Inst::Rem(a, b) => match self.ty_of(*a) {
+                Ty::I64 => self.insts.push(MachineInst::IntRem { dst, lhs: *a, rhs: *b }),
+                Ty::F64 => unimplemented!(
+                    "float remainder (fmod) has no native x86 instruction and isn't wired to a libm call yet"
+                ),
+                Ty::Bool => unreachable!("Rem never applies to Bool"),
+            },
             Inst::Neg(a) => match self.ty_of(*a) {
                 Ty::F64 => {
                     let mask_tmp = self.fresh(Ty::I64);
@@ -660,7 +676,7 @@ This task's `Neg` arm already handles BOTH the `i64` and `f64` cases (including 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 --lib 2>&1 | tail -30`
-Expected: all 18 new tests pass (11 i64 binop/unop tests for `Add`/`Sub`/`Mul`/`Div`/`Rem`/`And`/`Or`/`Xor`/`Shl`/`Shr`/`Sar`, 4 float-dispatch tests for `Add`/`Sub`/`Mul`/`Div`, `select_lowers_int_neg` and `select_lowers_float_neg_via_a_synthetic_mask_temp` exercising both branches of the dispatching `Neg` arm, plus `select_lowers_not`), all 6 from Task 1 still pass (24 total in `machine_inst`'s test module).
+Expected: all 19 new tests pass (11 i64 binop/unop tests for `Add`/`Sub`/`Mul`/`Div`/`Rem`/`And`/`Or`/`Xor`/`Shl`/`Shr`/`Sar`, 4 float-dispatch tests for `Add`/`Sub`/`Mul`/`Div`, `select_panics_on_float_rem_with_a_clear_deferral_message`, `select_lowers_int_neg` and `select_lowers_float_neg_via_a_synthetic_mask_temp` exercising both branches of the dispatching `Neg` arm, plus `select_lowers_not`), all 6 from Task 1 still pass (25 total in `machine_inst`'s test module).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -798,7 +814,7 @@ Expected: FAIL — every new test panics inside `todo!(...)`.
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 --lib 2>&1 | tail -30`
-Expected: all 7 new tests pass (`select_lowers_float_min`, `float_max`, `sqrt`, `floor`, `ceil`, `round`, `trunc`), all 24 from Tasks 1-2 still pass (31 total).
+Expected: all 7 new tests pass (`select_lowers_float_min`, `float_max`, `sqrt`, `floor`, `ceil`, `round`, `trunc`), all 25 from Tasks 1-2 still pass (32 total).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -936,7 +952,7 @@ Expected: FAIL — new tests panic inside `todo!(...)`.
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 --lib 2>&1 | tail -30`
-Expected: all 4 new tests pass, all 31 from Tasks 1-3 still pass (35 total).
+Expected: all 4 new tests pass, all 32 from Tasks 1-3 still pass (36 total).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -1056,7 +1072,7 @@ Expected: FAIL — new tests panic inside `todo!(...)`.
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 --lib 2>&1 | tail -30`
-Expected: both new tests pass (`select_lowers_abs_via_a_synthetic_mask_temp`, `select_lowers_fma_as_mul_then_add`), all 35 from Tasks 1-4 still pass (37 total).
+Expected: both new tests pass (`select_lowers_abs_via_a_synthetic_mask_temp`, `select_lowers_fma_as_mul_then_add`), all 36 from Tasks 1-4 still pass (38 total).
 
 - [ ] **Step 5: `cargo fmt` and `cargo clippy --workspace -- -D warnings`, fix anything found**
 
@@ -1158,7 +1174,7 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
     }
 ```
 
-**IMPORTANT**: this test file will need `smallvec` available — check whether `crates/forge-x64/Cargo.toml` needs a `[dev-dependencies]` entry for it (`smallvec.workspace = true`) or whether it's already reachable transitively through `forge-ir`'s public API (`SmallVec` appears in `Inst::Call`'s and `Inst::Phi`'s field types, so the type itself is reachable, but the `smallvec![...]` macro requires the crate to be a direct dependency to use unqualified — add it to `[dev-dependencies]` if `cargo build` complains about an unresolved `smallvec` macro/crate).
+`smallvec` is already a `[dev-dependencies]` entry as of Task 1, so `smallvec::smallvec![...]` resolves here with no further Cargo.toml changes.
 
 - [ ] **Step 2: Run to confirm failure**
 
@@ -1184,7 +1200,7 @@ The `match` is now exhaustive with no wildcard arm — if a future `forge_ir::In
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 --lib 2>&1 | tail -30`
-Expected: both new tests pass, all 37 from Tasks 1-5 still pass (39 total).
+Expected: both new tests pass, all 38 from Tasks 1-5 still pass (40 total).
 
 - [ ] **Step 5: Run the FULL workspace test suite one more time**
 
@@ -1215,7 +1231,7 @@ Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
 - [ ] **Step 1: Full workspace test run**
 
 Run: `cargo test --workspace 2>&1 | tail -60`
-Expected: every test passes. Report the exact final count for `forge-x64` (should be 39 tests in `machine_inst`'s module, per this plan's running arithmetic — trust the actual `cargo test` output over this number if they diverge).
+Expected: every test passes. Report the exact final count for `forge-x64` (should be 40 tests in `machine_inst`'s module, per this plan's running arithmetic — trust the actual `cargo test` output over this number if they diverge).
 
 - [ ] **Step 2: Clippy**
 
@@ -1233,7 +1249,7 @@ Run: `grep -n "_ =>" crates/forge-x64/src/machine_inst.rs` — expect NO matches
 
 Confirm all 6 exit criteria from the design doc are met:
 1. `MachineInst` enum exists in `crates/forge-x64/src/machine_inst.rs`, covering every `forge_ir::Inst` variant.
-2. `select(&Function) -> SelectedFunction` exists, walks blocks in RPO, lowers every `Inst` variant except `Call` (clear panic message).
+2. `select(&Function) -> SelectedFunction` exists, walks blocks in RPO, lowers every `Inst` variant except `Call` and `Rem` on `f64` operands (both a clear panic message; `Rem` on `i64` is fully implemented).
 3. Synthetic `Value`s never collide with real IR `Value`s, recorded in `SelectedFunction::synthetic_types`.
 4. Golden-sequence tests exist for every arithmetic/bitwise/shift/comparison/conversion family, `Abs`/`Neg`, `Fma`, CFG lowering, and `Phi`'s no-op behavior.
 5. `cargo test --workspace` green, clippy/fmt clean.
