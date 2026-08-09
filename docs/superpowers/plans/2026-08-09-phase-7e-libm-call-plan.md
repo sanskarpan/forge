@@ -138,12 +138,20 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to confirm failure**
+- [ ] **Step 2: Wire the module into `lib.rs`**
+
+Read the current `crates/forge-x64/src/lib.rs` first, then add exactly these two lines in the appropriate alphabetically-sorted spots (matching the existing style):
+- `mod libm;` among the other `mod` declarations
+- `pub use libm::libm_address;` among the other `pub use` lines
+
+This must happen NOW, before Step 3's "confirm failure" — until `libm.rs` is referenced by a `mod` declaration, Rust never compiles it at all, so `cargo test` would silently see nothing rather than fail loudly.
+
+- [ ] **Step 3: Run to confirm failure**
 
 Run: `cargo test -p forge-x64 --lib 2>&1 | head -60`
 Expected: FAIL — compile error (`libm_address`/`LibFunc` unresolved).
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 4: Write the implementation**
 
 Prepend this to the TOP of `crates/forge-x64/src/libm.rs`, above the `#[cfg(test)] mod tests` block from Step 1:
 
@@ -190,12 +198,6 @@ pub fn libm_address(func: LibFunc) -> i64 {
 }
 ```
 
-- [ ] **Step 4: Wire the module into `lib.rs`**
-
-Read the current `crates/forge-x64/src/lib.rs` first, then add exactly these two lines in the appropriate alphabetically-sorted spots (matching the existing style):
-- `mod libm;` among the other `mod` declarations
-- `pub use libm::libm_address;` among the other `pub use` lines
-
 - [ ] **Step 5: Run the tests and confirm they pass**
 
 Run: `cargo test -p forge-x64 --lib 2>&1 | tail -40`
@@ -203,7 +205,7 @@ Expected: all 4 new `libm::tests::*` tests pass (`all_six_addresses_are_real_and
 
 - [ ] **Step 6: `cargo fmt` and `cargo clippy -p forge-x64 --all-targets -- -D warnings`, fix anything found**
 
-The `as usize as i64` cast form in Step 3 is already clippy-clean per this plan's design review — if clippy still flags something, re-check the exact cast chain matches Step 3 verbatim before assuming a new issue.
+The `as usize as i64` cast form in Step 4 is already clippy-clean per this plan's design review — if clippy still flags something, re-check the exact cast chain matches Step 4 verbatim before assuming a new issue.
 
 - [ ] **Step 7: Commit**
 
@@ -417,7 +419,9 @@ fn coalescing_hints_no_entry_for_call_libm() {
 
 - [ ] **Step 3: Run to confirm failure**
 
-Run: `cargo test -p forge-x64 --lib select_lowers_a_unary_libm_call select_lowers_a_binary_libm_call coalescing_hints_no_entry_for_call_libm 2>&1 | tail -40`
+Run: `cargo test -p forge-x64 --lib -- select_lowers_a_unary_libm_call select_lowers_a_binary_libm_call coalescing_hints_no_entry_for_call_libm 2>&1 | tail -40`
+
+(The `--` is required: cargo's own CLI accepts only one bare TESTNAME before it; everything after `--` is forwarded to the libtest binary, which does accept multiple filter substrings.)
 Expected: FAIL — compile error (`MachineInst::CallLibm` doesn't exist yet).
 
 - [ ] **Step 4: Add the `CallLibm` variant to `MachineInst`**
@@ -574,7 +578,7 @@ git commit -m "feat(forge-x64): MachineInst::CallLibm, real libm call selection"
 
 ## Context for Task 2
 
-Every golden `Vec<MachineInst>` assertion above follows the exact style already established throughout `machine_inst/tests.rs` (e.g. `select_lowers_a_single_i64_constant_and_return`). The `Cargo.lock` will need updating as a side effect of the `Cargo.toml` change in Step 1 — this happens automatically on the next `cargo build`/`cargo test`, no manual step needed, but include the updated `Cargo.lock` in the Step 11 commit if `git status` shows it as modified.
+Every golden `Vec<MachineInst>` assertion above follows the exact style already established throughout `machine_inst/tests.rs` (e.g. `select_lowers_a_single_i64_constant_and_return`). `Cargo.lock` MAY need updating as a side effect of the `Cargo.toml` change in Step 1 (in practice it doesn't, since `smallvec` is already resolved workspace-wide via `forge-ir`'s existing dependency on it) — this happens automatically on the next `cargo build`/`cargo test` if it's needed at all, no manual step required, but include the updated `Cargo.lock` in the Step 11 commit if `git status` shows it as modified.
 
 Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
 
@@ -598,4 +602,4 @@ Run: `cargo fmt --check`
 
 - [ ] **Step 4: Report exit criteria status**
 
-Confirm all 8 exit criteria from the design doc are met (see `docs/superpowers/specs/2026-08-09-phase-7e-libm-call-design.md`'s "Exit criteria" section) — in particular criterion 8, that CHECKLIST.md's remaining Phase 7 bullets get accurate annotations distinguishing what this slice delivers from what's deferred to the new "final code-emission pipeline" task.
+Confirm exit criteria 1-7 from the design doc are met (see `docs/superpowers/specs/2026-08-09-phase-7e-libm-call-design.md`'s "Exit criteria" section). Criterion 8 (CHECKLIST.md's remaining Phase 7 bullets getting accurate `**note (Phase 7e):**` annotations distinguishing what this slice delivers from what's deferred to the new "final code-emission pipeline" task) is NOT this task's job — per this project's established convention (used identically for 7a-7d), CHECKLIST.md annotations are added by the separate final-holistic-review pass that runs after this plan's tasks complete, left uncommitted for review, not baked into the implementation plan itself.
