@@ -236,8 +236,10 @@ impl<'a> LinearScan<'a> {
 
     /// Explicitly stubbed, not built -- spilling ships in Phase 8c. This
     /// slice's own test corpus is verified (by construction, via the
-    /// real max-simultaneous-liveness numbers measured during design
-    /// review: 9 for both classes, against pools of 14/16) never to
+    /// real max-simultaneous-liveness measured on this exact corpus --
+    /// 4 GPR / 7 XMM, against pools of 14/16; a separate, more
+    /// adversarial stress corpus used during design review measured up
+    /// to 9 for both classes, still well under the pools) never to
     /// reach this path through real `build_intervals` output.
     fn spill_at_interval(&mut self, _i: usize) {
         unimplemented!(
@@ -245,11 +247,23 @@ impl<'a> LinearScan<'a> {
         )
     }
 
+    /// Debug-only check of the invariant `expire_old_intervals`'s early
+    /// `break` depends on: `active` stays ordered by interval `end`.
+    fn debug_assert_active_sorted(&self) {
+        debug_assert!(
+            self.active
+                .windows(2)
+                .all(|w| self.intervals[w[0]].end <= self.intervals[w[1]].end),
+            "active must stay sorted by end"
+        );
+    }
+
     pub fn run(&mut self) {
         self.intervals
             .sort_by_key(|iv| (iv.start, iv.end, iv.value.0));
         for i in 0..self.intervals.len() {
             self.expire_old_intervals(self.intervals[i].start);
+            self.debug_assert_active_sorted();
 
             if let Some(phys) = self.intervals[i].fixed {
                 self.evict_and_assign(i, phys);
@@ -267,6 +281,7 @@ impl<'a> LinearScan<'a> {
                     self.assign(i, Location::Reg(reg));
                     self.active.push(i);
                     self.active.sort_by_key(|&j| self.intervals[j].end);
+                    self.debug_assert_active_sorted();
                 }
                 None => self.spill_at_interval(i),
             }
@@ -789,6 +804,26 @@ mod tests {
                 assert!(
                     matches!(loc, Location::Reg(_)),
                     "{src:?}: unexpected Spill -- corpus should never need one"
+                );
+            }
+            // `allocate`'s whole job is the dual-class partition: an
+            // Xmm-class value must get an XMM register and a Gpr-class
+            // value a GPR, never the other way round. Deleting the
+            // filter-by-class step in `allocate` would otherwise pass
+            // every other test in this file undetected.
+            for iv in &intervals {
+                let Some(Location::Reg(r)) = assignment.get(&iv.value) else {
+                    continue;
+                };
+                let pool: &[PhysReg] = match iv.reg_class {
+                    crate::interval::RegClass::Gpr => ALLOCATABLE_GPR,
+                    crate::interval::RegClass::Xmm => ALLOCATABLE_XMM,
+                };
+                assert!(
+                    pool.contains(r),
+                    "{src:?}: {:?} ({:?}) got {r:?}, which is not in its class's pool",
+                    iv.value,
+                    iv.reg_class
                 );
             }
         }
