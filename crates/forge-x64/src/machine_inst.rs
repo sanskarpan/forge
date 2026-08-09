@@ -1565,4 +1565,50 @@ mod tests {
 
         assert_eq!(selected.coalescing_hints.get(&p), None);
     }
+
+    /// Distinct from the test above: `Param` has a `dst` field that's
+    /// simply not one of the hinted variants. `Jump`/`Return` are a
+    /// structurally different case -- they have no `dst` at all, so
+    /// nothing about compute_coalescing_hints's match should even
+    /// consider a "hint" concept for them. Rust's exhaustive match plus
+    /// the `_ => {}` catch-all makes this safe by construction, but the
+    /// point is worth an explicit test rather than only inferring it.
+    #[test]
+    fn coalescing_hints_no_entry_for_terminators_with_no_dst_at_all() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        let target = b.create_block();
+        b.add_pred(target, entry);
+        b.seal_block(entry);
+        b.seal_block(target);
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Jump(target));
+        let p = b.emit(
+            target,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        b.f.blocks[target.0 as usize].term = Some(Terminator::Return(p));
+
+        let selected = select(&b.f);
+
+        // Jump/Return themselves never produce a Value, so there's
+        // nothing to look up in coalescing_hints for them directly --
+        // this test's real assertion is simply that select() doesn't
+        // panic or misbehave when the sequence contains dst-less
+        // MachineInsts (Jump, Return), and that Param's own absence
+        // still holds alongside them.
+        assert_eq!(selected.coalescing_hints.get(&p), None);
+        assert!(selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::Jump { .. })));
+        assert!(selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::Return { .. })));
+    }
 }
