@@ -1,12 +1,4 @@
-// TEMPORARY (Tasks 2-4 only): until Task 5 adds `pub fn allocate`, which
-// `lib.rs` re-exports, nothing outside this file's own `#[cfg(test)]`
-// module reaches `LinearScan`, so a non-test build correctly reports every
-// item here as dead code and `cargo clippy -D warnings` fails without this.
-// DELETE this attribute in Task 5, Step 3, once `allocate` makes
-// everything genuinely reachable.
-#![allow(dead_code)]
-
-use crate::interval::Interval;
+use crate::interval::{Interval, RegClass};
 use forge_ir::Value;
 use forge_x64::PhysReg;
 use std::collections::{HashMap, HashSet};
@@ -252,6 +244,61 @@ impl<'a> LinearScan<'a> {
             "spilling ships in Phase 8c -- see docs/superpowers/specs/2026-08-09-phase-8-decomposition-design.md"
         )
     }
+
+    pub fn run(&mut self) {
+        self.intervals
+            .sort_by_key(|iv| (iv.start, iv.end, iv.value.0));
+        for i in 0..self.intervals.len() {
+            self.expire_old_intervals(self.intervals[i].start);
+
+            if let Some(phys) = self.intervals[i].fixed {
+                self.evict_and_assign(i, phys);
+                continue;
+            }
+
+            match self.pick_register(i, self.allocatable) {
+                Some(reg) => {
+                    // For a Case 2 (same-instruction-reuse) hint, `reg`
+                    // was never in `free_regs` to begin with -- this
+                    // `remove` is then a documented no-op, not a bug;
+                    // it's still correct and necessary for the ordinary
+                    // free-register case.
+                    self.free_regs.remove(&reg);
+                    self.assign(i, Location::Reg(reg));
+                    self.active.push(i);
+                    self.active.sort_by_key(|&j| self.intervals[j].end);
+                }
+                None => self.spill_at_interval(i),
+            }
+        }
+    }
+}
+
+/// Runs linear scan once per register class (GPR, then XMM), merging
+/// both partitions' assignments into one final map. No hint or φ-group
+/// ever crosses a class boundary (every φ's incoming values, and every
+/// arithmetic MachineInst's operands/result, share one Ty and therefore
+/// one RegClass by construction), so splitting before scanning never
+/// orphans a hint that would have resolved across the split.
+pub fn allocate(
+    intervals: Vec<Interval>,
+    excluded_registers: &HashMap<(usize, Value), Vec<PhysReg>>,
+) -> HashMap<Value, Location> {
+    let mut assignment = HashMap::new();
+    for (class, pool) in [
+        (RegClass::Gpr, ALLOCATABLE_GPR),
+        (RegClass::Xmm, ALLOCATABLE_XMM),
+    ] {
+        let class_intervals: Vec<Interval> = intervals
+            .iter()
+            .filter(|iv| iv.reg_class == class)
+            .cloned()
+            .collect();
+        let mut scan = LinearScan::new(class_intervals, excluded_registers, pool);
+        scan.run();
+        assignment.extend(scan.assignment);
+    }
+    assignment
 }
 
 #[cfg(test)]
@@ -544,5 +591,244 @@ mod tests {
         let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let mut scan = LinearScan::new(vec![a], &HashMap::new(), ALLOCATABLE_GPR);
         scan.spill_at_interval(0);
+    }
+
+    #[test]
+    fn run_allocates_a_straight_line_chain_via_transfers() {
+        // a = x + 1; b = a + 1; c = b + 1 -- three successive two-address
+        // handoffs, all through the same register.
+        let mut b = forge_ir::builder::Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            forge_ir::Inst::Param {
+                index: 0,
+                ty: forge_ir::Ty::I64,
+            },
+            forge_ir::Ty::I64,
+            forge_syntax::span::Span::new(0, 0),
+        );
+        let one = b.emit(
+            entry,
+            forge_ir::Inst::ConstI64(1),
+            forge_ir::Ty::I64,
+            forge_syntax::span::Span::new(0, 0),
+        );
+        let a = b.emit(
+            entry,
+            forge_ir::Inst::Add(x, one),
+            forge_ir::Ty::I64,
+            forge_syntax::span::Span::new(0, 0),
+        );
+        let c = b.emit(
+            entry,
+            forge_ir::Inst::Add(a, one),
+            forge_ir::Ty::I64,
+            forge_syntax::span::Span::new(0, 0),
+        );
+        b.f.blocks[entry.0 as usize].term = Some(forge_ir::Terminator::Return(c));
+
+        let selected = forge_x64::select(&b.f);
+        let intervals = crate::intervals::build_intervals(&b.f, &selected);
+        let excluded = crate::intervals::excluded_registers(&b.f, &selected);
+
+        let assignment = allocate(intervals, &excluded);
+
+        // a and c share x's register via Case 2 handoffs (x -> a -> c).
+        let x_loc = assignment[&x];
+        let a_loc = assignment[&a];
+        let c_loc = assignment[&c];
+        assert_eq!(x_loc, a_loc);
+        assert_eq!(a_loc, c_loc);
+        assert!(matches!(x_loc, Location::Reg(_)));
+    }
+
+    #[test]
+    fn run_never_shares_a_register_between_genuinely_conflicting_values() {
+        for src in test_corpus() {
+            let func = front_end(src);
+            let selected = forge_x64::select(&func);
+            let intervals = crate::intervals::build_intervals(&func, &selected);
+            let excluded = crate::intervals::excluded_registers(&func, &selected);
+
+            let assignment = allocate(intervals.clone(), &excluded);
+
+            for i in 0..intervals.len() {
+                for j in (i + 1)..intervals.len() {
+                    let (a, bb) = (&intervals[i], &intervals[j]);
+                    let (Some(Location::Reg(ra)), Some(Location::Reg(rb))) =
+                        (assignment.get(&a.value), assignment.get(&bb.value))
+                    else {
+                        continue;
+                    };
+                    if ra != rb {
+                        continue;
+                    }
+                    let disjoint = a.end < bb.start || bb.end < a.start;
+                    let legit_handoff = (a.end == bb.start && bb.hint == Some(a.value))
+                        || (bb.end == a.start && a.hint == Some(bb.value));
+                    assert!(
+                        disjoint || legit_handoff,
+                        "{src:?}: {:?} and {:?} share {ra:?} but are neither disjoint nor a \
+                         legitimate handoff -- ranges ({},{}) and ({},{})",
+                        a.value,
+                        bb.value,
+                        a.start,
+                        a.end,
+                        bb.start,
+                        bb.end
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_stays_sorted_by_end_throughout_every_corpus_run() {
+        // Design-doc Testing bullet 2: a DIRECT invariant check, not just an
+        // outcome check. `expire_old_intervals` relies on `active` being
+        // sorted by `end` for its `break` to be sound, and `pick_register`'s
+        // Case 2 mutates `active` OUTSIDE `run()`'s own push-then-sort, so
+        // the invariant needs its own dedicated assertion, not just trust
+        // that the outcome (a correct assignment) implies it held throughout.
+        for src in test_corpus() {
+            let func = front_end(src);
+            let selected = forge_x64::select(&func);
+            let intervals = crate::intervals::build_intervals(&func, &selected);
+            let excluded = crate::intervals::excluded_registers(&func, &selected);
+
+            for (class, pool) in [
+                (crate::interval::RegClass::Gpr, ALLOCATABLE_GPR),
+                (crate::interval::RegClass::Xmm, ALLOCATABLE_XMM),
+            ] {
+                let class_intervals: Vec<crate::interval::Interval> = intervals
+                    .iter()
+                    .filter(|iv| iv.reg_class == class)
+                    .cloned()
+                    .collect();
+                let mut scan = LinearScan::new(class_intervals, &excluded, pool);
+                scan.intervals
+                    .sort_by_key(|iv| (iv.start, iv.end, iv.value.0));
+                let sorted = |scan: &LinearScan| {
+                    scan.active
+                        .windows(2)
+                        .all(|w| scan.intervals[w[0]].end <= scan.intervals[w[1]].end)
+                };
+                for i in 0..scan.intervals.len() {
+                    scan.expire_old_intervals(scan.intervals[i].start);
+                    assert!(
+                        sorted(&scan),
+                        "{src:?}: active unsorted after expire_old_intervals"
+                    );
+                    let reg = scan.pick_register(i, pool).expect("no register available");
+                    assert!(
+                        sorted(&scan),
+                        "{src:?}: active unsorted after pick_register's Case 2 transfer"
+                    );
+                    scan.free_regs.remove(&reg);
+                    scan.assign(i, Location::Reg(reg));
+                    scan.active.push(i);
+                    scan.active.sort_by_key(|&j| scan.intervals[j].end);
+                    assert!(sorted(&scan), "{src:?}: active unsorted after assign");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn run_honors_a_non_trivial_fraction_of_hints() {
+        let (mut total_hints, mut honored) = (0usize, 0usize);
+        for src in test_corpus() {
+            let func = front_end(src);
+            let selected = forge_x64::select(&func);
+            let intervals = crate::intervals::build_intervals(&func, &selected);
+            let excluded = crate::intervals::excluded_registers(&func, &selected);
+            let assignment = allocate(intervals.clone(), &excluded);
+
+            for iv in &intervals {
+                let Some(hinted) = iv.hint else { continue };
+                total_hints += 1;
+                if let (Some(Location::Reg(a)), Some(Location::Reg(b))) =
+                    (assignment.get(&iv.value), assignment.get(&hinted))
+                {
+                    if a == b {
+                        honored += 1;
+                    }
+                }
+            }
+        }
+        assert!(total_hints > 0, "corpus must produce at least one hint");
+        // Calibration target per the design doc: 40-70% of total hints, NOT
+        // near zero. Execution-based plan review measured 28/52 = 53.8% on
+        // this exact corpus with this exact code, comfortably inside that
+        // band -- 40% is a real, non-arbitrary floor, not a guess. Treat a
+        // result dropping toward 0 as a real regression, not a threshold to
+        // lower quietly.
+        assert!(
+            honored * 100 >= total_hints * 40,
+            "only {honored}/{total_hints} hints honored -- expected at least ~40%"
+        );
+    }
+
+    #[test]
+    fn run_produces_only_reg_locations_never_spill_for_the_corpus() {
+        for src in test_corpus() {
+            let func = front_end(src);
+            let selected = forge_x64::select(&func);
+            let intervals = crate::intervals::build_intervals(&func, &selected);
+            let excluded = crate::intervals::excluded_registers(&func, &selected);
+            let assignment = allocate(intervals.clone(), &excluded);
+
+            assert_eq!(
+                assignment.len(),
+                intervals.len(),
+                "{src:?}: every interval must get a Location"
+            );
+            for loc in assignment.values() {
+                assert!(
+                    matches!(loc, Location::Reg(_)),
+                    "{src:?}: unexpected Spill -- corpus should never need one"
+                );
+            }
+        }
+    }
+
+    /// Shared corpus, copied VERBATIM from `crates/forge-regalloc/src/intervals.rs`'s
+    /// `every_hint_points_backward_in_8bs_scan_order` list (the superset of that file's
+    /// two corpus lists), so 8a's and 8b's test corpora stay in sync.
+    fn test_corpus() -> Vec<&'static str> {
+        vec![
+            "3.14159 * r * r",
+            "sin(x) + cos(y)",
+            "(n * 2654435761) >> 16",
+            "x / y",
+            "x + 1",
+            "fma(a, b, c)",
+            "base + i * 8",
+            "let t = a - b in if t > 0.0 then t else -t",
+            "if a > b then (if a > c then a else c) else b",
+            "(if a > b then a else b) + a",
+            "sqrt(x * x + y * y)",
+            "abs(x) + floor(y) + ceil(z)",
+            "(n >> 1) % 7 + (n >> 1) / 7",
+            "if a > b then (a * c) + (b * c) else a - b",
+            "if a > b then (a - b) - (a + b) else c - a",
+            "if a > b then fma(a, b, c) else a * c",
+            "if x > y then (x * y) + (x - y) else x / y",
+            "if x > y then fma(x, y, z) * x else fma(y, x, z) - y",
+        ]
+    }
+
+    /// Same front_end helper shape as crates/forge-regalloc/src/intervals.rs's
+    /// own test module (lex -> parse -> resolve -> typecheck -> lower).
+    fn front_end(src: &str) -> forge_ir::Function {
+        let (tokens, diags) = forge_syntax::lexer::lex(src);
+        assert!(diags.is_empty(), "lex errors for {src:?}: {diags:?}");
+        let (ast, diags) = forge_syntax::parser::parse(&tokens);
+        assert!(diags.is_empty(), "parse errors for {src:?}: {diags:?}");
+        let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
+            .unwrap_or_else(|e| panic!("type errors for {src:?}: {e:?}"));
+        forge_ir::lower::lower(&typed)
     }
 }
