@@ -286,6 +286,30 @@ impl<'a> Selector<'a> {
             Inst::Shr(a, b) => self.insts.push(MachineInst::Shr { dst, lhs: *a, rhs: *b }),
             Inst::Sar(a, b) => self.insts.push(MachineInst::Sar { dst, lhs: *a, rhs: *b }),
 
+            Inst::Min(a, b) => self.insts.push(MachineInst::FloatMin { dst, lhs: *a, rhs: *b }),
+            Inst::Max(a, b) => self.insts.push(MachineInst::FloatMax { dst, lhs: *a, rhs: *b }),
+            Inst::Sqrt(a) => self.insts.push(MachineInst::FloatSqrt { dst, src: *a }),
+            Inst::Floor(a) => self.insts.push(MachineInst::FloatRound {
+                dst,
+                src: *a,
+                mode: crate::RoundMode::Floor,
+            }),
+            Inst::Ceil(a) => self.insts.push(MachineInst::FloatRound {
+                dst,
+                src: *a,
+                mode: crate::RoundMode::Ceil,
+            }),
+            Inst::Round(a) => self.insts.push(MachineInst::FloatRound {
+                dst,
+                src: *a,
+                mode: crate::RoundMode::Nearest,
+            }),
+            Inst::Trunc(a) => self.insts.push(MachineInst::FloatRound {
+                dst,
+                src: *a,
+                mode: crate::RoundMode::Truncate,
+            }),
+
             // Remaining variants are filled in by later tasks in this plan.
             _ => todo!("filled in by Tasks 2-6 of the Phase 7a plan"),
         }
@@ -875,5 +899,108 @@ mod tests {
         let selected = select(&b.f);
 
         assert_eq!(selected.insts[1], MachineInst::Not { dst: r, src: x });
+    }
+
+    fn select_f64_unop(inst_ctor: impl FnOnce(Value) -> Inst) -> (SelectedFunction, Value, Value) {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, inst_ctor(x), Ty::F64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+        let selected = select(&b.f);
+        (selected, x, r)
+    }
+
+    #[test]
+    fn select_lowers_float_min() {
+        let (selected, x, y, r) = select_f64_binop(Inst::Min);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::FloatMin {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_float_max() {
+        let (selected, x, y, r) = select_f64_binop(Inst::Max);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::FloatMax {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_sqrt() {
+        let (selected, x, r) = select_f64_unop(Inst::Sqrt);
+        assert_eq!(selected.insts[1], MachineInst::FloatSqrt { dst: r, src: x });
+    }
+
+    #[test]
+    fn select_lowers_floor() {
+        let (selected, x, r) = select_f64_unop(Inst::Floor);
+        assert_eq!(
+            selected.insts[1],
+            MachineInst::FloatRound {
+                dst: r,
+                src: x,
+                mode: crate::RoundMode::Floor
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_ceil() {
+        let (selected, x, r) = select_f64_unop(Inst::Ceil);
+        assert_eq!(
+            selected.insts[1],
+            MachineInst::FloatRound {
+                dst: r,
+                src: x,
+                mode: crate::RoundMode::Ceil
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_round() {
+        let (selected, x, r) = select_f64_unop(Inst::Round);
+        assert_eq!(
+            selected.insts[1],
+            MachineInst::FloatRound {
+                dst: r,
+                src: x,
+                mode: crate::RoundMode::Nearest
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_trunc() {
+        let (selected, x, r) = select_f64_unop(Inst::Trunc);
+        assert_eq!(
+            selected.insts[1],
+            MachineInst::FloatRound {
+                dst: r,
+                src: x,
+                mode: crate::RoundMode::Truncate
+            }
+        );
     }
 }
