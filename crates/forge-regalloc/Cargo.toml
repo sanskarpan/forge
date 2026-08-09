@@ -4,3 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+forge-ir = { path = "../forge-ir" }
+forge-x64 = { path = "../forge-x64" }
+
+[dev-dependencies]
+forge-syntax = { path = "../forge-syntax" }
+smallvec.workspace = true

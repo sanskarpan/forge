@@ -1,1 +1,3 @@
-//! Stub crate — not yet implemented. See CHECKLIST.md for this crate's phase.
+mod interval;
+
+pub use interval::{Interval, RegClass, SYSV_FLOAT_ARGS, SYSV_INT_ARGS};

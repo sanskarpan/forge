@@ -100,6 +100,12 @@ dependencies = [
 [[package]]
 name = "forge-regalloc"
 version = "0.1.0"
+dependencies = [
+ "forge-ir",
+ "forge-syntax",
+ "forge-x64",
+ "smallvec",
+]
 
 [[package]]
 name = "forge-runtime"
