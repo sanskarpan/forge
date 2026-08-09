@@ -6,7 +6,7 @@
 
 ## Why System V only, not System V + Win64
 
-CHECKLIST's callee-saved bullet doesn't specify an ABI, and 7a-7c's `MachineInst` design is deliberately ABI-agnostic (a future emission step reads `callee_saved`/`spill_bytes` as plain inputs). But building this slice for BOTH ABIs isn't just "duplicate the constants" — Win64's callee-saved set includes `XMM6`-`XMM15` (System V has no callee-saved XMM registers at all: "All XMM registers are caller-saved in System V" per SPEC.md), and there is no `push`/`pop` for an XMM register on x86-64 — saving one needs a `movsd`/`movups`-to-stack-memory sequence instead, a genuinely different code path from the GPR case, not a parameter change. Checking this project's own CI matrix (Phase 0's bootstrap task): `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu` (QEMU), `wasm32-unknown-unknown` — **no Windows target exists anywhere in this project's plan**. Building real, tested Win64 XMM-save support for a platform this project doesn't target and can't test in CI would be speculative generality with no consumer. `emit_prologue`/`emit_epilogue`'s actual code doesn't hardcode System V anywhere (they just push/pop whatever `PhysReg`s they're given), so nothing here forecloses Win64 support later if a real need arises — this slice just doesn't build or test it now.
+CHECKLIST's callee-saved bullet doesn't specify an ABI, and 7a-7c's `MachineInst` design is deliberately ABI-agnostic (a future emission step reads `callee_saved`/`spill_bytes` as plain inputs). But building this slice for BOTH ABIs isn't just "duplicate the constants" — Win64's callee-saved set includes `XMM6`-`XMM15` (System V has no callee-saved XMM registers at all: "All XMM registers are caller-saved in System V" per SPEC.md), and there is no `push`/`pop` for an XMM register on x86-64 — saving one needs a `movsd`/`movups`-to-stack-memory sequence instead, a genuinely different code path from the GPR case, not a parameter change. Checking this project's own CI matrix (Phase 0's bootstrap task): `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu` (QEMU), `wasm32-unknown-unknown` — **no Windows CI target exists**. (Windows platform support IS planned elsewhere — `forge-mem`'s platform detection and a future `docs/PLATFORMS.md` both mention it — so this isn't "Windows is out of scope for the project," just "untestable in this project's actual CI today.") Building real, tested Win64 XMM-save support for an ABI this project can't exercise in CI right now would be speculative generality with no way to verify it's correct. `emit_prologue`/`emit_epilogue`'s actual code doesn't hardcode System V anywhere (they just push/pop whatever `PhysReg`s they're given), so nothing here forecloses Win64 support later if a real need arises — this slice just doesn't build or test it now.
 
 ## Architecture
 
@@ -33,6 +33,14 @@ pub const SYSV_CALLEE_SAVED: &[PhysReg] =
 /// "Stack alignment" section for the derivation. A pure function, not a
 /// method, so emit_prologue and emit_epilogue each independently compute
 /// the identical value from the identical inputs and can never disagree.
+///
+/// PRECONDITION: `requested` must be a realistic spill-slot frame size
+/// (nowhere near `u32::MAX`) -- plain `u32` addition here is unchecked,
+/// so a `requested` within 16 bytes of `u32::MAX` could overflow/wrap.
+/// Not a concern for any real JIT'd expression's spill footprint (which
+/// would stack-overflow long before approaching 4GB), so this is
+/// documented as a precondition rather than defended with checked
+/// arithmetic against an unreachable input.
 fn padded_spill_bytes(num_callee_saved: usize, requested: u32) -> u32 {
     let base_offset = (num_callee_saved as u32) * 8;
     let misalignment = (base_offset + requested) % 16;
