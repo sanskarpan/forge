@@ -311,6 +311,10 @@ impl<'a> Selector<'a> {
             }),
 
             Inst::Cmp { op, lhs, rhs } => {
+                // dst's Ty is always Bool for a comparison -- dispatching on
+                // dst instead of the operand would always fall into the
+                // I64|Bool arm below and silently mis-lower every float
+                // comparison. Dispatch on the OPERAND's type instead.
                 let operand_ty = self.ty_of(*lhs);
                 match operand_ty {
                     Ty::F64 => self.insts.push(MachineInst::FloatCmp {
@@ -1072,6 +1076,9 @@ mod tests {
         );
     }
 
+    /// Proves the dispatch reads the OPERAND's type, not dst's -- dst here
+    /// is Ty::Bool, identical to select_lowers_int_cmp's dst, so this test
+    /// only discriminates correctly if the match keys off `lhs`/`rhs`.
     #[test]
     fn select_lowers_float_cmp() {
         let mut b = Builder::new();
