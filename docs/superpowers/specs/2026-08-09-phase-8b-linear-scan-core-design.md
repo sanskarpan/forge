@@ -131,7 +131,11 @@ fn pick_register(&mut self, i: usize, allocatable: &[PhysReg]) -> Option<PhysReg
 }
 ```
 
-**This is not a complete fix for φ-group co-location** — measured on the corpus, this rule honors 57/81 hints (up from 0/81), and the remaining 24 are two-address hints whose `lhs` genuinely outlives `dst`'s start (correctly refused — no unsafe reuse there) and φ-group hints where the anchor and a non-anchor member are BOTH live simultaneously beyond the touching-point case (e.g. both read again later, or the anchor itself isn't literally adjacent to the non-anchor in scan order). Those cases are NOT bugs to fix in 8b — per 8a's own design doc, un-co-located φ-group members are an expected, routine outcome (nested `if`s provably can't always co-locate even at zero register pressure) whose resolution is the deferred final-emission task's parallel-copy insertion, not this slice's job.
+**This is not a complete fix for φ-group co-location, and Case 1 is provably dead code, not just usually-idle.** A confirmation review that transcribed this EXACT code (not a paraphrase) against the corpus measured **49/83 hints honored** (a different, non-round number than an earlier draft's approximate 57/81 — the earlier figure came from a reviewer's own hand-written prototype, not this file's literal code; trust the 49/83 figure and the reasoning below over any specific number, since the exact count is corpus-composition-dependent and will shift again once the real corpus is finalized in the implementation plan). Case 1 (`free_regs.contains`) fired **zero times** in that run, and this is structural, not incidental: a hint target `T` of interval `D` is always EITHER a two-address `lhs`/`src` read by the instruction at `D.start` (so `T.end >= D.start`, meaning `T` can't have expired via `expire_old_intervals(D.start)`, which requires `T.end < D.start`) OR a φ-group anchor whose range is IDENTICAL to `D`'s (so `T.end == D.end >= D.start`, same conclusion). Either way, `T`'s register can never be sitting in `free_regs` by the time `D` is processed — Case 1's condition is unsatisfiable given how 8a's hints are actually constructed. It stays in the code as a defensive/future-proofing branch (a hint SHAPE this project doesn't currently produce could conceivably reach it), but 8b's own tests should not expect real corpus data to exercise it, and should test it directly with a hand-built fixture instead (a hint target whose interval has already fully expired before the hinting interval starts).
+
+The remaining un-honored hints (roughly 40% of the corpus total) are two-address hints whose `lhs` genuinely outlives `dst`'s start (correctly refused — no unsafe reuse there) and φ-group hints where the anchor and a non-anchor member are BOTH live simultaneously beyond the touching-point case (e.g. both read again later, or the anchor isn't literally adjacent to the non-anchor in scan order). Those cases are NOT bugs to fix in 8b — per 8a's own design doc, un-co-located φ-group members are an expected, routine outcome (nested `if`s provably can't always co-locate even at zero register pressure) whose resolution is the deferred final-emission task's parallel-copy insertion, not this slice's job.
+
+**Direct, load-bearing consequence for the no-overlap property (read before the Testing section below): Case 2 deliberately makes two OVERLAPPING intervals share one register.** A same-instruction handoff (`lhs.end == dst.start`, `dst.hint == Some(lhs.value)`) is, by the plain inclusive-range overlap predicate `a.start <= b.end && b.start <= a.end`, an "overlap" — and Case 2 assigns them the same register anyway, correctly (this is precisely the point of coalescing: no real conflict exists, since `lhs`'s value is dead the instant `dst`'s is born, at the very same instruction). This means the naive "no two overlapping intervals share a register" property, stated without qualification, is FALSE of this design's own intended output — see the corrected property statement in Testing, below. Do not "fix" `pick_register` to avoid this; the naive property was wrong, not the code.
 
 **Aggregating `excluded_registers` over an interval's whole range**: `excluded_registers()` returns `HashMap<(usize, Value), Vec<PhysReg>>`, keyed per INSTRUCTION POSITION (8a's point-in-time correction). 8b has no interval splitting — one register serves the interval's whole `[start, end]` — so a register excluded at ANY position within that range must be excluded for the WHOLE interval, or the value could still end up in a register that's unsafe at the one position that mattered. Every exclusion position is guaranteed (by construction — `excluded_registers` only ever keys on a `MachineInst`'s own operand at that `MachineInst`'s own position, which is always within that operand's interval) to lie inside its value's `[start, end]`, so a simple per-`Value` union — with NO reference to `intervals` needed at all — is both necessary and sufficient:
 
@@ -146,6 +150,12 @@ fn precompute_excluded(excluded_registers: &HashMap<(usize, Value), Vec<PhysReg>
 
 // excluded_at returns an EMPTY set (not a missing-key panic) for any
 // Value with no exclusion entry -- the overwhelming common case.
+// `HashSet::new()` is not `const fn`, so `EMPTY_EXCLUSION_SET` needs a
+// lazily-initialized static, not a plain `static _: HashSet<_> = HashSet::new();`
+// (a compile error, caught during design review).
+static EMPTY_EXCLUSION_SET: std::sync::LazyLock<HashSet<PhysReg>> =
+    std::sync::LazyLock::new(HashSet::new);
+
 fn excluded_at(&self, value: Value) -> &HashSet<PhysReg> {
     self.excluded.get(&value).unwrap_or(&EMPTY_EXCLUSION_SET)
 }
@@ -184,6 +194,8 @@ fn evict_and_assign(&mut self, i: usize, phys: PhysReg) {
 ```
 
 **Testing note**: since `build_intervals` never produces `fixed: Some(_)`, this function's tests MUST hand-construct `Vec<Interval>` fixtures directly (not go through the front-end/`select`/`build_intervals` pipeline) — the only way to exercise it at all in this slice. Cover both the no-victim success path and the victim-requires-eviction `#[should_panic]` path (confirming the deferred-work message, not just that SOME panic occurs).
+
+**Known narrowness, acceptable given no real producer exists**: the no-victim path neither consults `excluded_at` nor confirms `phys` is actually a member of `self.allocatable` before assigning it. Both are unreachable today (nothing constructs a `fixed` value that's also excluded, or a `fixed` value outside the interval's own class's pool), but a hand-built test COULD construct such a fixture and get a silently-wrong assignment rather than a panic — worth a defensive `assert!` if 8b's implementer has spare scope, not required for this slice's exit criteria.
 
 ## `spill_at_interval` — explicitly stubbed, not built
 
@@ -227,22 +239,52 @@ pub fn allocate(intervals: Vec<Interval>, excluded_registers: &HashMap<(usize, V
 }
 ```
 
-`run()` follows PROMPT.md's sketch exactly (sort by start [already done via the constructor accepting pre-sorted intervals, or sorting internally with 8a's exact tie-break key], loop: expire, fixed-eviction-or-pick-register, assign-or-spill), with the corrections above (`expire_old_intervals`'s inclusive boundary; `pick_register`'s corrected hint resolution, now `&mut self` since the same-instruction-reuse case mutates `active` directly; `evict_and_assign`'s narrowed, leak-free scope). `allocatable_for` (referenced in an earlier draft of `evict_and_assign`) does not exist and is not needed — `evict_and_assign`'s corrected form never calls `pick_register` at all.
+`run()` follows PROMPT.md's sketch's SHAPE (sort by start, loop: expire, fixed-eviction-or-pick-register, assign-or-spill) but its `pick_register`-succeeds arm must be spelled out explicitly, not left as PROMPT.md's bare `self.assign(i, reg)` — design review found that transcribing the sketch literally (treating `assign` as the whole job) silently skips removing the register from `free_regs` and pushing/re-sorting `active`, which would make `expire_old_intervals` never have anything to expire and every subsequent interval collide on `ALLOCATABLE[0]`:
+
+```rust
+pub fn run(&mut self) {
+    self.intervals.sort_by_key(|iv| (iv.start, iv.end, iv.value.0)); // same key as 8a's own sort
+    for i in 0..self.intervals.len() {
+        self.expire_old_intervals(self.intervals[i].start);
+
+        if let Some(phys) = self.intervals[i].fixed {
+            self.evict_and_assign(i, phys);
+            continue;
+        }
+
+        match self.pick_register(i, self.allocatable) {
+            Some(reg) => {
+                // For a Case 2 (same-instruction-reuse) hint, `reg` was
+                // never in `free_regs` to begin with -- `remove` here is
+                // then a documented no-op, not a bug; it's still correct
+                // and necessary for the ordinary free-register case.
+                self.free_regs.remove(&reg);
+                self.assign(i, Location::Reg(reg));
+                self.active.push(i);
+                self.active.sort_by_key(|&j| self.intervals[j].end);
+            }
+            None => self.spill_at_interval(i),
+        }
+    }
+}
+```
+
+Corrections applied relative to PROMPT.md's original sketch: `expire_old_intervals`'s inclusive boundary; `pick_register`'s corrected hint resolution (now `&mut self` since the same-instruction-reuse case mutates `active` directly); `evict_and_assign`'s narrowed, leak-free scope; `run()`'s success arm spelled out in full rather than left as a one-line `self.assign(i, reg)`. `allocatable_for` (referenced in an earlier draft of `evict_and_assign`) does not exist and is not needed — `evict_and_assign`'s corrected form never calls `pick_register` at all.
 
 ## Testing
 
 Property tests FIRST (per the process lesson above), over the SAME real-front-end corpus 8a's own `build_intervals_holds_its_invariants_across_the_whole_language_corpus`/`every_hint_points_backward_in_8bs_scan_order` tests already use (reuse the corpus list, don't re-invent it):
 
-- **No two overlapping intervals share a `Location::Reg`** (the inclusive-range overlap predicate: `a.start <= b.end && b.start <= a.end`) — this is literally what 8d's independent verifier will ALSO check later, built independently; 8b having its own copy of this property test now is not redundant with 8d, it's a regression net for THIS slice while 8d doesn't exist yet.
+- **CORRECTED — the no-overlap property needs a specific, narrow exemption for legitimate same-instruction handoffs, or it is FALSE of this design's own intended output, not just of a bug.** The naive statement ("no two overlapping intervals share a `Location::Reg`") is exactly what `pick_register`'s Case 2 deliberately violates, by design, every time it fires — confirmed during design review that Case 2's exact code produces dozens of such "violations" across the corpus, all of them correct coalescing, not bugs. The precise property to test (and the one 8d's independent verifier must ALSO implement — this is a real requirement to carry into 8d's own design doc, not just a note for 8b): two intervals `a`/`b` sharing a `Location::Reg` is a genuine problem UNLESS their ranges are disjoint (`a.end < b.start || b.end < a.start`) OR they touch at exactly one point that is a legitimate two-address/coalescing handoff (`a.end == b.start && b.hint == Some(a.value)`, or symmetrically `b.end == a.start && a.hint == Some(b.value)`). Anything else sharing a register is a real violation. This exemption is not a loophole to be suspicious of: it is exactly, and only, satisfied by pairs where `selected.insts[recipient.start]` is a two-address-destructive `MachineInst` whose `dst` is the recipient and whose `lhs`/`src` is the donor — a φ-group anchor can never satisfy it (`a.end == b.start` would require two distinct group members sharing a range to ALSO differ at the single point where one starts and the other ends, contradicting "identical range").
 - **`active` remains sorted by `end` after every `expire_old_intervals`/`assign`/hint-transfer call** — a direct invariant check, not just an outcome check.
 - **Every interval in the input ends up with exactly one entry in the returned `assignment` map** (modulo the `unimplemented!` spill path, which the scope-limiting note above guarantees the real corpus never reaches).
-- **Every honored hint was interference-free at the moment it was honored, AND a real, non-trivial number of hints actually get honored** — BOTH halves are required, not just the first. A property test asserting only "no violations" would have passed VACUOUSLY against the original, broken `pick_register` (which honored zero hints, so there was nothing to violate) — this exact gap is why the bug wasn't caught by reasoning about the rule in isolation. Assert a concrete lower bound on honored-hint count across the corpus (calibrate the exact number once the real implementation runs; treat a value near 0 as a redesign signal, not a threshold to lower).
+- **Every honored hint's assignment satisfies the corrected no-overlap property above, AND a real, non-trivial number of hints actually get honored** — BOTH halves are required, not just the first. A property test asserting only "no violations" would have passed VACUOUSLY against the original, broken `pick_register` (which honored zero hints, so there was nothing to violate) — this exact gap is why the bug wasn't caught by reasoning about the rule in isolation. Assert a concrete lower bound on honored-hint count across the corpus, calibrated against the REAL implementation's own measured count once it exists (design-review prototypes measured different exact numbers depending on corpus composition and exact transcription — 49/83 in the most careful literal-code run, ~57/81 in an earlier hand-written prototype over a different corpus subset — so treat "somewhere in the 40-70% range of total hints, definitely not near 0%" as the calibration target, not a specific number carried over from this doc).
 - Hand-constructed synthetic-`Interval` tests (bypassing `build_intervals` entirely, per the note above) for: `evict_and_assign`'s no-victim success path, and its victim-requires-eviction `#[should_panic]` path (confirming the deferred-work message, not just that some panic occurs).
 - A dedicated test for `pick_register`'s Case 2 (same-instruction reuse): two hand-built intervals where `lhs.end == dst.start` and `lhs`'s value is `dst`'s hint — confirm `dst` gets `lhs`'s exact register, `lhs` is removed from `active` without ever appearing in `free_regs`, and `active` stays correctly sorted afterward. A second test for the negative case: a hint target whose interval extends PAST the hinting interval's start (shouldn't happen per 8a's own invariants, but confirm the fallback path is taken safely, not a panic or a wrong register).
 - `expire_old_intervals`'s exact boundary: two hand-built intervals `[0,2]` and `[2,4]` sharing position 2 — confirm they're correctly treated as OVERLAPPING (both active simultaneously at position 2, needing two different registers) — this is the single most important boundary test in this slice, given it's a direct, easy-to-get-backward consequence of 8a's inclusive-range correction.
 - `PhysReg`'s new `Hash` derive: a trivial smoke test that `HashSet::from([PhysReg::Rax, PhysReg::Rax]).len() == 1` (confirms the derive actually compiles and works as intended — cheap, but real, since a missing/incorrect derive would otherwise only surface as a confusing downstream compile error far from its cause).
 - `ALLOCATABLE_GPR`/`ALLOCATABLE_XMM` contents: exactly 14 and 16 entries respectively, `Rsp`/`Rbp` absent from the GPR list, `Xmm16`-`Xmm31` absent from the XMM list.
-- A real end-to-end test: run `allocate()` on `build_intervals`'s output for a handful of real corpus programs and confirm every returned `Location` is `Reg(_)` (never `Spill`, matching the scope-limiting note) and that the no-overlap property holds — this is the first point in Phase 8 where 8a and 8b's outputs are actually wired together and exercised end-to-end.
+- A real end-to-end test: run `allocate()` on `build_intervals`'s output for a handful of real corpus programs and confirm every returned `Location` is `Reg(_)` (never `Spill`, matching the scope-limiting note) and that the CORRECTED no-overlap property (disjoint-or-legitimate-handoff, above — not the naive unqualified version) holds — this is the first point in Phase 8 where 8a and 8b's outputs are actually wired together and exercised end-to-end.
 
 ## Exit criteria
 
@@ -250,7 +292,7 @@ Property tests FIRST (per the process lesson above), over the SAME real-front-en
 2. `PhysReg` gains `Hash` in `crates/forge-x64/src/reg.rs`, additive, no other change.
 3. `ALLOCATABLE_GPR`/`ALLOCATABLE_XMM` correctly exclude `Rsp`/`Rbp` and `Xmm16`-`31` respectively.
 4. `expire_old_intervals` uses the INCLUSIVE-range-correct boundary (`end >= current_start` keeps active, not the half-open `end > current_start` PROMPT.md's sketch literally shows) — tested with an explicit touching-at-one-point case. Frees only `Location::Reg` occupants (not a type-mismatched raw `Location`).
-5. `pick_register` honors a hint in BOTH the "target already expired normally" case AND the "target is a same-instruction reuse, still nominally active" case (Case 1 and Case 2 above) — NOT just the naive free-register check alone, which was found by execution-based review to honor zero hints ever, on any program. Never honors a hint that would collide with a genuinely, simultaneously-live different value. Tested by BOTH halves of the "interference-free AND non-trivially-often honored" property — a test suite asserting only the first half would have passed against the broken version.
+5. `pick_register` honors a hint in BOTH the "target already expired normally" case (Case 1 — kept for defensiveness/future-proofing, though structurally dead against every hint shape 8a currently produces) AND the "target is a same-instruction reuse, still nominally active" case (Case 2 — the one that actually fires, always) — NOT just the naive free-register check alone, which was found by execution-based review to honor zero hints ever, on any program. Never honors a hint that would collide with a genuinely, simultaneously-live different value under the CORRECTED (disjoint-or-legitimate-handoff) no-overlap property, not the naive unqualified one. Tested by BOTH halves of the "correctly-exempted overlaps only AND non-trivially-often honored" property — a test suite asserting only the first half would have passed against the broken (zero-hints-honored) version too.
 6. `excluded_registers`' point-in-time exclusions are correctly aggregated (unioned) to whole-interval scope before being used as a candidate filter — since 8b has no splitting mechanism. `Shl`/`Shr`/`Sar`'s analogous `Cl`-register requirement is explicitly noted as deferred (fixable by an emission-time copy, unlike idiv's divisor), not silently unhandled.
 7. `evict_and_assign` exists, is leak-free (no double-booked register, no interval dropped from `active` — both confirmed real bugs in an earlier draft, found by hand-tracing a 3-interval eviction scenario), and is DELIBERATELY NARROWED to the no-victim case, with any genuine victim-requiring-reassignment scenario hitting an explicit, clearly-messaged `unimplemented!()` rather than an unsound reassignment (an earlier draft's reassignment path was proven wrong by execution: it could choose a register free only at the CURRENT scan position, not free across the victim's whole original range).
 8. `spill_at_interval` is an explicit, clearly-messaged `unimplemented!()` — not a silent wrong answer, and this slice's own test corpus is verified never to reach it (confirmed by execution: real max simultaneous liveness across a stress-tested corpus is 9 for both classes, against pools of 14/16).
