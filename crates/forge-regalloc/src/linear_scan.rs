@@ -152,6 +152,51 @@ impl<'a> LinearScan<'a> {
             }
         }
     }
+
+    /// Picks a register for interval `i`, honoring its hint where safe.
+    /// Case 1: the hint target's register is already free (it expired
+    /// normally). Case 2: the hint target is STILL active but its
+    /// interval ends exactly where this one starts -- the legitimate
+    /// same-instruction-reuse case (x86's own 2-address destructive
+    /// instructions read-then-overwrite one register atomically). When
+    /// Case 2 fires, ownership transfers directly: the hint target is
+    /// removed from `active` WITHOUT ever touching `free_regs` -- the
+    /// register never becomes "free" in the general sense, it goes
+    /// straight from one owner to the next. Falls back to any free,
+    /// non-excluded register (in `allocatable`'s declared order, for
+    /// deterministic output) if neither case applies.
+    fn pick_register(&mut self, i: usize, allocatable: &[PhysReg]) -> Option<PhysReg> {
+        let iv = self.intervals[i].clone();
+        let excluded = self.excluded_at(iv.value);
+
+        if let Some(hinted_value) = iv.hint {
+            if let Some(Location::Reg(reg)) = self.assignment.get(&hinted_value) {
+                if self.free_regs.contains(reg) && !excluded.contains(reg) {
+                    return Some(*reg);
+                }
+            }
+            if let Some(pos) = self
+                .active
+                .iter()
+                .position(|&j| self.intervals[j].value == hinted_value)
+            {
+                let target_end = self.intervals[self.active[pos]].end;
+                if target_end == iv.start {
+                    if let Some(Location::Reg(reg)) = self.assignment.get(&hinted_value).copied() {
+                        if !excluded.contains(&reg) {
+                            self.active.remove(pos);
+                            return Some(reg);
+                        }
+                    }
+                }
+            }
+        }
+
+        allocatable
+            .iter()
+            .find(|r| self.free_regs.contains(r) && !excluded.contains(r))
+            .copied()
+    }
 }
 
 #[cfg(test)]
@@ -265,5 +310,103 @@ mod tests {
 
         assert!(scan.active.is_empty());
         assert!(scan.free_regs.contains(&PhysReg::Rax));
+    }
+
+    #[test]
+    fn pick_register_case2_transfers_ownership_on_same_instruction_reuse() {
+        // lhs.end == dst.start == 2, dst.hint == Some(lhs.value) -- the
+        // structural signature of a legitimate two-address handoff.
+        let lhs = iv(0, 0, 2, crate::interval::RegClass::Gpr);
+        let mut dst = iv(1, 2, 4, crate::interval::RegClass::Gpr);
+        dst.hint = Some(Value(0));
+        let mut scan = LinearScan::new(vec![lhs.clone(), dst], &HashMap::new(), ALLOCATABLE_GPR);
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.active.push(0);
+        // lhs's register is NOT in free_regs (still "active") -- Case 2 must
+        // transfer it directly, not require it to be free first.
+        scan.free_regs.remove(&PhysReg::Rax);
+
+        let picked = scan.pick_register(1, ALLOCATABLE_GPR);
+
+        assert_eq!(picked, Some(PhysReg::Rax));
+        assert!(
+            scan.active.is_empty(),
+            "lhs must be removed from active by the transfer"
+        );
+        assert!(
+            !scan.free_regs.contains(&PhysReg::Rax),
+            "the register must NEVER appear in free_regs during a Case 2 transfer"
+        );
+    }
+
+    #[test]
+    fn pick_register_case1_honors_a_hint_whose_target_already_expired() {
+        // A hand-built fixture for the structurally-dead-against-real-data
+        // Case 1 path: the hint target's interval has ALREADY expired, so
+        // its register is genuinely back in `free_regs` and the target is
+        // NOT in `active`. `build_intervals` provably cannot produce this
+        // shape (a hint target is always either a two-address operand read
+        // at the hinting interval's own start, or a phi anchor whose range
+        // is identical -- both still active), so this MUST be hand-built
+        // rather than corpus-derived.
+        let mut dst = iv(1, 5, 7, crate::interval::RegClass::Gpr);
+        dst.hint = Some(Value(0));
+        let mut scan = LinearScan::new(vec![dst], &HashMap::new(), ALLOCATABLE_GPR);
+        // Value(0) held Rcx and has since expired: `LinearScan::new` seeds
+        // `free_regs` with the whole pool, so Rcx is already free, and
+        // Value(0) never enters `active`.
+        scan.assignment
+            .insert(Value(0), Location::Reg(PhysReg::Rcx));
+        assert!(scan.free_regs.contains(&PhysReg::Rcx));
+        assert!(scan.active.is_empty());
+
+        let picked = scan.pick_register(0, ALLOCATABLE_GPR);
+
+        // Rcx, and specifically NOT ALLOCATABLE_GPR[0] (Rax) -- proving
+        // Case 1 fired rather than the plain free-register fallback.
+        assert_eq!(picked, Some(PhysReg::Rcx));
+        assert_ne!(picked, Some(ALLOCATABLE_GPR[0]));
+    }
+
+    #[test]
+    fn pick_register_falls_back_to_free_register_when_hint_unusable() {
+        // Hint target's interval extends PAST this interval's start -- not a
+        // legitimate handoff (shouldn't happen per 8a's own invariants, but
+        // confirm the fallback path is taken safely, not a panic/wrong reg).
+        let target = iv(0, 0, 10, crate::interval::RegClass::Gpr);
+        let mut dst = iv(1, 2, 4, crate::interval::RegClass::Gpr);
+        dst.hint = Some(Value(0));
+        let mut scan = LinearScan::new(vec![target.clone(), dst], &HashMap::new(), ALLOCATABLE_GPR);
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.active.push(0);
+        scan.free_regs.remove(&PhysReg::Rax); // target HOLDS Rax -- it is not free
+
+        let picked = scan.pick_register(1, ALLOCATABLE_GPR);
+
+        // Rax is NOT returned (target.end=10 != dst.start=2, no transfer);
+        // falls back to the first free register in ALLOCATABLE_GPR's order.
+        assert_ne!(picked, Some(PhysReg::Rax));
+        assert_eq!(picked, Some(ALLOCATABLE_GPR[1])); // Rax is index 0 and still occupied
+    }
+
+    #[test]
+    fn pick_register_respects_exclusions_even_for_a_legitimate_handoff() {
+        let lhs = iv(0, 0, 2, crate::interval::RegClass::Gpr);
+        let mut dst = iv(1, 2, 4, crate::interval::RegClass::Gpr);
+        dst.hint = Some(Value(0));
+        let mut raw: HashMap<(usize, Value), Vec<PhysReg>> = HashMap::new();
+        raw.insert((2, Value(1)), vec![PhysReg::Rax]); // dst itself excluded from Rax
+        let mut scan = LinearScan::new(vec![lhs, dst], &raw, ALLOCATABLE_GPR);
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.active.push(0);
+        scan.free_regs.remove(&PhysReg::Rax);
+
+        let picked = scan.pick_register(1, ALLOCATABLE_GPR);
+
+        assert_ne!(
+            picked,
+            Some(PhysReg::Rax),
+            "excluded even though it's the hint target's register"
+        );
     }
 }
