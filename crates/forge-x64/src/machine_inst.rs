@@ -199,6 +199,13 @@ pub enum MachineInst {
 pub struct SelectedFunction {
     pub insts: Vec<MachineInst>,
     pub synthetic_types: HashMap<Value, Ty>,
+    /// dst -> the Value dst should end up sharing a physical register/slot
+    /// with, if Phase 8's allocator can manage it. Every entry corresponds
+    /// to a 2-address-destructive x86 operation where honoring the hint
+    /// lets the final MachineInst-to-bytes emission step skip an
+    /// otherwise-mandatory `mov dst, lhs` copy. A hint that isn't honored
+    /// is not an error -- emission falls back to inserting the copy.
+    pub coalescing_hints: HashMap<Value, Value>,
 }
 
 struct Selector<'a> {
@@ -411,10 +418,53 @@ pub fn select(func: &Function) -> SelectedFunction {
             sel.select_term(term);
         }
     }
+    let coalescing_hints = compute_coalescing_hints(&sel.insts);
     SelectedFunction {
         insts: sel.insts,
         synthetic_types: sel.synthetic_types,
+        coalescing_hints,
     }
+}
+
+/// Scans a fully-selected instruction sequence and records a dst->operand
+/// coalescing hint for every 2-address-destructive MachineInst. Binary ops
+/// hint dst->lhs (the operand whose register `dst` needs to already hold);
+/// unary ops hint dst->src. IntDiv/IntRem are deliberately excluded -- their
+/// constraint is fixed RAX/RDX placement, a different (fixed-register, not
+/// coalescing) hint Phase 8's allocator handles separately. Lea is
+/// deliberately excluded too -- real x86 lea is non-destructive 3-operand,
+/// so it has no two-address constraint to hint around at all.
+pub fn compute_coalescing_hints(insts: &[MachineInst]) -> HashMap<Value, Value> {
+    let mut hints = HashMap::new();
+    for inst in insts {
+        match inst {
+            MachineInst::IntAdd { dst, lhs, .. }
+            | MachineInst::IntSub { dst, lhs, .. }
+            | MachineInst::IntMul { dst, lhs, .. }
+            | MachineInst::And { dst, lhs, .. }
+            | MachineInst::Or { dst, lhs, .. }
+            | MachineInst::Xor { dst, lhs, .. }
+            | MachineInst::Shl { dst, lhs, .. }
+            | MachineInst::Shr { dst, lhs, .. }
+            | MachineInst::Sar { dst, lhs, .. }
+            | MachineInst::FloatAdd { dst, lhs, .. }
+            | MachineInst::FloatSub { dst, lhs, .. }
+            | MachineInst::FloatMul { dst, lhs, .. }
+            | MachineInst::FloatDiv { dst, lhs, .. }
+            | MachineInst::FloatMin { dst, lhs, .. }
+            | MachineInst::FloatMax { dst, lhs, .. } => {
+                hints.insert(*dst, *lhs);
+            }
+            MachineInst::IntNeg { dst, src }
+            | MachineInst::Not { dst, src }
+            | MachineInst::FloatNeg { dst, src, .. }
+            | MachineInst::FloatAbs { dst, src, .. } => {
+                hints.insert(*dst, *src);
+            }
+            _ => {}
+        }
+    }
+    hints
 }
 
 #[cfg(test)]
@@ -1406,5 +1456,113 @@ mod tests {
         b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
 
         select(&b.f); // must panic
+    }
+
+    #[test]
+    fn coalescing_hints_binary_op_hints_dst_to_lhs_not_rhs() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let y = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, Inst::Sub(x, y), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        assert_eq!(selected.coalescing_hints.get(&r), Some(&x));
+        assert_ne!(selected.coalescing_hints.get(&r), Some(&y));
+    }
+
+    #[test]
+    fn coalescing_hints_unary_op_hints_dst_to_src() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, Inst::Neg(x), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        assert_eq!(selected.coalescing_hints.get(&r), Some(&x));
+    }
+
+    #[test]
+    fn coalescing_hints_exclude_int_div_and_rem() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let y = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let d = b.emit(entry, Inst::Div(x, y), Ty::I64, dummy_span());
+        let r = b.emit(entry, Inst::Rem(x, y), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        assert_eq!(selected.coalescing_hints.get(&d), None);
+        assert_eq!(selected.coalescing_hints.get(&r), None);
+    }
+
+    #[test]
+    fn coalescing_hints_no_entry_for_ops_with_no_natural_hint() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let p = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(p));
+
+        let selected = select(&b.f);
+
+        assert_eq!(selected.coalescing_hints.get(&p), None);
     }
 }
