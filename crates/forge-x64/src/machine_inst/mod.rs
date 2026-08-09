@@ -228,6 +228,19 @@ pub enum MachineInst {
         src: Value,
     }, // truncating (cvttsd2si)
 
+    // libm calls -- see crates/forge-x64/src/libm.rs for address resolution.
+    // Still fully virtual-register/SSA-form like every other MachineInst: the
+    // real call SEQUENCE (spill live regs, marshal args into xmm0/xmm1, align
+    // rsp, mov_reg_imm+call_reg, move the f64 result out of xmm0) is entirely
+    // the future emission step's job, once Phase 8 assigns real registers --
+    // this variant only records WHAT gets called, with WHICH SSA args, and
+    // WHERE the result goes.
+    CallLibm {
+        dst: Value,
+        func: forge_ir::LibFunc,
+        args: smallvec::SmallVec<[Value; 2]>,
+    },
+
     // Control flow
     Jump {
         target: Block,
@@ -447,7 +460,13 @@ impl<'a> Selector<'a> {
                 self.insts.push(MachineInst::FloatAdd { dst, lhs: mul_tmp, rhs: *c });
             }
 
-            Inst::Call { .. } => unimplemented!("libm call lowering ships in Phase 7e"),
+            Inst::Call { func, args } => {
+                self.insts.push(MachineInst::CallLibm {
+                    dst,
+                    func: *func,
+                    args: args.clone(),
+                });
+            }
             Inst::Phi { .. } => {
                 // Deliberately emits nothing -- see the design doc's "φ
                 // handling" section. This Inst's destination Value is

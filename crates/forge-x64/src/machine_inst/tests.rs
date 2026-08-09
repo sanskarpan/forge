@@ -1185,8 +1185,7 @@ fn select_emits_nothing_for_phi() {
 }
 
 #[test]
-#[should_panic(expected = "Phase 7e")]
-fn select_panics_on_call_with_a_clear_deferral_message() {
+fn select_lowers_a_unary_libm_call() {
     let mut b = Builder::new();
     let entry = b.create_block();
     b.seal_block(entry);
@@ -1210,7 +1209,104 @@ fn select_panics_on_call_with_a_clear_deferral_message() {
     );
     b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
 
-    select(&b.f); // must panic
+    let selected = select(&b.f);
+
+    assert_eq!(
+        selected.insts,
+        vec![
+            MachineInst::Param { dst: x, index: 0 },
+            MachineInst::CallLibm {
+                dst: r,
+                func: forge_ir::LibFunc::Sin,
+                args: smallvec::smallvec![x],
+            },
+            MachineInst::Return { value: r },
+        ]
+    );
+}
+
+#[test]
+fn select_lowers_a_binary_libm_call() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let x = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let y = b.emit(
+        entry,
+        Inst::Param {
+            index: 1,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let r = b.emit(
+        entry,
+        Inst::Call {
+            func: forge_ir::LibFunc::Pow,
+            args: smallvec::smallvec![x, y],
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+    let selected = select(&b.f);
+
+    assert_eq!(
+        selected.insts,
+        vec![
+            MachineInst::Param { dst: x, index: 0 },
+            MachineInst::Param { dst: y, index: 1 },
+            MachineInst::CallLibm {
+                dst: r,
+                func: forge_ir::LibFunc::Pow,
+                args: smallvec::smallvec![x, y],
+            },
+            MachineInst::Return { value: r },
+        ]
+    );
+}
+
+#[test]
+fn coalescing_hints_no_entry_for_call_libm() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let x = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let r = b.emit(
+        entry,
+        Inst::Call {
+            func: forge_ir::LibFunc::Sin,
+            args: smallvec::smallvec![x],
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+    let selected = select(&b.f);
+
+    // A call's dst isn't 2-address-destructive -- its real location is
+    // wherever the ABI return convention places it (xmm0), unrelated to
+    // any operand's register, so it must never get a coalescing hint.
+    assert_eq!(selected.coalescing_hints.get(&r), None);
 }
 
 #[test]
@@ -1739,6 +1835,76 @@ fn lea_synthesis_escaping_use_prevents_suppression() {
         .insts
         .iter()
         .any(|i| matches!(i, MachineInst::IntMul { dst, .. } if *dst == mul)));
+}
+
+/// Mirrors lea_synthesis_escaping_use_prevents_suppression's structure,
+/// but the SECOND (escaping) use is a libm call argument instead of a
+/// direct Return -- this specifically exercises find_fully_fusable_
+/// scaled_indices's reliance on forge_ir::uses_of's Inst::Call coverage.
+/// Without that coverage, `mul`'s call-argument use wouldn't be counted
+/// in total_uses, its only recorded use would be the fusable Add, and it
+/// would be WRONGLY suppressed (its own IntMul dropped, even though the
+/// call still needs mul's real computed value).
+#[test]
+fn lea_synthesis_libm_call_argument_use_prevents_suppression() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let base_v = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::I64,
+        },
+        Ty::I64,
+        dummy_span(),
+    );
+    let idx = b.emit(
+        entry,
+        Inst::Param {
+            index: 1,
+            ty: Ty::I64,
+        },
+        Ty::I64,
+        dummy_span(),
+    );
+    let four = b.emit(entry, Inst::ConstI64(4), Ty::I64, dummy_span());
+    let mul = b.emit(entry, Inst::Mul(idx, four), Ty::I64, dummy_span());
+    let _add = b.emit(entry, Inst::Add(mul, base_v), Ty::I64, dummy_span());
+    // `mul` is ALSO used as a libm call argument -- an escaping use (not
+    // an Add-fusion pattern), so it must NOT be suppressed even though
+    // the Add above fuses it. (Using an I64 value as a libm call arg
+    // isn't realistic front-end output -- real calls are f64-only per
+    // the type checker -- but this is a raw IR-construction unit test
+    // exercising the selector's suppression logic directly, the same
+    // way lea_synthesis_escaping_use_prevents_suppression's sibling
+    // tests do; MachineInst::CallLibm's selection doesn't inspect arg
+    // types, only uses_of's traversal, which is what's under test here.)
+    let call_r = b.emit(
+        entry,
+        Inst::Call {
+            func: forge_ir::LibFunc::Sin,
+            args: smallvec::smallvec![mul],
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(call_r));
+
+    let selected = select(&b.f);
+
+    assert!(selected
+        .insts
+        .iter()
+        .any(|i| matches!(i, MachineInst::Lea { .. })));
+    assert!(selected
+        .insts
+        .iter()
+        .any(|i| matches!(i, MachineInst::IntMul { dst, .. } if *dst == mul)));
+    assert!(selected
+        .insts
+        .iter()
+        .any(|i| matches!(i, MachineInst::CallLibm { args, .. } if args.as_slice() == [mul])));
 }
 
 #[test]

@@ -5,8 +5,8 @@ edition.workspace = true
 
 [dependencies]
 forge-ir = { path = "../forge-ir" }
+smallvec.workspace = true
 
 [dev-dependencies]
 iced-x86.workspace = true
 forge-syntax = { path = "../forge-syntax" }
-smallvec.workspace = true
