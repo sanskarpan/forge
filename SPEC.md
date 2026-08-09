@@ -201,18 +201,20 @@ the common all-float case; the general entry point is
    └────┬─────────────────────┘
         │  optimized IR
    ┌────▼─────────────────────┐
-   │  Liveness Analysis       │  live intervals per SSA value
+   │  Instruction Selection   │  tree tiling, addressing modes,
+   │                          │  virtual regs (SSA Values reused
+   │                          │  directly, no separate VReg type)
+   └────┬─────────────────────┘
+        │  MachineInst (virtual regs + coalescing hints)
+   ┌────▼─────────────────────┐
+   │  Liveness Analysis       │  live intervals per virtual register
    └────┬─────────────────────┘
         │
    ┌────▼─────────────────────┐
    │  Linear Scan RegAlloc    │  assign phys regs, insert spills
    └────┬─────────────────────┘
-        │  IR + RegAssignment
-   ┌────▼─────────────────────┐
-   │  Instruction Selection   │  tree tiling, addressing modes,
-   │                          │  two-address fixups
-   └────┬─────────────────────┘
-        │  MachineInst
+        │  MachineInst + RegAssignment (two-address
+        │  fixups resolved using real registers)
    ┌────▼──────────┬──────────┬────────────┐
    │ x86-64 Encoder│ AArch64  │ WASM       │
    │ REX/ModRM/SIB │ Encoder  │ Encoder    │
@@ -225,6 +227,19 @@ the common all-float case; the general entry point is
    │  icache invalidate → transmute → CALL │
    └───────────────────────────────────────┘
 ```
+
+Instruction Selection runs *before* register allocation, not after: it lowers
+optimized IR into `MachineInst` entirely in terms of virtual registers
+(`forge_ir::Value`, reused directly — no separate `VReg` type), attaching
+coalescing hints as metadata rather than inserting real copies. Liveness
+Analysis and Linear Scan RegAlloc then operate on that `MachineInst` sequence,
+assigning physical registers to those virtual registers and honoring hints
+where possible. Two-address fixups (`add dst, src` needing `dst == a`
+beforehand) aren't rewritten at selection time either — they're resolved by a
+final emission step, once real register assignments exist, which decides
+per-instruction whether an actual copy is needed. (Phase 7's own design doc,
+`docs/superpowers/specs/2026-08-09-phase-7a-machine-inst-selection-design.md`,
+has the full reasoning.)
 
 **Tiered execution** wraps the whole thing:
 
