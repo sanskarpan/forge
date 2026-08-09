@@ -552,12 +552,8 @@ fn select_lowers_int_neg() {
     assert_eq!(selected.insts[1], MachineInst::IntNeg { dst: r, src: x });
 }
 
-/// Proves Neg's OTHER branch: an f64 operand mints a synthetic mask
-/// temp and lowers to FloatNeg, not IntNeg -- the float counterpart to
-/// select_lowers_int_neg above, both exercising the same dispatching
-/// `Inst::Neg` arm.
 #[test]
-fn select_lowers_float_neg_via_a_synthetic_mask_temp() {
+fn select_lowers_float_neg_via_a_pooled_mask() {
     let mut b = Builder::new();
     let entry = b.create_block();
     b.seal_block(entry);
@@ -575,22 +571,19 @@ fn select_lowers_float_neg_via_a_synthetic_mask_temp() {
 
     let selected = select(&b.f);
 
-    let mask_tmp = match &selected.insts[1] {
-        MachineInst::LoadImmI64 { dst, imm } => {
-            assert_eq!(*imm, i64::MIN);
-            *dst
-        }
-        other => panic!("expected LoadImmI64 for the mask temp, got {:?}", other),
-    };
     assert_eq!(
-        selected.insts[2],
+        selected.insts[1],
         MachineInst::FloatNeg {
             dst: r,
             src: x,
-            mask_tmp
+            mask_pool: PoolIndex(0)
         }
     );
-    assert_eq!(selected.synthetic_types.get(&mask_tmp), Some(&Ty::I64));
+    assert_eq!(selected.pool.entries(), &[i64::MIN as u64]);
+    // No synthetic Value minted anymore -- the old mask-temp mechanism
+    // is gone for this case (Fma's mul_tmp mechanism, tested separately
+    // below, is unrelated and still mints synthetic values).
+    assert!(selected.synthetic_types.is_empty());
 }
 
 #[test]
@@ -868,7 +861,7 @@ fn select_lowers_f_to_i() {
 }
 
 #[test]
-fn select_lowers_abs_via_a_synthetic_mask_temp() {
+fn select_lowers_abs_via_a_pooled_mask() {
     let mut b = Builder::new();
     let entry = b.create_block();
     b.seal_block(entry);
@@ -886,27 +879,192 @@ fn select_lowers_abs_via_a_synthetic_mask_temp() {
 
     let selected = select(&b.f);
 
-    // insts[0] = Param x, insts[1] = LoadImmI64 for the mask temp,
-    // insts[2] = FloatAbs, insts[3] = Return.
-    let mask_tmp = match &selected.insts[1] {
-        MachineInst::LoadImmI64 { dst, imm } => {
-            assert_eq!(*imm, 0x7FFF_FFFF_FFFF_FFFFi64);
-            *dst
-        }
-        other => panic!("expected LoadImmI64 for the mask temp, got {:?}", other),
-    };
     assert_eq!(
-        selected.insts[2],
+        selected.insts[1],
         MachineInst::FloatAbs {
             dst: r,
             src: x,
-            mask_tmp
+            mask_pool: PoolIndex(0)
         }
     );
-    assert_eq!(selected.synthetic_types.get(&mask_tmp), Some(&Ty::I64));
-    // The mask temp's Value must not collide with any real IR value --
-    // the highest real Value index is `r` (the Abs instruction itself).
-    assert!(mask_tmp.0 > r.0);
+    assert_eq!(selected.pool.entries(), &[0x7FFF_FFFF_FFFF_FFFFu64]);
+    assert!(selected.synthetic_types.is_empty());
+}
+
+#[test]
+fn select_shares_one_pool_entry_across_multiple_abs_call_sites() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let x = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let y = b.emit(
+        entry,
+        Inst::Param {
+            index: 1,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let abs_x = b.emit(entry, Inst::Abs(x), Ty::F64, dummy_span());
+    let abs_y = b.emit(entry, Inst::Abs(y), Ty::F64, dummy_span());
+    let sum = b.emit(entry, Inst::Add(abs_x, abs_y), Ty::F64, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(sum));
+
+    let selected = select(&b.f);
+
+    assert_eq!(
+        selected.insts[2],
+        MachineInst::FloatAbs {
+            dst: abs_x,
+            src: x,
+            mask_pool: PoolIndex(0)
+        }
+    );
+    assert_eq!(
+        selected.insts[3],
+        MachineInst::FloatAbs {
+            dst: abs_y,
+            src: y,
+            mask_pool: PoolIndex(0)
+        }
+    );
+    assert_eq!(selected.pool.entries().len(), 1);
+}
+
+#[test]
+fn select_abs_and_neg_masks_do_not_share_a_pool_entry() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let x = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let y = b.emit(
+        entry,
+        Inst::Param {
+            index: 1,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let abs_x = b.emit(entry, Inst::Abs(x), Ty::F64, dummy_span());
+    let neg_y = b.emit(entry, Inst::Neg(y), Ty::F64, dummy_span());
+    let sum = b.emit(entry, Inst::Add(abs_x, neg_y), Ty::F64, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(sum));
+
+    let selected = select(&b.f);
+
+    assert_eq!(selected.pool.entries().len(), 2);
+    assert!(selected.pool.entries().contains(&0x7FFF_FFFF_FFFF_FFFFu64));
+    assert!(selected.pool.entries().contains(&(i64::MIN as u64)));
+}
+
+/// The case worked through explicitly in the design doc: i64::MIN's bits
+/// equal -0.0f64's bits, so a function with BOTH a literal -0.0 and a
+/// float Neg deliberately shares one pool entry between them. This is
+/// intended, correct behavior -- not a bug to fix if you're reading this
+/// after a "why does this collide" investigation.
+#[test]
+fn select_negative_zero_literal_and_neg_mask_deliberately_collide() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let neg_zero = b.emit(
+        entry,
+        Inst::ConstF64((-0.0f64).to_bits()),
+        Ty::F64,
+        dummy_span(),
+    );
+    let y = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let neg_y = b.emit(entry, Inst::Neg(y), Ty::F64, dummy_span());
+    let sum = b.emit(entry, Inst::Add(neg_zero, neg_y), Ty::F64, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(sum));
+
+    let selected = select(&b.f);
+
+    assert_eq!(selected.pool.entries().len(), 1);
+    assert_eq!(selected.pool.entries()[0], i64::MIN as u64);
+}
+
+#[test]
+fn select_fma_temp_mechanism_is_unaffected_by_the_constant_pool() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let x = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let y = b.emit(
+        entry,
+        Inst::Param {
+            index: 1,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let z = b.emit(
+        entry,
+        Inst::Param {
+            index: 2,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let r = b.emit(entry, Inst::Fma { a: x, b: y, c: z }, Ty::F64, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+    let selected = select(&b.f);
+
+    let mul_tmp = match &selected.insts[3] {
+        MachineInst::FloatMul { dst, lhs, rhs } => {
+            assert_eq!(*lhs, x);
+            assert_eq!(*rhs, y);
+            *dst
+        }
+        other => panic!("expected FloatMul, got {:?}", other),
+    };
+    assert_eq!(
+        selected.insts[4],
+        MachineInst::FloatAdd {
+            dst: r,
+            lhs: mul_tmp,
+            rhs: z
+        }
+    );
+    assert_eq!(selected.synthetic_types.get(&mul_tmp), Some(&Ty::F64));
+    assert!(selected.pool.entries().is_empty());
 }
 
 #[test]

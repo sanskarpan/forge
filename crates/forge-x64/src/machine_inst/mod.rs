@@ -188,20 +188,20 @@ pub enum MachineInst {
         mode: crate::RoundMode,
     },
 
-    // Abs/Neg on floats: mask_tmp is a synthetic I64 Value holding the
-    // sign-mask constant, minted by the selector -- see machine_inst.rs's
-    // Fma/Abs/Neg lowering for why this field exists (it lets the
-    // post-Phase-8 emission step synthesize the exact movq+andpd/xorpd
-    // sequence once mask_tmp's and dst's real registers are known).
+    // Abs/Neg on floats: mask_pool references the sign-mask constant in
+    // the selector's ConstantPool -- see machine_inst.rs's Fma/Abs/Neg
+    // lowering for why this field exists (it lets the post-Phase-8
+    // emission step synthesize the exact movq+andpd/xorpd sequence once
+    // mask_pool's constant and dst's real register are known).
     FloatAbs {
         dst: Value,
         src: Value,
-        mask_tmp: Value,
+        mask_pool: PoolIndex,
     },
     FloatNeg {
         dst: Value,
         src: Value,
-        mask_tmp: Value,
+        mask_pool: PoolIndex,
     },
 
     // Comparisons -- resolved to a specific strategy at selection time
@@ -250,8 +250,9 @@ pub enum MachineInst {
 
 /// The result of instruction selection: a flat MachineInst sequence plus
 /// the Ty of every virtual register the selector minted that ISN'T a real
-/// IR value (i.e. every synthetic temp -- Fma's mul_tmp, Abs/Neg's
-/// mask_tmp). Phase 8 needs this to know GPR-vs-XMM class for registers
+/// IR value (i.e. every synthetic temp -- Fma's mul_tmp is currently the
+/// only one; Abs/Neg's sign masks live in `pool` instead, not here).
+/// Phase 8 needs this to know GPR-vs-XMM class for registers
 /// `func.types` doesn't cover; real IR values look their Ty up in
 /// `func.types` directly via this module's own `ty_of` helper.
 pub struct SelectedFunction {
@@ -360,9 +361,8 @@ impl<'a> Selector<'a> {
                     // set. XOR-ing this into the value FLIPS the sign bit
                     // (negation) -- contrast Abs's mask below, which CLEARS
                     // it via AND instead.
-                    let mask_tmp = self.fresh(Ty::I64);
-                    self.insts.push(MachineInst::LoadImmI64 { dst: mask_tmp, imm: i64::MIN });
-                    self.insts.push(MachineInst::FloatNeg { dst, src: *a, mask_tmp });
+                    let mask_pool = self.pool.intern(i64::MIN as u64);
+                    self.insts.push(MachineInst::FloatNeg { dst, src: *a, mask_pool });
                 }
                 Ty::I64 => self.insts.push(MachineInst::IntNeg { dst, src: *a }),
                 Ty::Bool => unreachable!("Neg never applies to Bool"),
@@ -433,12 +433,8 @@ impl<'a> Selector<'a> {
                 // AND-ing this into the value CLEARS the sign bit
                 // (absolute value) -- contrast Neg's mask above, which
                 // FLIPS it via XOR instead.
-                let mask_tmp = self.fresh(Ty::I64);
-                self.insts.push(MachineInst::LoadImmI64 {
-                    dst: mask_tmp,
-                    imm: 0x7FFF_FFFF_FFFF_FFFFi64,
-                });
-                self.insts.push(MachineInst::FloatAbs { dst, src: *a, mask_tmp });
+                let mask_pool = self.pool.intern(0x7FFF_FFFF_FFFF_FFFFu64);
+                self.insts.push(MachineInst::FloatAbs { dst, src: *a, mask_pool });
             }
             // NOT bit-identical to a real hardware FMA (that's a single
             // rounding; this is two -- multiply rounds once, then add
