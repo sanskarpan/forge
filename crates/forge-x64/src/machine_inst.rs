@@ -310,6 +310,26 @@ impl<'a> Selector<'a> {
                 mode: crate::RoundMode::Truncate,
             }),
 
+            Inst::Cmp { op, lhs, rhs } => {
+                let operand_ty = self.ty_of(*lhs);
+                match operand_ty {
+                    Ty::F64 => self.insts.push(MachineInst::FloatCmp {
+                        op: *op,
+                        dst,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                    }),
+                    Ty::I64 | Ty::Bool => self.insts.push(MachineInst::IntCmp {
+                        op: *op,
+                        dst,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                    }),
+                }
+            }
+            Inst::IToF(a) => self.insts.push(MachineInst::IntToFloat { dst, src: *a }),
+            Inst::FToI(a) => self.insts.push(MachineInst::FloatToInt { dst, src: *a }),
+
             // Remaining variants are filled in by later tasks in this plan.
             _ => todo!("filled in by Tasks 4-6 of the Phase 7a plan"),
         }
@@ -1001,6 +1021,152 @@ mod tests {
                 src: x,
                 mode: crate::RoundMode::Truncate
             }
+        );
+    }
+
+    #[test]
+    fn select_lowers_int_cmp() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let y = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let r = b.emit(
+            entry,
+            Inst::Cmp {
+                op: CmpOp::Lt,
+                lhs: x,
+                rhs: y,
+            },
+            Ty::Bool,
+            dummy_span(),
+        );
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::IntCmp {
+                op: CmpOp::Lt,
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_float_cmp() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let y = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let r = b.emit(
+            entry,
+            Inst::Cmp {
+                op: CmpOp::Lt,
+                lhs: x,
+                rhs: y,
+            },
+            Ty::Bool,
+            dummy_span(),
+        );
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::FloatCmp {
+                op: CmpOp::Lt,
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_i_to_f() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, Inst::IToF(x), Ty::F64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        assert_eq!(
+            selected.insts[1],
+            MachineInst::IntToFloat { dst: r, src: x }
+        );
+    }
+
+    #[test]
+    fn select_lowers_f_to_i() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, Inst::FToI(x), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        assert_eq!(
+            selected.insts[1],
+            MachineInst::FloatToInt { dst: r, src: x }
         );
     }
 }
