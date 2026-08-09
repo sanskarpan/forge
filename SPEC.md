@@ -628,6 +628,18 @@ pub const SYSV_CALLEE_SAVED: &[PhysReg] = &[RBX, RBP, R12, R13, R14, R15];
 /// All XMM registers are caller-saved in System V — so ANY libm call
 /// clobbers every float register. This is why `sin(x) + cos(y)` needs spills
 /// and `sqrt(x) + sqrt(y)` doesn't.
+///
+/// NOTE (Phase 7d): this is the ABI-level full callee-saved set, for this
+/// section's register-allocation bookkeeping. forge-x64's actual, shipped
+/// `prologue::SYSV_CALLEE_SAVED` (`crates/forge-x64/src/prologue.rs`) is a
+/// narrower, same-named constant covering only `RBX, R12-R15` — it
+/// deliberately EXCLUDES `RBP`, because `RBP`'s save/restore is baked
+/// unconditionally into `emit_prologue`/`emit_epilogue`'s own `push rbp`/
+/// `pop rbp`, never passed in by the caller. This isn't a bug in either
+/// place — `RBP` is never a register the Phase 8 allocator would hand out
+/// anyway — but don't conflate the two lists by name when Phase 8 wires
+/// real allocator output into `emit_prologue`/`emit_epilogue`'s
+/// `callee_saved` parameter.
 
 /// Microsoft x64 (Windows)
 pub const WIN64_INT_ARGS:  &[PhysReg] = &[RCX, RDX, R8, R9];
