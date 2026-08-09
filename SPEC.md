@@ -662,6 +662,92 @@ impl LinearScan {
         }
     }
 }
+
+/// NOTE (Phase 8b): the shipped allocator
+/// (`crates/forge-regalloc/src/linear_scan.rs`) follows the SHAPE of the
+/// `run()` sketch above — sort, expire, fixed-eviction-or-pick, assign-or-spill
+/// — but SIX things in this sketch are wrong or incomplete as literally
+/// written, each found by executing a transcription of it against the real
+/// corpus rather than by reading it. Later phases must not re-derive any of
+/// them from this sketch:
+///
+/// 1. `expire_old_intervals`'s `if self.intervals[j].end > current_start`
+///    is a HALF-OPEN test and is wrong for this project's INCLUSIVE ranges
+///    (see the Phase 8a note above). It frees a register one position early,
+///    while the value is still live, and hands it to an unrelated interval —
+///    a silent wrong answer, not a crash. Shipped code breaks on
+///    `end >= current_start`, expiring only when `end < current_start`.
+///
+/// 2. `pick_register` is sketched here as "prefer the hint, then any free
+///    register", and CHECKLIST.md words it the same way. The obvious
+///    implementation of that — honor the hint if the target's register is in
+///    `free_regs` — honors ZERO hints, ever, on any program (measured: 0/81
+///    across the corpus). Under inclusive ranges a two-address hint's target
+///    satisfies `target.end == this.start` by construction, so the target is
+///    always still active and its register is never free at the moment the
+///    hint is consulted; a φ-group anchor shares an identical range and
+///    fails identically. The shipped rule has two cases: Case 1 (target's
+///    register genuinely free) — kept for future-proofing but STRUCTURALLY
+///    DEAD against every hint shape 8a can produce, and tested only with a
+///    hand-built fixture — and Case 2 (target still active, `target.end ==
+///    this.start`), which transfers ownership directly from the target's
+///    `active` entry without the register ever entering `free_regs`. Case 2
+///    is the one that fires; ~54% of corpus hints are honored.
+///
+/// 3. **The property "no two overlapping intervals share a register" is
+///    FALSE of the correct allocator's own output**, and CHECKLIST bullet 17
+///    ("Independent allocation verifier") must NOT implement it as stated.
+///    Case 2 above deliberately gives one register to two intervals that
+///    overlap under the plain inclusive predicate, because a same-instruction
+///    two-address handoff is not a real conflict (the donor's value is dead
+///    the instant the recipient's is born, at the same instruction — this is
+///    precisely what coalescing means). The correct property, which 8d's
+///    verifier must implement independently: sharing a register is a
+///    violation UNLESS the ranges are disjoint (`a.end < b.start ||
+///    b.end < a.start`) OR they touch at exactly one point that is a real
+///    handoff (`a.end == b.start && b.hint == Some(a.value)`, or
+///    symmetrically). A φ-group pair can never satisfy the exemption — a
+///    merged group's range structurally spans at least two positions — so
+///    this is a narrow, checkable exemption, not a loophole.
+///
+/// 4. `run()`'s `if let Some(reg) = self.pick_register(i) { self.assign(i, reg); }`
+///    is incomplete: `assign` only records the `Value -> Location` mapping.
+///    The success arm must ALSO remove `reg` from `free_regs`, push `i` onto
+///    `active`, and re-sort `active` by `end`. Transcribed literally, nothing
+///    ever enters `active`, so `expire_old_intervals` never has anything to
+///    expire and every interval collides on the first allocatable register.
+///
+/// 5. `evict_and_assign` is shipped DELIBERATELY NARROWED to the no-victim
+///    case; a genuine "evict whoever holds it" is an explicit
+///    `unimplemented!()`, deferred to 8c. Two separate drafts of the
+///    reassignment path were proven wrong by execution (a leaked victim that
+///    double-books a register, and — after fixing that — choosing the
+///    victim's replacement from a `free_regs` snapshot that describes the
+///    CURRENT scan position rather than the victim's whole range). Moot in
+///    practice while `Interval::fixed` stays `None` (Phase 8a note, item 3).
+///
+/// 6. `spill_at_interval` — the whole spill heuristic sketched above — is
+///    Phase 8c's, not 8b's. 8b ships a clearly-messaged `unimplemented!()`
+///    stub and verifies by construction that its corpus never reaches it
+///    (max simultaneous liveness 4 GPR / 7 XMM against pools of 14/16).
+///    Consequently `spill_slots: u32` does not exist in the shipped struct
+///    yet, and `Location::Spill(u32)` — see below — is never constructed.
+///
+/// Shape differences that are deliberate but harmless: `free_regs: RegSet`
+/// is a plain `HashSet<PhysReg>` (`PhysReg` gained `Hash` in Phase 8b, an
+/// additive derive); `assignment: FxHashMap` is `std::collections::HashMap`
+/// (`forge-regalloc` has no `rustc-hash` dependency and nothing here is
+/// hash-throughput-bound); and the shipped struct carries an `allocatable:
+/// &[PhysReg]` pool plus a precomputed `excluded: HashMap<Value,
+/// HashSet<PhysReg>>` (8a's per-position `excluded_registers` unioned to
+/// whole-interval scope, since this allocator has no interval splitting).
+/// GPR/XMM separation is done by running this single-class loop twice from
+/// `allocate()`, not by one interleaved scan.
+///
+/// `Location`, which this section's own `assignment: FxHashMap<Value, Location>`
+/// and the verifier snippet's `Location::Reg(ra)` both reference but which
+/// SPEC.md never defines, is defined in Phase 8b as
+/// `pub enum Location { Reg(PhysReg), Spill(u32) }`.
 ```
 
 ### ABI constraints
