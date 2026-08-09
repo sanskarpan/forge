@@ -528,6 +528,42 @@ mod tests {
     }
 
     #[test]
+    fn pick_register_refused_exclusion_does_not_remove_the_target_from_active() {
+        // ORDERING REGRESSION TEST: `pick_register`'s Case 2 checks
+        // `!excluded.contains(&reg)` BEFORE calling `self.active.remove(pos)`,
+        // not after. If that order were ever reversed (an easy, plausible
+        // refactor -- remove first, then decide whether to actually use the
+        // register), a refused exclusion would still silently evict the
+        // hint target from `active`: its register would never return to
+        // `free_regs` (since the target isn't expired, just orphaned), and
+        // it would leak for the rest of the scan. Found by hand-tracing a
+        // real chained-handoff-plus-exclusion program during Phase 8b's
+        // final review; nothing else in this file pins the ordering.
+        let lhs = iv(0, 0, 2, crate::interval::RegClass::Gpr);
+        let mut dst = iv(1, 2, 4, crate::interval::RegClass::Gpr);
+        dst.hint = Some(Value(0));
+        let mut raw: HashMap<(usize, Value), Vec<PhysReg>> = HashMap::new();
+        raw.insert((2, Value(1)), vec![PhysReg::Rax]); // dst excluded from Rax
+        let mut scan = LinearScan::new(vec![lhs, dst], &raw, ALLOCATABLE_GPR);
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.active.push(0);
+        scan.free_regs.remove(&PhysReg::Rax);
+
+        let picked = scan.pick_register(1, ALLOCATABLE_GPR);
+
+        assert_ne!(picked, Some(PhysReg::Rax), "excluded, must not be returned");
+        assert_eq!(
+            scan.active,
+            vec![0],
+            "lhs must STILL be active -- the refused exclusion must not have evicted it"
+        );
+        assert!(
+            !scan.free_regs.contains(&PhysReg::Rax),
+            "Rax must still be held by lhs, not leaked back into free_regs"
+        );
+    }
+
+    #[test]
     fn pick_register_case2_when_active_position_differs_from_interval_index() {
         // DISCRIMINATION FIXTURE: `pos` (from `active.iter().position(...)`)
         // indexes `active`, NOT `intervals` directly. Every OTHER Case 2
