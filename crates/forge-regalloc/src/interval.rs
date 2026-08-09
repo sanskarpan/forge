@@ -60,6 +60,19 @@ pub struct Interval {
     pub end: u32,
     pub reg_class: RegClass,
     pub hint: Option<Value>,
+    /// A whole-lifetime pin: the value must occupy exactly this register
+    /// for its ENTIRE `[start, end]` range. As of Phase 8a NO rule
+    /// populates this -- it is always `None`, and that is deliberate, not
+    /// an oversight. Every "fixed register" requirement currently known
+    /// (a `Param`'s incoming ABI register, `IntDiv`'s rax, `IntRem`'s rdx)
+    /// turned out to be a POINT constraint holding for exactly one
+    /// instruction, and expressing a point constraint as a whole-lifetime
+    /// pin produces unsatisfiable constraint sets on trivial programs
+    /// (`a/b + c/d` pins two overlapping values to rax forever). Those are
+    /// all resolved as emission-time copies instead -- see the design
+    /// doc's corrected "Fixed registers" section. The field stays because
+    /// a genuinely whole-lifetime hardware constraint may exist in some
+    /// future `MachineInst` variant.
     pub fixed: Option<PhysReg>,
     /// Always 0.0 in Phase 8a -- populated by Phase 8c's spill heuristic.
     pub spill_weight: f32,

@@ -14,10 +14,19 @@ use std::collections::HashMap;
 /// `start`/`end` come from real backward liveness dataflow, not an
 /// approximation: `end` covers every position a value is live across, not
 /// just its last textual use inside its own block. φ destinations and all
-/// their incoming values are then merged into one shared range (see
-/// `merge_phi_intervals`), two-address hints are copied from
-/// `SelectedFunction::coalescing_hints`, and `fixed` is populated for
-/// `Param`/`IntDiv`/`IntRem`.
+/// their incoming values are then merged into one shared range AND given
+/// mutual hints toward the φ's own destination (see `merge_phi_intervals`),
+/// and two-address hints are copied from
+/// `SelectedFunction::coalescing_hints`. NOTHING populates `Interval::fixed`
+/// -- see `populate_fixed_registers`' own doc comment and the design doc's
+/// corrected "Fixed registers" section for why `Param`/`IntDiv`/`IntRem`
+/// are emission-time copies rather than whole-lifetime register pins.
+///
+/// The returned `Vec` is sorted by `(start, end, value)`: construction is
+/// `HashMap`-backed, whose iteration order is not stable across runs on
+/// identical input, and an unsorted return would make register assignment
+/// -- and therefore emitted machine code -- nondeterministic once 8b
+/// consumes this.
 pub fn build_intervals(func: &Function, selected: &SelectedFunction) -> Vec<Interval> {
     let liveness = compute_liveness(func, selected);
 
@@ -110,9 +119,11 @@ pub fn build_intervals(func: &Function, selected: &SelectedFunction) -> Vec<Inte
 
     merge_phi_intervals(func, &mut intervals);
     populate_two_address_hints(selected, &mut intervals);
-    populate_fixed_registers(func, selected, &mut intervals);
+    populate_fixed_registers(func);
 
-    intervals.into_values().collect()
+    let mut result: Vec<Interval> = intervals.into_values().collect();
+    result.sort_by_key(|iv| (iv.start, iv.end, iv.value.0));
+    result
 }
 
 /// A block's real successors, straight from its terminator -- the ground
@@ -121,10 +132,25 @@ pub fn build_intervals(func: &Function, selected: &SelectedFunction) -> Vec<Inte
 /// `add_pred` calls a caller can forget, leave stale, or never make at all
 /// for a hand-built `Function`; the terminators cannot disagree with the
 /// CFG the selector actually laid out.)
+///
+/// A degenerate `Branch { then_: X, else_: X }` (both arms targeting the
+/// same block) counts as ONE successor, not two. The critical-edge logic
+/// treats successor and predecessor COUNTS as meaningful, so counting that
+/// branch twice would both inflate `X`'s predecessor count and make the
+/// branching block look like it has two successors -- misfiring the
+/// tripwire on an edge that is not actually critical. Today's front-end
+/// cannot produce this shape, but Phase 7f's diamond fusion plausibly
+/// could.
 fn successors_of(func: &Function, block: Block) -> Vec<Block> {
     match &func.blocks[block.0 as usize].term {
         Some(Terminator::Jump(t)) => vec![*t],
-        Some(Terminator::Branch { then_, else_, .. }) => vec![*then_, *else_],
+        Some(Terminator::Branch { then_, else_, .. }) => {
+            if then_ == else_ {
+                vec![*then_]
+            } else {
+                vec![*then_, *else_]
+            }
+        }
         Some(Terminator::Return(_)) | None => vec![],
     }
 }
@@ -238,6 +264,39 @@ fn merge_phi_intervals(func: &Function, intervals: &mut HashMap<Value, Interval>
             iv.end = e;
         }
     }
+
+    // Beyond the range merge, every group member ALSO needs a mutual hint
+    // toward one canonical anchor (the phi's own destination) -- N
+    // intervals with an identical range and no hint look like N mutually
+    // interfering values to 8b, not one coalescing group. The hint is
+    // soft (per this project's established "not honoring a hint is not
+    // an error" convention); the deferred final-emission task is
+    // responsible for inserting a real parallel copy for any group
+    // member 8b/8c didn't manage to co-locate -- the fallback Phase 7a's
+    // own design doc already anticipated ("insert parallel-copy moves at
+    // predecessor block ends otherwise") but which doesn't exist yet.
+    //
+    // This is a genuinely separate pass over `func.insts` rather than a
+    // fold into the bounds loop above: that loop iterates `members`, a
+    // flat list of every value touched by ANY phi across the whole
+    // function, so it cannot cleanly derive which phi is a given value's
+    // anchor -- re-walking `Inst::Phi` directly can.
+    for (i, inst) in func.insts.iter().enumerate() {
+        let Inst::Phi { incoming } = inst else {
+            continue;
+        };
+        let phi_value = Value(i as u32);
+        if !intervals.contains_key(&phi_value) {
+            continue;
+        }
+        for &(_, incoming_value) in incoming.iter() {
+            if let Some(iv) = intervals.get_mut(&incoming_value) {
+                if iv.hint.is_none() {
+                    iv.hint = Some(phi_value);
+                }
+            }
+        }
+    }
 }
 
 fn find(parent: &mut HashMap<Value, Value>, mut v: Value) -> Value {
@@ -285,32 +344,26 @@ fn populate_two_address_hints(
     }
 }
 
-/// `Param`'s class-relative ABI register, and `IntDiv`/`IntRem`'s fixed
-/// rax/rdx `dst` -- see the design doc's "Fixed registers" section for the
-/// full reasoning (in particular why `rhs`/`lhs` get NO Interval-level
-/// treatment here: `rhs` is handled by `excluded_registers` in Task 6,
-/// `lhs` by emission-time copy insertion, out of this crate's scope).
-fn populate_fixed_registers(
-    func: &Function,
-    selected: &SelectedFunction,
-    intervals: &mut HashMap<Value, Interval>,
-) {
-    // `Inst::Param { index, .. }`'s `index` counts ALL parameters
-    // regardless of type, but SysV assigns integer and float arguments
-    // from SEPARATE register files -- so the register a param lands in is
-    // determined by how many EARLIER params share its RegClass, not by
-    // `index`. `func.params` is the authority on declaration order/types
-    // (it is 1:1 with `index` by construction in `lower.rs`).
-    let param_values = param_value_by_index(func);
+/// Validates `func.params` fits within SysV's ABI argument-register counts.
+/// Does NOT populate `Interval::fixed` for Param/IntDiv/IntRem's dst --
+/// see the design doc's corrected "Fixed registers" section: none of
+/// these are genuinely whole-lifetime register requirements (the ABI/
+/// hardware register only matters for a single instant -- the Param's
+/// own position, or the IntDiv/IntRem's own position), so representing
+/// them as a whole-`Interval` pin produces unsatisfiable constraint sets
+/// whenever two such values have overlapping lifetimes (e.g. `a/b + c/d`,
+/// or a 3rd int param used alongside an `%` in the same function --
+/// both confirmed to actually collide by an earlier version of this
+/// function). Both are instead resolved as pure emission-time copies
+/// (mirroring the established two-address-hint and dividend-into-rax
+/// fixups): the deferred final-emission task recomputes the ABI/hardware
+/// register directly from the MachineInst itself (no Interval data
+/// needed) and inserts a copy into the value's real assigned location if
+/// they don't already coincide.
+fn populate_fixed_registers(func: &Function) {
     let mut gpr_seen = 0usize;
     let mut xmm_seen = 0usize;
-    for (index, &(_, ty)) in func.params.iter().enumerate() {
-        // The class counters must advance for EVERY declared parameter,
-        // including one whose defining instruction is gone (dead-code
-        // eliminated) or was never emitted -- the ABI register a LATER
-        // param occupies depends on the full declared list, not on which
-        // params survived.
-        let value = param_values.get(&(index as u32)).copied();
+    for &(_, ty) in &func.params {
         match RegClass::of(ty) {
             RegClass::Gpr => {
                 assert!(
@@ -320,9 +373,6 @@ fn populate_fixed_registers(
                      before any user-facing CLI surface ships (tracked in the Phase 8a design doc)",
                     crate::interval::SYSV_INT_ARGS.len()
                 );
-                if let Some(iv) = value.and_then(|v| intervals.get_mut(&v)) {
-                    iv.fixed = Some(crate::interval::SYSV_INT_ARGS[gpr_seen]);
-                }
                 gpr_seen += 1;
             }
             RegClass::Xmm => {
@@ -333,58 +383,21 @@ fn populate_fixed_registers(
                      any user-facing CLI surface ships (tracked in the Phase 8a design doc)",
                     crate::interval::SYSV_FLOAT_ARGS.len()
                 );
-                if let Some(iv) = value.and_then(|v| intervals.get_mut(&v)) {
-                    iv.fixed = Some(crate::interval::SYSV_FLOAT_ARGS[xmm_seen]);
-                }
                 xmm_seen += 1;
             }
         }
     }
-
-    for inst in &selected.insts {
-        match inst {
-            forge_x64::MachineInst::IntDiv { dst, .. } => {
-                if let Some(iv) = intervals.get_mut(dst) {
-                    iv.fixed = Some(forge_x64::PhysReg::Rax);
-                }
-            }
-            forge_x64::MachineInst::IntRem { dst, .. } => {
-                if let Some(iv) = intervals.get_mut(dst) {
-                    iv.fixed = Some(forge_x64::PhysReg::Rdx);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Maps each parameter index to the `Value` its `Inst::Param` defines, by
-/// scanning `func.insts` for real `Param` instructions.
-///
-/// Deliberately NOT `Value(index)`: that shortcut happens to hold for a
-/// function straight out of `lower.rs` (which emits every `Param` first,
-/// into the entry block, and `Builder::emit` numbers values by
-/// `f.insts.len()`), but nothing enforces it -- later passes can append
-/// new instructions freely, and a hand-built `Function` can set `params`
-/// without emitting `Param` instructions at index 0 at all. Scanning is
-/// the same cost and can't go stale.
-fn param_value_by_index(func: &Function) -> HashMap<u32, Value> {
-    let mut by_index = HashMap::new();
-    for (i, inst) in func.insts.iter().enumerate() {
-        if let Inst::Param { index, .. } = inst {
-            by_index.insert(*index, Value(i as u32));
-        }
-    }
-    by_index
+    // IntDiv/IntRem's dst deliberately gets NO fixed marking either -- see
+    // this function's own doc comment above.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use forge_ir::builder::Builder;
-    use forge_ir::{Function, Inst, Terminator, Ty, Value};
+    use forge_ir::{Function, Inst, Terminator, Ty};
     use forge_syntax::span::Span;
-    use forge_x64::{select, PhysReg};
+    use forge_x64::select;
 
     fn dummy_span() -> Span {
         Span::new(0, 0)
@@ -554,6 +567,13 @@ mod tests {
         assert_eq!((then_iv.start, then_iv.end), (2, 6));
         assert_eq!((else_iv.start, else_iv.end), (2, 6));
         assert_eq!((phi_iv.start, phi_iv.end), (2, 6));
+
+        // Beyond the range merge, both incoming values must ALSO hint toward
+        // the phi's own destination -- the merge alone isn't enough signal
+        // for an allocator to treat these as one coalescing group rather
+        // than N mutually interfering values with identical ranges.
+        assert_eq!(then_iv.hint, Some(phi));
+        assert_eq!(else_iv.hint, Some(phi));
     }
 
     #[test]
@@ -704,10 +724,14 @@ mod tests {
     }
 
     #[test]
-    fn mixed_type_params_get_class_relative_fixed_registers() {
-        // f(x: f64, n: i64, y: f64) -- x is the 1st XMM arg (Xmm0), n is the
-        // 1st GPR arg (Rdi) despite being the 2nd param overall, y is the 2nd
-        // XMM arg (Xmm1) despite being the 3rd param overall.
+    fn params_never_get_a_fixed_register_pin_from_build_intervals() {
+        // Corrected behavior: Param's ABI register is no longer represented
+        // as a whole-lifetime Interval::fixed pin (an earlier version of this
+        // rule made overlapping params/idiv results unsatisfiable-by-
+        // construction -- see the design doc's corrected "Fixed registers"
+        // section). The ABI register is recomputed independently by the
+        // deferred final-emission task directly from func.params + index,
+        // with zero Interval involvement.
         let mut b = Builder::new();
         let entry = b.create_block();
         b.seal_block(entry);
@@ -751,55 +775,11 @@ mod tests {
         let x_iv = intervals.iter().find(|iv| iv.value == x).unwrap();
         let n_iv = intervals.iter().find(|iv| iv.value == n).unwrap();
         let y_iv = intervals.iter().find(|iv| iv.value == y).unwrap();
-        assert_eq!(x_iv.fixed, Some(PhysReg::Xmm0));
-        assert_eq!(n_iv.fixed, Some(PhysReg::Rdi));
-        assert_eq!(y_iv.fixed, Some(PhysReg::Xmm1));
+        assert_eq!(x_iv.fixed, None);
+        assert_eq!(n_iv.fixed, None);
+        assert_eq!(y_iv.fixed, None);
         assert_eq!(x_iv.reg_class, RegClass::Xmm);
         assert_eq!(n_iv.reg_class, RegClass::Gpr);
-    }
-
-    #[test]
-    fn params_are_found_by_scanning_not_by_assuming_value_index_equals_param_index() {
-        // The same three params, but with two unrelated instructions emitted
-        // BEFORE them, so Value(0)/Value(1)/Value(2) are NOT the params.
-        // Assuming Value(index) == the param's own Value would silently pin
-        // the ABI registers onto the wrong values here (and leave the real
-        // params unfixed).
-        let mut b = Builder::new();
-        let entry = b.create_block();
-        b.seal_block(entry);
-        let junk_a = b.emit(entry, Inst::ConstI64(11), Ty::I64, dummy_span());
-        let junk_b = b.emit(entry, Inst::ConstI64(22), Ty::I64, dummy_span());
-        let p0 = b.emit(
-            entry,
-            Inst::Param {
-                index: 0,
-                ty: Ty::I64,
-            },
-            Ty::I64,
-            dummy_span(),
-        );
-        let p1 = b.emit(
-            entry,
-            Inst::Param {
-                index: 1,
-                ty: Ty::F64,
-            },
-            Ty::F64,
-            dummy_span(),
-        );
-        b.f.params = vec![("p0".to_string(), Ty::I64), ("p1".to_string(), Ty::F64)];
-        let sum = b.emit(entry, Inst::Add(junk_a, junk_b), Ty::I64, dummy_span());
-        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(sum));
-
-        let selected = select(&b.f);
-        let intervals = build_intervals(&b.f, &selected);
-
-        let iv = |v: Value| intervals.iter().find(|iv| iv.value == v).unwrap().clone();
-        assert_eq!(iv(p0).fixed, Some(PhysReg::Rdi));
-        assert_eq!(iv(p1).fixed, Some(PhysReg::Xmm0));
-        assert_eq!(iv(junk_a).fixed, None);
-        assert_eq!(iv(junk_b).fixed, None);
     }
 
     #[test]
@@ -831,11 +811,12 @@ mod tests {
     }
 
     #[test]
-    fn int_div_dst_fixed_rax_int_rem_dst_fixed_rdx() {
-        // The dividend is deliberately NOT a Param: a Param would pick up a
-        // fixed ABI register from the Param rule, masking the property this
-        // test is about (idiv's DIVIDEND gets no allocator-level treatment of
-        // its own -- the design's "pure emission-time fixup" resolution).
+    fn int_div_and_int_rem_dst_get_no_fixed_register_pin() {
+        // Corrected behavior: dst no longer gets fixed = Some(Rax)/Some(Rdx)
+        // (an earlier version made two overlapping idiv results, e.g.
+        // `a/b + c/d`, unsatisfiable-by-construction). The Rax/Rdx placement
+        // is now a pure emission-time copy, symmetric with the dividend-side
+        // fixup this file already didn't touch at the Interval level.
         let mut b = Builder::new();
         let entry = b.create_block();
         b.seal_block(entry);
@@ -852,8 +833,8 @@ mod tests {
         let q_iv = intervals.iter().find(|iv| iv.value == q).unwrap();
         let r_iv = intervals.iter().find(|iv| iv.value == r).unwrap();
         let a_iv = intervals.iter().find(|iv| iv.value == a).unwrap();
-        assert_eq!(q_iv.fixed, Some(PhysReg::Rax));
-        assert_eq!(r_iv.fixed, Some(PhysReg::Rdx));
+        assert_eq!(q_iv.fixed, None);
+        assert_eq!(r_iv.fixed, None);
         // lhs (a) gets NO special treatment at the Interval level -- neither a
         // fixed register nor a hint -- confirming the design's "pure
         // emission-time fixup, no allocator-level hint" resolution.
@@ -863,5 +844,107 @@ mod tests {
         // either (compute_coalescing_hints deliberately excludes them).
         assert_eq!(q_iv.hint, None);
         assert_eq!(r_iv.hint, None);
+    }
+
+    #[test]
+    fn two_overlapping_int_divs_no_longer_produce_conflicting_fixed_registers() {
+        // The exact shape that exposed the original bug: two independent
+        // divisions whose results are both needed by a later Add. Under the
+        // old (incorrect) design both dsts got fixed = Some(Rax) for their
+        // whole, overlapping ranges -- unsatisfiable. Now neither gets fixed
+        // at all, so there's no conflict for 8b to even encounter.
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let a = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let bb = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let c = b.emit(
+            entry,
+            Inst::Param {
+                index: 2,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let d = b.emit(
+            entry,
+            Inst::Param {
+                index: 3,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        b.f.params = vec![
+            ("a".to_string(), Ty::I64),
+            ("b".to_string(), Ty::I64),
+            ("c".to_string(), Ty::I64),
+            ("d".to_string(), Ty::I64),
+        ];
+        let q1 = b.emit(entry, Inst::Div(a, bb), Ty::I64, dummy_span());
+        let q2 = b.emit(entry, Inst::Div(c, d), Ty::I64, dummy_span());
+        let sum = b.emit(entry, Inst::Add(q1, q2), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(sum));
+
+        let selected = select(&b.f);
+        let intervals = build_intervals(&b.f, &selected);
+
+        let q1_iv = intervals.iter().find(|iv| iv.value == q1).unwrap();
+        let q2_iv = intervals.iter().find(|iv| iv.value == q2).unwrap();
+        // Both dsts overlap (both survive to the final Add) -- confirm
+        // neither carries a fixed register that would conflict.
+        assert_eq!(q1_iv.fixed, None);
+        assert_eq!(q2_iv.fixed, None);
+    }
+
+    #[test]
+    fn build_intervals_returns_a_deterministically_sorted_vec() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let a = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let one = b.emit(entry, Inst::ConstI64(1), Ty::I64, dummy_span());
+        let two = b.emit(entry, Inst::ConstI64(2), Ty::I64, dummy_span());
+        let x = b.emit(entry, Inst::Add(a, one), Ty::I64, dummy_span());
+        let y = b.emit(entry, Inst::Add(x, two), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(y));
+
+        let selected = select(&b.f);
+        let intervals = build_intervals(&b.f, &selected);
+
+        let sorted: Vec<_> = {
+            let mut v = intervals.clone();
+            v.sort_by_key(|iv| (iv.start, iv.end, iv.value.0));
+            v
+        };
+        assert_eq!(
+            intervals, sorted,
+            "build_intervals' output must already be in sorted order"
+        );
     }
 }
