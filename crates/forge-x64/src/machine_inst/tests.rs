@@ -215,6 +215,97 @@ fn select_visits_blocks_in_true_rpo_not_creation_order() {
             MachineInst::Return { value: c },
         ]
     );
+
+    // block_starts is recorded by the SAME walk, so it must agree with the
+    // instruction order above: entry's Jump at 0, y's Jump at 1, x's two
+    // instructions from 2.
+    assert_eq!(selected.block_starts, vec![(entry, 0), (y, 1), (x, 2)]);
+}
+
+#[test]
+fn select_records_block_starts_in_rpo_order() {
+    // Same fixture shape as select_visits_blocks_in_true_rpo_not_creation_order:
+    // an if/else with a join block, entry -> {then_block, else_block} -> join.
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    let then_block = b.create_block();
+    let else_block = b.create_block();
+    let join = b.create_block();
+    b.add_pred(then_block, entry);
+    b.add_pred(else_block, entry);
+    b.add_pred(join, then_block);
+    b.add_pred(join, else_block);
+    b.seal_block(entry);
+
+    let cond = b.emit(entry, Inst::ConstBool(true), Ty::Bool, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+        cond,
+        then_: then_block,
+        else_: else_block,
+    });
+
+    b.seal_block(then_block);
+    let then_val = b.emit(then_block, Inst::ConstI64(1), Ty::I64, dummy_span());
+    b.f.blocks[then_block.0 as usize].term = Some(Terminator::Jump(join));
+
+    b.seal_block(else_block);
+    let else_val = b.emit(else_block, Inst::ConstI64(2), Ty::I64, dummy_span());
+    b.f.blocks[else_block.0 as usize].term = Some(Terminator::Jump(join));
+
+    b.seal_block(join);
+    let phi = b.emit(
+        join,
+        Inst::Phi {
+            incoming: smallvec::smallvec![(then_block, then_val), (else_block, else_val)],
+        },
+        Ty::I64,
+        dummy_span(),
+    );
+    b.f.blocks[join.0 as usize].term = Some(Terminator::Return(phi));
+
+    let selected = select(&b.f);
+
+    // The order is REAL RPO, not creation order: dominance::reverse_postorder
+    // does a DFS visiting `then_` before `else_` and reverses the postorder,
+    // which puts else_block BEFORE then_block (the same "RPO != creation
+    // order" property select_visits_blocks_in_true_rpo_not_creation_order
+    // pins down for a straight chain).
+    // Per-block MachineInst counts: entry = LoadImmI64(ConstBool) + Branch = 2;
+    // else_block = LoadImmI64 + Jump = 2; then_block = LoadImmI64 + Jump = 2;
+    // join = Phi (emits NOTHING, per Phase 7a) + Return = 1. Total 7.
+    assert_eq!(
+        selected.block_starts,
+        vec![(entry, 0), (else_block, 2), (then_block, 4), (join, 6)]
+    );
+    assert_eq!(selected.insts.len(), 7);
+
+    // Each recorded start must genuinely be that block's first instruction,
+    // not just a plausible count: check the MachineInst actually sitting there.
+    assert!(matches!(
+        selected.insts[0],
+        MachineInst::LoadImmI64 { dst, .. } if dst == cond
+    ));
+    assert!(matches!(
+        selected.insts[2],
+        MachineInst::LoadImmI64 { dst, .. } if dst == else_val
+    ));
+    assert!(matches!(
+        selected.insts[4],
+        MachineInst::LoadImmI64 { dst, .. } if dst == then_val
+    ));
+    assert!(matches!(selected.insts[6], MachineInst::Return { .. }));
+
+    // Structural invariants the liveness pass depends on: entry is first,
+    // starts are non-decreasing, and every start is a valid index.
+    assert_eq!(selected.block_starts[0].0, b.f.entry);
+    let positions: Vec<usize> = selected.block_starts.iter().map(|(_, pos)| *pos).collect();
+    for w in positions.windows(2) {
+        assert!(
+            w[0] <= w[1],
+            "block_starts positions must be non-decreasing"
+        );
+    }
+    assert!(*positions.last().unwrap() < selected.insts.len());
 }
 
 #[test]

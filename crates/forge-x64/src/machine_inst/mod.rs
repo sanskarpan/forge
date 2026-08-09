@@ -279,6 +279,20 @@ pub struct SelectedFunction {
     /// is not an error -- emission falls back to inserting the copy.
     pub coalescing_hints: HashMap<Value, Value>,
     pub pool: ConstantPool,
+    /// (Block, first-instruction-index-in-insts) for every block, in the
+    /// same RPO order `insts` itself was built in. Lets later passes
+    /// (Phase 8's liveness analysis) reconstruct block boundaries --
+    /// `insts` alone has no boundary markers, and the IR-instruction-to-
+    /// MachineInst count isn't 1:1 (Fma emits 2, Phi/suppressed lea
+    /// operands emit 0), so only `select()`'s own walk can record this
+    /// correctly. A block's end is the NEXT ENTRY'S start (by list
+    /// position, not by searching for a larger value -- a block that
+    /// selects to zero MachineInsts makes two consecutive entries share
+    /// the same start, and only positional lookup gets that block's empty
+    /// range right), or `insts.len()` for the last entry in this list.
+    /// Only blocks reachable from `entry` appear here, since `select()`
+    /// itself only walks `reverse_postorder(func)`.
+    pub block_starts: Vec<(Block, usize)>,
 }
 
 struct Selector<'a> {
@@ -617,7 +631,9 @@ pub fn select(func: &Function) -> SelectedFunction {
         fully_fusable_scaled_indices,
         pool: ConstantPool::default(),
     };
+    let mut block_starts = Vec::new();
     for block in forge_ir::dominance::reverse_postorder(func) {
+        block_starts.push((block, sel.insts.len()));
         for &v in &func.blocks[block.0 as usize].insts {
             let inst = &func.insts[v.0 as usize];
             sel.select_inst(v, inst);
@@ -632,6 +648,7 @@ pub fn select(func: &Function) -> SelectedFunction {
         synthetic_types: sel.synthetic_types,
         coalescing_hints,
         pool: sel.pool,
+        block_starts,
     }
 }
 
