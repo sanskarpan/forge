@@ -1102,3 +1102,78 @@ fn pop_reg_extended_register_sets_rex_b() {
     assert_eq!(a.code(), &[0x41, 0x5C]);
     assert_eq!(disassemble(a.code()), vec!["pop r12"]);
 }
+
+#[test]
+fn call_reg_low_register_needs_no_rex() {
+    let mut a = Assembler::new();
+    a.call_reg(PhysReg::Rax);
+    assert_eq!(a.code(), &[0xFF, 0xD0]);
+    assert_eq!(disassemble(a.code()), vec!["call rax"]);
+}
+
+#[test]
+fn call_reg_extended_register_sets_rex_b() {
+    let mut a = Assembler::new();
+    a.call_reg(PhysReg::R12);
+    assert_eq!(a.code(), &[0x41, 0xFF, 0xD4]);
+    assert_eq!(disassemble(a.code()), vec!["call r12"]);
+}
+
+/// Forward reference: the label isn't bound yet when call_rel32 runs,
+/// so it must record a Fixup (exactly like jmp's forward-jump branch)
+/// and patch it once bind() runs. Assertions are formulaic (derived
+/// from the actual buffer layout), not hand-typed magic numbers, per
+/// this crate's established jmp/jcc test style -- plus one concrete
+/// sanity value so the derivation itself can be double-checked by hand.
+#[test]
+fn call_rel32_forward_reference_patches_correctly() {
+    let mut a = Assembler::new();
+    let label = a.new_label();
+    a.call_rel32(label);
+    a.ret();
+    a.bind(label);
+    assert_eq!(a.code()[0], 0xE8);
+    let fixup_at = 1; // opcode byte is code[0]; the 4-byte rel32 starts at code[1]
+    let end_of_fixup = fixup_at + 4; // == 5, where `ret`'s single byte begins
+    let target_pos = a.code().len(); // bind() ran right after ret(), so this is the label's position
+    let expected_rel32 = (target_pos as isize - end_of_fixup as isize) as i32;
+    let actual_rel32 = i32::from_le_bytes(a.code()[fixup_at..end_of_fixup].try_into().unwrap());
+    assert_eq!(actual_rel32, expected_rel32);
+    // Sanity check on the derivation: call_rel32 emits 5 bytes, ret emits 1,
+    // so target_pos == 6 and end_of_fixup == 5, giving rel32 == 1.
+    assert_eq!(expected_rel32, 1);
+    // NOTE: verify this string empirically -- unlike every other disassembly
+    // string in this crate so far, this one depends on the disassembler's
+    // assumed instruction pointer for resolving the call's absolute target,
+    // which wasn't checked against a live compile when this plan was written.
+    assert_eq!(disassemble(a.code()), vec!["call 6", "ret"]);
+}
+
+/// Backward reference: the label is already bound when call_rel32 runs,
+/// so the distance is computed immediately with no Fixup involved at
+/// all -- mirrors jmp's backward-jump branch.
+#[test]
+fn call_rel32_backward_reference_computes_immediately() {
+    let mut a = Assembler::new();
+    let label = a.new_label();
+    a.bind(label);
+    a.ret();
+    a.call_rel32(label);
+    let fixup_at = a.code().len() - 4;
+    let end_of_fixup = fixup_at + 4;
+    let target_pos = 0isize; // label was bound at the very start of the buffer
+    let expected_rel32 = (target_pos - end_of_fixup as isize) as i32;
+    let actual_rel32 = i32::from_le_bytes(a.code()[fixup_at..end_of_fixup].try_into().unwrap());
+    assert_eq!(actual_rel32, expected_rel32);
+    // Sanity check: ret (1 byte) + call_rel32 (5 bytes) == 6 bytes total,
+    // so end_of_fixup == 6 and target_pos == 0, giving rel32 == -6.
+    assert_eq!(expected_rel32, -6);
+}
+
+#[test]
+fn ret_encodes_correctly() {
+    let mut a = Assembler::new();
+    a.ret();
+    assert_eq!(a.code(), &[0xC3]);
+    assert_eq!(disassemble(a.code()), vec!["ret"]);
+}

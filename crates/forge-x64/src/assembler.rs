@@ -955,6 +955,44 @@ impl Assembler {
         self.rex(false, 0, 0, dst.encoding());
         self.code.push(0x58 + (dst.encoding() & 7));
     }
+
+    /// `call target` -- FF /2, indirect through a register holding an
+    /// absolute address. This is how forge calls libm: mov_reg_imm the
+    /// function pointer into a register, then call_reg through it --
+    /// a direct rel32 call can't reliably reach an arbitrary libm
+    /// address (it may be outside +/-2GiB of the JIT buffer).
+    pub fn call_reg(&mut self, target: PhysReg) {
+        self.rex(false, 0, 0, target.encoding());
+        self.code.push(0xFF);
+        self.modrm_reg(2, target.encoding());
+    }
+
+    /// `call label` -- E8 rel32, direct call within the same code
+    /// buffer (e.g. a future JIT-to-JIT call). Unlike jmp/jcc there is
+    /// no rel8 short form for call at all -- this is unconditionally
+    /// the 5-byte form, whether the label is already bound (backward,
+    /// distance computed immediately) or not (forward, recorded as a
+    /// Fixup exactly like jmp's forward-jump branch).
+    pub fn call_rel32(&mut self, label: Label) {
+        if let Some(target_pos) = self.labels[label.0] {
+            let end = self.code.len() + 5;
+            let rel32 = target_pos as isize - end as isize;
+            self.code.push(0xE8);
+            self.code.extend_from_slice(&(rel32 as i32).to_le_bytes());
+        } else {
+            self.code.push(0xE8);
+            let at = self.code.len();
+            self.code.extend_from_slice(&[0, 0, 0, 0]);
+            self.fixups.push(Fixup { at, target: label });
+        }
+    }
+
+    /// `ret` -- C3, no operands. The rare imm16 stack-cleanup form
+    /// (cdecl-style callee cleanup) is not used by SysV or Win64 and
+    /// isn't built.
+    pub fn ret(&mut self) {
+        self.code.push(0xC3);
+    }
 }
 
 #[cfg(test)]
