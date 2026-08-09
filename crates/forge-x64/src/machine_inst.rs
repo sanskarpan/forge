@@ -361,8 +361,12 @@ impl<'a> Selector<'a> {
                 self.insts.push(MachineInst::FloatAdd { dst, lhs: mul_tmp, rhs: *c });
             }
 
-            // Remaining variants are filled in by later tasks in this plan.
-            _ => todo!("filled in by Tasks 4-6 of the Phase 7a plan"),
+            Inst::Call { .. } => unimplemented!("libm call lowering ships in Phase 7e"),
+            Inst::Phi { .. } => {
+                // Deliberately emits nothing -- see the design doc's "φ
+                // handling" section. This Inst's destination Value is
+                // resolved entirely by Phase 8's SSA deconstruction.
+            }
         }
     }
 
@@ -1302,5 +1306,93 @@ mod tests {
             }
         );
         assert_eq!(selected.synthetic_types.get(&mul_tmp), Some(&Ty::F64));
+    }
+
+    /// A diamond CFG (entry branches to then/else, both jump to merge,
+    /// merge has a phi) -- confirms Phi produces NO MachineInst, per the
+    /// design doc's explicit deferral of phi resolution to Phase 8.
+    #[test]
+    fn select_emits_nothing_for_phi() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        let then_b = b.create_block();
+        let else_b = b.create_block();
+        let merge = b.create_block();
+        b.add_pred(then_b, entry);
+        b.add_pred(else_b, entry);
+        b.seal_block(entry);
+        b.seal_block(then_b);
+        b.seal_block(else_b);
+        b.add_pred(merge, then_b);
+        b.add_pred(merge, else_b);
+        b.seal_block(merge);
+
+        let cond = b.emit(entry, Inst::ConstBool(true), Ty::Bool, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+            cond,
+            then_: then_b,
+            else_: else_b,
+        });
+        let t = b.emit(then_b, Inst::ConstI64(1), Ty::I64, dummy_span());
+        b.f.blocks[then_b.0 as usize].term = Some(Terminator::Jump(merge));
+        let e = b.emit(else_b, Inst::ConstI64(0), Ty::I64, dummy_span());
+        b.f.blocks[else_b.0 as usize].term = Some(Terminator::Jump(merge));
+        let phi = b.emit(
+            merge,
+            Inst::Phi {
+                incoming: smallvec::smallvec![(then_b, t), (else_b, e)],
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        b.f.blocks[merge.0 as usize].term = Some(Terminator::Return(phi));
+
+        let selected = select(&b.f);
+
+        // No MachineInst variant anywhere in the output should be a
+        // stand-in "phi" op -- the only thing referencing `phi`'s Value at
+        // all is the final Return.
+        assert_eq!(
+            selected.insts.last(),
+            Some(&MachineInst::Return { value: phi })
+        );
+        let phi_producing_insts: Vec<_> = selected
+            .insts
+            .iter()
+            .filter(|i| matches!(i, MachineInst::LoadImmI64 { dst, .. } if *dst == phi))
+            .collect();
+        assert!(
+            phi_producing_insts.is_empty(),
+            "Phi's destination Value must not be produced by any MachineInst in Phase 7a"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Phase 7e")]
+    fn select_panics_on_call_with_a_clear_deferral_message() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let r = b.emit(
+            entry,
+            Inst::Call {
+                func: forge_ir::LibFunc::Sin,
+                args: smallvec::smallvec![x],
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        select(&b.f); // must panic
     }
 }
