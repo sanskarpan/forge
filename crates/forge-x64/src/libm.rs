@@ -47,11 +47,21 @@ mod tests {
     /// calls it -- this is what the future call-emission step effectively
     /// does at runtime via mov_reg_imm+call_reg, just done here in-process
     /// instead of through JIT-generated machine code.
+    ///
+    /// # Safety
+    /// `addr` must be a real address returned by `libm_address` for a
+    /// unary `LibFunc`; an arbitrary or stale address, or one resolved for
+    /// the binary `Pow` instead, is UB.
     unsafe fn call_unary(addr: i64, x: f64) -> f64 {
         let f: unsafe extern "C" fn(f64) -> f64 = std::mem::transmute(addr as usize);
         f(x)
     }
 
+    /// Binary analog of `call_unary`, for `LibFunc::Pow`.
+    ///
+    /// # Safety
+    /// `addr` must be a real address returned by `libm_address(LibFunc::Pow)`;
+    /// an arbitrary or stale address, or one resolved for a unary function, is UB.
     unsafe fn call_binary(addr: i64, x: f64, y: f64) -> f64 {
         let f: unsafe extern "C" fn(f64, f64) -> f64 = std::mem::transmute(addr as usize);
         f(x, y)
