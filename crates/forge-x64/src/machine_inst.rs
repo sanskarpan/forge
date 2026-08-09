@@ -89,6 +89,14 @@ pub enum MachineInst {
         rhs: Value,
     },
 
+    Lea {
+        dst: Value,
+        base: Value,
+        index: Value,
+        scale: u8,
+        disp: i32,
+    },
+
     // Float arithmetic -- destructive (dst must end up == lhs's location)
     FloatAdd {
         dst: Value,
@@ -213,6 +221,7 @@ struct Selector<'a> {
     insts: Vec<MachineInst>,
     synthetic_types: HashMap<Value, Ty>,
     next_value: u32,
+    fully_fusable_scaled_indices: std::collections::HashSet<Value>,
 }
 
 impl<'a> Selector<'a> {
@@ -256,7 +265,12 @@ impl<'a> Selector<'a> {
 
             Inst::Add(a, b) => match self.ty_of(*a) {
                 Ty::F64 => self.insts.push(MachineInst::FloatAdd { dst, lhs: *a, rhs: *b }),
-                Ty::I64 => self.insts.push(MachineInst::IntAdd { dst, lhs: *a, rhs: *b }),
+                Ty::I64 => match find_fusable_add(self.func, *a, *b) {
+                    Some((base, index, scale)) => {
+                        self.insts.push(MachineInst::Lea { dst, base, index, scale, disp: 0 })
+                    }
+                    None => self.insts.push(MachineInst::IntAdd { dst, lhs: *a, rhs: *b }),
+                },
                 Ty::Bool => unreachable!("Add never applies to Bool"),
             },
             Inst::Sub(a, b) => match self.ty_of(*a) {
@@ -266,7 +280,13 @@ impl<'a> Selector<'a> {
             },
             Inst::Mul(a, b) => match self.ty_of(*a) {
                 Ty::F64 => self.insts.push(MachineInst::FloatMul { dst, lhs: *a, rhs: *b }),
-                Ty::I64 => self.insts.push(MachineInst::IntMul { dst, lhs: *a, rhs: *b }),
+                Ty::I64 => {
+                    if !self.fully_fusable_scaled_indices.contains(&dst) {
+                        self.insts.push(MachineInst::IntMul { dst, lhs: *a, rhs: *b });
+                    }
+                    // else: fully subsumed by lea fusion, nothing to emit --
+                    // same suppression discipline as Inst::Phi.
+                }
                 Ty::Bool => unreachable!("Mul never applies to Bool"),
             },
             Inst::Div(a, b) => match self.ty_of(*a) {
@@ -298,7 +318,12 @@ impl<'a> Selector<'a> {
             Inst::Or(a, b) => self.insts.push(MachineInst::Or { dst, lhs: *a, rhs: *b }),
             Inst::Xor(a, b) => self.insts.push(MachineInst::Xor { dst, lhs: *a, rhs: *b }),
             Inst::Not(a) => self.insts.push(MachineInst::Not { dst, src: *a }),
-            Inst::Shl(a, b) => self.insts.push(MachineInst::Shl { dst, lhs: *a, rhs: *b }),
+            Inst::Shl(a, b) => {
+                if !self.fully_fusable_scaled_indices.contains(&dst) {
+                    self.insts.push(MachineInst::Shl { dst, lhs: *a, rhs: *b });
+                }
+                // else: fully subsumed by lea fusion, nothing to emit.
+            }
             Inst::Shr(a, b) => self.insts.push(MachineInst::Shr { dst, lhs: *a, rhs: *b }),
             Inst::Sar(a, b) => self.insts.push(MachineInst::Sar { dst, lhs: *a, rhs: *b }),
 
@@ -402,12 +427,126 @@ impl<'a> Selector<'a> {
     }
 }
 
+/// Free function (not a Selector method) so it has a single call site
+/// usable both by the whole-function suppression pre-pass (which runs
+/// BEFORE any Selector exists) and by Selector's Add arm during the main
+/// walk -- the suppression decision and the fusion decision MUST agree
+/// about which operand (if any) is "the fused one," so there is exactly
+/// one implementation of this shape check, not two that could drift out
+/// of sync.
+///
+/// Checks whether `candidate` is a real IR value (an index into
+/// func.insts -- synthetic values are never Mul/Shl-defined and always
+/// return None here) defined by a "scaled index" shape: `Mul(index,
+/// ConstI64(k))`/`Mul(ConstI64(k), index)` for k in {2,4,8}, OR
+/// `Shl(index, ConstI64(s))` for s in {1,2,3} (equivalent to k = 2^s --
+/// strength-reduction rewrites the former into the latter for realistic
+/// optimized input, so both are live, real shapes on different execution
+/// tiers). If matched, returns (base, index, scale) with `base` set to
+/// the OTHER argument passed in.
+fn match_scaled_index(
+    func: &Function,
+    candidate: Value,
+    other: Value,
+) -> Option<(Value, Value, u8)> {
+    if (candidate.0 as usize) >= func.insts.len() {
+        return None;
+    }
+    let const_scale = |v: Value| -> Option<u8> {
+        if (v.0 as usize) >= func.insts.len() {
+            return None;
+        }
+        match &func.insts[v.0 as usize] {
+            Inst::ConstI64(k) if matches!(k, 2 | 4 | 8) => Some(*k as u8),
+            _ => None,
+        }
+    };
+    match &func.insts[candidate.0 as usize] {
+        Inst::Mul(m_a, m_b) => {
+            if let Some(k) = const_scale(*m_b) {
+                return Some((other, *m_a, k));
+            }
+            if let Some(k) = const_scale(*m_a) {
+                return Some((other, *m_b, k));
+            }
+            None
+        }
+        Inst::Shl(index, shift_amount) => {
+            if (shift_amount.0 as usize) >= func.insts.len() {
+                return None;
+            }
+            match &func.insts[shift_amount.0 as usize] {
+                Inst::ConstI64(s) if matches!(s, 1..=3) => Some((other, *index, 1u8 << s)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Tries both operand orderings of an Add(a, b) for the scaled-index
+/// shape, preferring `a` as the fused operand if both individually
+/// qualify (Add(Mul(x,4), Shl(y,3)) picks x/4 as index, leaving y's Shl
+/// as an ordinary Value feeding the Lea's `base` -- NOT itself
+/// fused/suppressed).
+fn find_fusable_add(func: &Function, a: Value, b: Value) -> Option<(Value, Value, u8)> {
+    match_scaled_index(func, a, b).or_else(|| match_scaled_index(func, b, a))
+}
+
+/// Run once, before the main RPO walk, over the WHOLE function. Determines
+/// which real IR Values, if any, are Mul/Shl results fully subsumed by lea
+/// fusion (every use is a fusable Add pattern, none escape to any other
+/// consumer) and therefore safe to suppress the same way Phi is.
+fn find_fully_fusable_scaled_indices(func: &Function) -> std::collections::HashSet<Value> {
+    let mut total_uses: HashMap<Value, u32> = HashMap::new();
+    for inst in &func.insts {
+        for used in forge_ir::uses_of(inst) {
+            *total_uses.entry(used).or_insert(0) += 1;
+        }
+    }
+    // uses_of only covers Inst, never Terminator -- a directly-returned or
+    // branched-on Value must still count as used, or it would be wrongly
+    // suppressed even though the terminator needs its real computed value.
+    for block in &func.blocks {
+        match &block.term {
+            Some(Terminator::Return(v)) => *total_uses.entry(*v).or_insert(0) += 1,
+            Some(Terminator::Branch { cond, .. }) => *total_uses.entry(*cond).or_insert(0) += 1,
+            _ => {}
+        }
+    }
+
+    // NOTE: this must key on the OUTER Add's own operand (`a` or `b` --
+    // one of which IS the Mul/Shl's defining Value) that matched, NOT on
+    // match_scaled_index's returned `index` (which is the raw scaled
+    // register INSIDE the matched Mul/Shl -- a completely different
+    // Value). Keying on the wrong Value here silently defeats suppression
+    // entirely.
+    let mut fusable_uses: HashMap<Value, u32> = HashMap::new();
+    for inst in &func.insts {
+        if let Inst::Add(a, b) = inst {
+            if match_scaled_index(func, *a, *b).is_some() {
+                *fusable_uses.entry(*a).or_insert(0) += 1;
+            } else if match_scaled_index(func, *b, *a).is_some() {
+                *fusable_uses.entry(*b).or_insert(0) += 1;
+            }
+        }
+    }
+
+    total_uses
+        .into_iter()
+        .filter(|(v, total)| fusable_uses.get(v).copied().unwrap_or(0) == *total)
+        .map(|(v, _)| v)
+        .collect()
+}
+
 pub fn select(func: &Function) -> SelectedFunction {
+    let fully_fusable_scaled_indices = find_fully_fusable_scaled_indices(func);
     let mut sel = Selector {
         func,
         insts: Vec::new(),
         synthetic_types: HashMap::new(),
         next_value: func.insts.len() as u32,
+        fully_fusable_scaled_indices,
     };
     for block in forge_ir::dominance::reverse_postorder(func) {
         for &v in &func.blocks[block.0 as usize].insts {
@@ -1610,5 +1749,473 @@ mod tests {
             .insts
             .iter()
             .any(|i| matches!(i, MachineInst::Return { .. })));
+    }
+
+    #[test]
+    fn lea_synthesis_mul_shape_operand_order_a() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let base_v = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let idx = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let four = b.emit(entry, Inst::ConstI64(4), Ty::I64, dummy_span());
+        let mul = b.emit(entry, Inst::Mul(idx, four), Ty::I64, dummy_span());
+        let add = b.emit(entry, Inst::Add(mul, base_v), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(add));
+
+        let selected = select(&b.f);
+
+        assert_eq!(
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea {
+                dst: add,
+                base: base_v,
+                index: idx,
+                scale: 4,
+                disp: 0
+            }
+        );
+        // No standalone IntMul for `mul` -- it was fully subsumed by fusion.
+        assert!(!selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::IntMul { dst, .. } if *dst == mul)));
+    }
+
+    #[test]
+    fn lea_synthesis_mul_shape_operand_order_b() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let base_v = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let idx = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let four = b.emit(entry, Inst::ConstI64(4), Ty::I64, dummy_span());
+        let mul = b.emit(entry, Inst::Mul(idx, four), Ty::I64, dummy_span());
+        let add = b.emit(entry, Inst::Add(base_v, mul), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(add));
+
+        let selected = select(&b.f);
+
+        assert_eq!(
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea {
+                dst: add,
+                base: base_v,
+                index: idx,
+                scale: 4,
+                disp: 0
+            }
+        );
+        assert!(!selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::IntMul { dst, .. } if *dst == mul)));
+    }
+
+    #[test]
+    fn lea_synthesis_shl_shape() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let base_v = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let idx = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let two = b.emit(entry, Inst::ConstI64(2), Ty::I64, dummy_span());
+        let shl = b.emit(entry, Inst::Shl(idx, two), Ty::I64, dummy_span());
+        let add = b.emit(entry, Inst::Add(shl, base_v), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(add));
+
+        let selected = select(&b.f);
+
+        assert_eq!(
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea {
+                dst: add,
+                base: base_v,
+                index: idx,
+                scale: 4,
+                disp: 0
+            }
+        );
+        assert!(!selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::Shl { dst, .. } if *dst == shl)));
+    }
+
+    #[test]
+    fn lea_synthesis_rejects_non_pow2_multiplier() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let base_v = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let idx = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let three = b.emit(entry, Inst::ConstI64(3), Ty::I64, dummy_span());
+        let mul = b.emit(entry, Inst::Mul(idx, three), Ty::I64, dummy_span());
+        let add = b.emit(entry, Inst::Add(mul, base_v), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(add));
+
+        let selected = select(&b.f);
+
+        assert!(!selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::Lea { .. })));
+        assert_eq!(
+            selected.insts[3],
+            MachineInst::IntMul {
+                dst: mul,
+                lhs: idx,
+                rhs: three
+            }
+        );
+        assert_eq!(
+            selected.insts[4],
+            MachineInst::IntAdd {
+                dst: add,
+                lhs: mul,
+                rhs: base_v
+            }
+        );
+    }
+
+    #[test]
+    fn lea_synthesis_rejects_non_constant_multiplier() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let base_v = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let idx = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let other = b.emit(
+            entry,
+            Inst::Param {
+                index: 2,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let mul = b.emit(entry, Inst::Mul(idx, other), Ty::I64, dummy_span());
+        let add = b.emit(entry, Inst::Add(mul, base_v), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(add));
+
+        let selected = select(&b.f);
+
+        assert!(!selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::Lea { .. })));
+    }
+
+    #[test]
+    fn lea_synthesis_rejects_out_of_range_shift() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let base_v = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let idx = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let four_shift = b.emit(entry, Inst::ConstI64(4), Ty::I64, dummy_span());
+        let shl = b.emit(entry, Inst::Shl(idx, four_shift), Ty::I64, dummy_span());
+        let add = b.emit(entry, Inst::Add(shl, base_v), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(add));
+
+        let selected = select(&b.f);
+
+        assert!(!selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::Lea { .. })));
+        assert_eq!(
+            selected.insts[3],
+            MachineInst::Shl {
+                dst: shl,
+                lhs: idx,
+                rhs: four_shift
+            }
+        );
+    }
+
+    #[test]
+    fn lea_synthesis_shared_consumer_both_fuse_and_suppress() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let idx = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let c1 = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let c2 = b.emit(
+            entry,
+            Inst::Param {
+                index: 2,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let two = b.emit(entry, Inst::ConstI64(2), Ty::I64, dummy_span());
+        let shl = b.emit(entry, Inst::Shl(idx, two), Ty::I64, dummy_span());
+        let add1 = b.emit(entry, Inst::Add(shl, c1), Ty::I64, dummy_span());
+        let add2 = b.emit(entry, Inst::Add(shl, c2), Ty::I64, dummy_span());
+        let sum = b.emit(entry, Inst::Add(add1, add2), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(sum));
+
+        let selected = select(&b.f);
+
+        let leas: Vec<_> = selected
+            .insts
+            .iter()
+            .filter(|i| matches!(i, MachineInst::Lea { .. }))
+            .collect();
+        assert_eq!(leas.len(), 2);
+        assert!(!selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::Shl { dst, .. } if *dst == shl)));
+    }
+
+    #[test]
+    fn lea_synthesis_escaping_use_prevents_suppression() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let base_v = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let idx = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let four = b.emit(entry, Inst::ConstI64(4), Ty::I64, dummy_span());
+        let mul = b.emit(entry, Inst::Mul(idx, four), Ty::I64, dummy_span());
+        let _add = b.emit(entry, Inst::Add(mul, base_v), Ty::I64, dummy_span());
+        // `mul` is ALSO directly returned -- an escaping use, so it must
+        // NOT be suppressed even though the Add fuses it.
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(mul));
+
+        let selected = select(&b.f);
+
+        assert!(selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::Lea { .. })));
+        assert!(selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::IntMul { dst, .. } if *dst == mul)));
+    }
+
+    #[test]
+    fn lea_synthesis_mixed_shape_both_operands_fusable_prefers_a() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let y = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let four = b.emit(entry, Inst::ConstI64(4), Ty::I64, dummy_span());
+        let three_shift = b.emit(entry, Inst::ConstI64(3), Ty::I64, dummy_span());
+        let mul_x = b.emit(entry, Inst::Mul(x, four), Ty::I64, dummy_span());
+        let shl_y = b.emit(entry, Inst::Shl(y, three_shift), Ty::I64, dummy_span());
+        let add = b.emit(entry, Inst::Add(mul_x, shl_y), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(add));
+
+        let selected = select(&b.f);
+
+        // mul_x (the `a` operand) is preferred as the fused index; shl_y
+        // (the `b` operand) remains an ordinary Value used as `base`, and
+        // gets its own independent, non-suppressed computation.
+        assert_eq!(
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea {
+                dst: add,
+                base: shl_y,
+                index: x,
+                scale: 4,
+                disp: 0
+            }
+        );
+        assert!(selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::Shl { dst, .. } if *dst == shl_y)));
+        assert!(!selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::IntMul { dst, .. } if *dst == mul_x)));
+    }
+
+    #[test]
+    fn lea_synthesis_self_referential_add_never_suppresses() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let idx = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let four = b.emit(entry, Inst::ConstI64(4), Ty::I64, dummy_span());
+        let mul = b.emit(entry, Inst::Mul(idx, four), Ty::I64, dummy_span());
+        let add = b.emit(entry, Inst::Add(mul, mul), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(add));
+
+        let selected = select(&b.f);
+
+        assert_eq!(
+            selected.insts[selected.insts.len() - 2],
+            MachineInst::Lea {
+                dst: add,
+                base: mul,
+                index: idx,
+                scale: 4,
+                disp: 0
+            }
+        );
+        // mul's own register genuinely still needs to exist (it's the
+        // Lea's `base` operand too) -- must NOT be suppressed.
+        assert!(selected
+            .insts
+            .iter()
+            .any(|i| matches!(i, MachineInst::IntMul { dst, .. } if *dst == mul)));
     }
 }
