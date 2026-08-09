@@ -939,6 +939,24 @@ impl RoundMode {
     }
 }
 
+impl Assembler {
+    /// `push src` -- 50+r, no ModRM (register encoded in the opcode's
+    /// low 3 bits, the same shape mov_reg_imm's opcode byte uses). No
+    /// REX.W -- push/pop default to 64-bit operand size in long mode;
+    /// REX.W has no defined effect on this opcode. REX.B only if src
+    /// is r8-r15.
+    pub fn push_reg(&mut self, src: PhysReg) {
+        self.rex(false, 0, 0, src.encoding());
+        self.code.push(0x50 + (src.encoding() & 7));
+    }
+
+    /// `pop dst` -- 58+r, the mirror image of push_reg.
+    pub fn pop_reg(&mut self, dst: PhysReg) {
+        self.rex(false, 0, 0, dst.encoding());
+        self.code.push(0x58 + (dst.encoding() & 7));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

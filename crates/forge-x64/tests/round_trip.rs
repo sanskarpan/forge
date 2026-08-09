@@ -1070,3 +1070,35 @@ fn roundsd_truncate() {
     // NOTE: verify this string empirically, same caveat as roundsd_ceil.
     assert_eq!(disassemble(a.code()), vec!["roundsd xmm0,xmm1,0Bh"]);
 }
+
+#[test]
+fn push_reg_low_register_needs_no_rex() {
+    let mut a = Assembler::new();
+    a.push_reg(PhysReg::Rax);
+    assert_eq!(a.code(), &[0x50]);
+    assert_eq!(disassemble(a.code()), vec!["push rax"]);
+}
+
+#[test]
+fn push_reg_extended_register_sets_rex_b() {
+    let mut a = Assembler::new();
+    a.push_reg(PhysReg::R12);
+    assert_eq!(a.code(), &[0x41, 0x54]);
+    assert_eq!(disassemble(a.code()), vec!["push r12"]);
+}
+
+#[test]
+fn pop_reg_low_register_needs_no_rex() {
+    let mut a = Assembler::new();
+    a.pop_reg(PhysReg::Rax);
+    assert_eq!(a.code(), &[0x58]);
+    assert_eq!(disassemble(a.code()), vec!["pop rax"]);
+}
+
+#[test]
+fn pop_reg_extended_register_sets_rex_b() {
+    let mut a = Assembler::new();
+    a.pop_reg(PhysReg::R12);
+    assert_eq!(a.code(), &[0x41, 0x5C]);
+    assert_eq!(disassemble(a.code()), vec!["pop r12"]);
+}
