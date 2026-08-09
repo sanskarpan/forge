@@ -1177,3 +1177,99 @@ fn ret_encodes_correctly() {
     assert_eq!(a.code(), &[0xC3]);
     assert_eq!(disassemble(a.code()), vec!["ret"]);
 }
+
+#[test]
+fn lea_reg_riprel_forward_reference_patches_correctly() {
+    let mut a = Assembler::new();
+    let label = a.new_label();
+    a.lea_reg_riprel(PhysReg::Rax, label);
+    a.ret();
+    a.bind(label);
+    assert_eq!(&a.code()[0..3], &[0x48, 0x8D, 0x05]);
+    let fixup_at = 3;
+    let end_of_fixup = fixup_at + 4; // == 7, where `ret`'s single byte begins
+    let target_pos = a.code().len(); // bind() ran right after ret()
+    let expected_rel32 = (target_pos as isize - end_of_fixup as isize) as i32;
+    let actual_rel32 = i32::from_le_bytes(a.code()[fixup_at..end_of_fixup].try_into().unwrap());
+    assert_eq!(actual_rel32, expected_rel32);
+    // Sanity check: lea_reg_riprel emits 7 bytes, ret emits 1, so
+    // target_pos == 8 and end_of_fixup == 7, giving rel32 == 1.
+    assert_eq!(expected_rel32, 1);
+    // Empirically verified against a live iced-x86 disassembly: NasmFormatter
+    // renders a RIP-relative operand as "[rel <resolved absolute target>]",
+    // not as a relative offset like "[rip+1]" -- the plan's guess was wrong
+    // about the string's form (though the byte-level and formulaic-offset
+    // assertions above, which are what actually prove the encoding is
+    // correct, needed no correction). Target here is 8, matching
+    // `target_pos` above.
+    assert_eq!(disassemble(a.code()), vec!["lea rax,[rel 8]", "ret"]);
+}
+
+/// Proves REX.R (not REX.B) is what threads through for an extended
+/// destination register -- the exact risk the design doc calls out:
+/// mod=00/rm=101's rm field is a fixed CPU bit pattern, not a real
+/// register encoding, so REX.B must never be set by this method
+/// regardless of which register `dst` is.
+#[test]
+fn lea_reg_riprel_extended_register_sets_only_rex_r_not_rex_b() {
+    let mut a = Assembler::new();
+    let label = a.new_label();
+    a.lea_reg_riprel(PhysReg::R9, label);
+    a.ret();
+    a.bind(label);
+    // 0x4C == 0x40 | REX.W(0x08) | REX.R(0x04) -- REX.B (bit 0) is NOT set.
+    assert_eq!(&a.code()[0..3], &[0x4C, 0x8D, 0x0D]);
+    let fixup_at = 3;
+    let end_of_fixup = fixup_at + 4;
+    let target_pos = a.code().len();
+    let expected_rel32 = (target_pos as isize - end_of_fixup as isize) as i32;
+    let actual_rel32 = i32::from_le_bytes(a.code()[fixup_at..end_of_fixup].try_into().unwrap());
+    assert_eq!(actual_rel32, expected_rel32);
+    assert_eq!(expected_rel32, 1);
+    // Empirically verified, same "[rel <target>]" form as the test above.
+    assert_eq!(disassemble(a.code()), vec!["lea r9,[rel 8]", "ret"]);
+}
+
+#[test]
+fn movsd_reg_riprel_forward_reference_patches_correctly() {
+    let mut a = Assembler::new();
+    let label = a.new_label();
+    a.movsd_reg_riprel(PhysReg::Xmm0, label);
+    a.ret();
+    a.bind(label);
+    assert_eq!(&a.code()[0..4], &[0xF2, 0x0F, 0x10, 0x05]);
+    let fixup_at = 4;
+    let end_of_fixup = fixup_at + 4; // == 8, where `ret`'s single byte begins
+    let target_pos = a.code().len();
+    let expected_rel32 = (target_pos as isize - end_of_fixup as isize) as i32;
+    let actual_rel32 = i32::from_le_bytes(a.code()[fixup_at..end_of_fixup].try_into().unwrap());
+    assert_eq!(actual_rel32, expected_rel32);
+    // Sanity check: movsd_reg_riprel emits 8 bytes, ret emits 1, so
+    // target_pos == 9 and end_of_fixup == 8, giving rel32 == 1.
+    assert_eq!(expected_rel32, 1);
+    // Empirically verified, same "[rel <target>]" form as lea_reg_riprel's.
+    // Target here is 9, matching `target_pos` above.
+    assert_eq!(disassemble(a.code()), vec!["movsd xmm0,[rel 9]", "ret"]);
+}
+
+/// Backward reference: the label is already bound when
+/// movsd_reg_riprel runs, so riprel_fixup's immediate branch computes
+/// the distance directly with no Fixup involved -- mirrors
+/// call_rel32_backward_reference_computes_immediately.
+#[test]
+fn movsd_reg_riprel_backward_reference_computes_immediately() {
+    let mut a = Assembler::new();
+    let label = a.new_label();
+    a.bind(label);
+    a.ret();
+    a.movsd_reg_riprel(PhysReg::Xmm0, label);
+    let fixup_at = a.code().len() - 4;
+    let end_of_fixup = fixup_at + 4;
+    let target_pos = 0isize; // label was bound at the very start of the buffer
+    let expected_rel32 = (target_pos - end_of_fixup as isize) as i32;
+    let actual_rel32 = i32::from_le_bytes(a.code()[fixup_at..end_of_fixup].try_into().unwrap());
+    assert_eq!(actual_rel32, expected_rel32);
+    // Sanity check: ret (1 byte) + movsd_reg_riprel (8 bytes) == 9 bytes
+    // total, so end_of_fixup == 9 and target_pos == 0, giving rel32 == -9.
+    assert_eq!(expected_rel32, -9);
+}

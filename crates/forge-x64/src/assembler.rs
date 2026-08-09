@@ -995,6 +995,58 @@ impl Assembler {
     }
 }
 
+impl Assembler {
+    /// `lea dst, [rip + disp32]` where disp32 resolves label -- REX.W +
+    /// 8D /r with a fixed mod=00/rm=101 ModRM byte. REX.B is
+    /// deliberately never set here (rex() is called with rm=0) since
+    /// mod=00/rm=101 is not a real register's encoding -- it's the
+    /// CPU's dedicated RIP-relative bit pattern in 64-bit mode, and
+    /// setting REX.B would be meaningless/undefined for it. Reuses
+    /// lea_reg_mem's REX.W=true and opcode 0x8D.
+    pub fn lea_reg_riprel(&mut self, dst: PhysReg, label: Label) {
+        self.rex(true, dst.encoding(), 0, 0);
+        self.code.push(0x8D);
+        self.code.push(0b00_000_101 | ((dst.encoding() & 7) << 3));
+        self.riprel_fixup(label);
+    }
+
+    /// `movsd dst, [rip + disp32]` -- F2 0F 10 /r with the same
+    /// mod=00/rm=101 RIP-relative ModRM shape as lea_reg_riprel.
+    /// Reuses movsd_reg_reg's F2 prefix, REX.W=false, and opcode 0x10.
+    pub fn movsd_reg_riprel(&mut self, dst: PhysReg, label: Label) {
+        self.code.push(0xF2);
+        self.rex(false, dst.encoding(), 0, 0);
+        self.code.push(0x0F);
+        self.code.push(0x10);
+        self.code.push(0b00_000_101 | ((dst.encoding() & 7) << 3));
+        self.riprel_fixup(label);
+    }
+
+    /// Shared by both RIP-relative methods above: emits the trailing
+    /// disp32 (immediately, if `label` is already bound -- an unusual
+    /// case for a constant pool placed after the code, but handled for
+    /// correctness/symmetry with jmp/call_rel32) or a 4-byte
+    /// placeholder plus a Fixup (the expected case, since Phase 7's
+    /// constant pool is placed after the code it's referenced from).
+    /// Correct ONLY when disp32 is the last bytes of the instruction --
+    /// true for both current callers, since neither has a trailing
+    /// immediate after its memory operand. A future RIP-relative
+    /// consumer WITH a trailing immediate (e.g. an imm32 ALU op reading
+    /// a RIP-relative operand) would need a different fixup scheme;
+    /// document this constraint rather than generalizing prematurely.
+    fn riprel_fixup(&mut self, label: Label) {
+        if let Some(target_pos) = self.labels[label.0] {
+            let end = self.code.len() + 4;
+            let rel32 = target_pos as isize - end as isize;
+            self.code.extend_from_slice(&(rel32 as i32).to_le_bytes());
+        } else {
+            let at = self.code.len();
+            self.code.extend_from_slice(&[0, 0, 0, 0]);
+            self.fixups.push(Fixup { at, target: label });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
