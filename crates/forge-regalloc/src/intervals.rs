@@ -20,13 +20,12 @@ use std::collections::HashMap;
 /// order (see `merge_phi_intervals`). Two-address hints are copied from
 /// `SelectedFunction::coalescing_hints` afterwards, and deliberately do NOT
 /// overwrite a φ-group hint already set (see `populate_two_address_hints`).
-/// NOTHING populates `Interval::fixed` -- see `populate_fixed_registers`'
+/// NOTHING populates `Interval::fixed` -- see `validate_param_abi_capacity`'s
 /// own doc comment and the design doc's corrected "Fixed registers" section
 /// for why `Param`/`IntDiv`/`IntRem` are emission-time copies rather than
 /// whole-lifetime register pins. `rhs` (the divisor) is NOT handled here
 /// either -- it's the one genuinely allocation-time idiv constraint,
-/// exposed separately via `excluded_registers` (Task 6; not yet implemented
-/// as of this commit).
+/// exposed separately via `excluded_registers`, below.
 ///
 /// The returned `Vec` is sorted by `(start, end, value)`: construction is
 /// `HashMap`-backed, whose iteration order is not stable across runs on
@@ -125,7 +124,7 @@ pub fn build_intervals(func: &Function, selected: &SelectedFunction) -> Vec<Inte
 
     merge_phi_intervals(func, &mut intervals);
     populate_two_address_hints(selected, &mut intervals);
-    populate_fixed_registers(func);
+    validate_param_abi_capacity(func);
 
     let mut result: Vec<Interval> = intervals.into_values().collect();
     result.sort_by_key(|iv| (iv.start, iv.end, iv.value.0));
@@ -393,7 +392,7 @@ fn populate_two_address_hints(
 /// register directly from the MachineInst itself (no Interval data
 /// needed) and inserts a copy into the value's real assigned location if
 /// they don't already coincide.
-fn populate_fixed_registers(func: &Function) {
+fn validate_param_abi_capacity(func: &Function) {
     let mut gpr_seen = 0usize;
     let mut xmm_seen = 0usize;
     for &(_, ty) in &func.params {
