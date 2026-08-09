@@ -1,7 +1,7 @@
 # Design: forge Phase 7b — Two-Address Coalescing Hints & `lea` Synthesis
 
 **Status:** Approved for planning
-**Scope:** The second sub-slice of CHECKLIST.md Phase 7 — two of its bullets: "Two-address fixup" (as coalescing-hint *generation*, not copy insertion — copy insertion is a post-Phase-8 emission-time decision, per 7a's design) and "`lea` synthesis for `a + b*k + c`" (recognizing an `Add(Mul(b, k), c)`-shaped IR tree, `k ∈ {2,4,8}`, and selecting a single non-destructive `lea` instead of two destructive `IntMul`+`IntAdd` instructions).
+**Scope:** The second sub-slice of CHECKLIST.md Phase 7 — two of its bullets: "Two-address fixup" (as coalescing-hint *generation*, not copy insertion — copy insertion is a post-Phase-8 emission-time decision, per 7a's design) and "`lea` synthesis for `a + b*k + c`" (recognizing an `Add(scaled-index, c)`-shaped IR tree — where "scaled-index" is EITHER `Mul(b, ConstI64(k))` for `k ∈ {2,4,8}` OR `Shl(b, ConstI64(s))` for `s ∈ {1,2,3}` — see "Why both `Mul` and `Shl` must be recognized" below — and selecting a single non-destructive `lea` instead of two destructive instructions).
 **Out of scope (deferred):** "Addressing-mode folding: `Load{base, offset}` folds into the memory operand of the consuming instruction" — `forge_ir::Inst` has no `Load`/`Store` variant at all (confirmed in 7a's research, and forge's language has no arrays/pointers/memory operations of any kind); this bullet describes an IR construct that doesn't exist in this language, so there is nothing to fold today. It stays open on CHECKLIST.md with a note explaining why, to be revisited if/when the language grows memory operations. "`Select` → `cmov`/blend" is **also explicitly deferred — to Phase 7f, a new named slice** (not implemented here) — see "Why Select→cmov is deferred" below.
 
 ## Why `Select`→`cmov` is deferred to Phase 7f
@@ -16,24 +16,28 @@ Both pieces live in `crates/forge-x64/src/machine_inst.rs`, extending `Selector`
 
 **Scope note on CHECKLIST's literal `a + b*k + c` wording**: `forge_ir::Inst::Add` is strictly binary, so a genuine three-additive-term chain (`Add(Add(a, Mul(b,k)), c)` or similar, spanning two real `Add` instructions) is NOT recognized by this design — only the two-term shape `Add(Mul(b,k), c)` is. This is a reasonable, explicit scope reduction (the two-term case is both the common one and the one CHECKLIST's own bullet title emphasizes — "`lea` synthesis for `a + b*k + c`" names the general x86 addressing-mode shape `lea` supports, not a specific requirement that every use of it be recognized), not an oversight.
 
-**`lea` synthesis** extends `select_inst`'s existing `Inst::Add` arm (7a's `Ty`-dispatching match). Before falling through to the existing `IntAdd`/`FloatAdd` dispatch, the `I64` case is checked against two tree shapes: `Add(Mul(b, ConstI64(k)), c)` and `Add(c, Mul(b, ConstI64(k)))`, for `k ∈ {2, 4, 8}` (`lea`'s only legal SIB scale values — `k=1` is deliberately excluded, since scale=1 buys nothing over a plain `IntAdd` and isn't worth the special-casing). Recognizing the shape means looking at an *operand's defining instruction* (`func.insts[operand.0 as usize]`, via a shared free function — see below) for the first time in this selector — 7a's arms only ever looked at an operand's *type* (`ty_of`), never its *defining instruction*. When the shape matches, `select_inst` emits `MachineInst::Lea { dst, base: c, index: b, scale: k, disp: 0 }` instead of `IntAdd`. That fusion, on its own, is only half the story — see the next section for why the fused `Mul`'s own computation must also be suppressed.
+**`lea` synthesis** extends `select_inst`'s existing `Inst::Add` arm (7a's `Ty`-dispatching match). Before falling through to the existing `IntAdd`/`FloatAdd` dispatch, the `I64` case is checked against two tree shapes: `Add(scaled-index, c)` and `Add(c, scaled-index)`, where "scaled-index" is `Mul(b, ConstI64(k))` for `k ∈ {2, 4, 8}` (`lea`'s only legal SIB scale values — `k=1` is deliberately excluded, since scale=1 buys nothing over a plain `IntAdd`) **or** `Shl(b, ConstI64(s))` for `s ∈ {1, 2, 3}` (`b << s` is arithmetically `b * 2^s`, i.e. the exact same three scale factors expressed as a shift — see "Why both `Mul` and `Shl` must be recognized" below for why this second shape is not optional). Recognizing either shape means looking at an *operand's defining instruction* (`func.insts[operand.0 as usize]`, via a shared free function — see below) for the first time in this selector — 7a's arms only ever looked at an operand's *type* (`ty_of`), never its *defining instruction*. When either shape matches, `select_inst` emits `MachineInst::Lea { dst, base: c, index: b, scale, disp: 0 }` instead of `IntAdd`. That fusion, on its own, is only half the story — see the next section for why the fused `Mul`/`Shl`'s own computation must also be suppressed.
 
-## Lea synthesis must suppress the fused `Mul`'s own computation — this is genuinely required, not an optional refinement
+## Why both `Mul` and `Shl` must be recognized
 
-An earlier draft of this design assumed it was acceptable to leave the fused `Mul`'s own `IntMul` in place (a "redundant but harmless" simplification). That assumption doesn't hold, for two independent reasons surfaced during design review:
+`crates/forge-opt/src/strength.rs`'s `StrengthReduceShifts` pass — already shipped, and unconditionally wired into `forge_opt::optimize()`'s default pipeline (`fold → simplify → strength-reduce → gvn → reassoc → dce`, re-run to a fixed point) — rewrites `Mul(x, ConstI64(n))` **in place** into `Shl(x, ConstI64(log2(n)))` for every power-of-two `n` in `1..63`. This unconditionally covers `n ∈ {2, 4, 8}`, exactly `lea`'s three usable scale factors. This means: on any function that went through the standard optimizer pipeline (forge's Tier 2, and the codebase's primary/default path), `Add(Mul(b,k), c)` **essentially never survives to reach `select()`** — it has already become `Add(Shl(b, log2(k)), c)` by the time instruction selection runs. A design matching only `Inst::Mul` would be correct but practically dead code on realistic optimized input — real, verified during design review by tracing `strength.rs`'s pass ordering and its own `mul_pow2` rewrite logic directly. Matching `Inst::Mul` is still necessary, not vestigial, though: SPEC.md's tiered-execution model includes a **Tier 1 "baseline JIT (no optimizer)"** path, where `select()` legitimately runs on IR that never went through `strength.rs` at all — there, `Mul(x, ConstI64(k))` is exactly what a multiply-by-constant literally looks like. Both shapes are real, live inputs on different execution tiers; this design recognizes both rather than optimizing for only one.
 
-1. **It's not "sometimes redundant," it's "always dead."** `select()` unconditionally visits every real IR `Value` in RPO order and calls `select_inst` on it — nothing skips a `Value`'s own selection based on how a later instruction chooses to consume it. Since SSA def-before-use guarantees a `Mul`'s defining position is visited before any `Add` that might fuse it, the `Mul` **always** gets its own standalone `IntMul` pushed, whether or not it also gets fused into a `Lea`. Once fused, nothing downstream references that `IntMul`'s `dst` — it's unconditionally dead on every single successful fusion, not just when the `Mul`'s result happens to be shared. Leaving this unaddressed would mean `lea` synthesis produces `IntMul` (dead) *plus* `Lea` — never "one instruction instead of two," contradicting the entire point of this bullet.
-2. **The "shared Mul" case is the common case, not a rare edge case.** `crates/forge-opt/src/gvn.rs` performs dominator-scoped CSE that canonicalizes commutative ops (including `Mul`, sorting operands by `Value` index) and merges syntactically-identical instructions within a dominating scope — confirmed by its own test (`repeated_subexpression_cses_to_one_add`). So two occurrences of the same `b*4`-shaped subexpression in a dominating scope are *already merged into one shared `Value`* by the time this selector runs. Un-suppressed, that shared `Mul` becomes a strict regression when both its uses fuse: the same instruction count as before, but one of them (the standalone `IntMul`) is now pure waste with no compensating benefit (each `Lea` still redoes its own scale-multiply independently — `lea`'s address computation doesn't consume a materialized `Mul` result at all, it recomputes from raw registers).
+## Lea synthesis must suppress the fused `Mul`/`Shl`'s own computation — this is genuinely required, not an optional refinement
 
-**The fix**: a whole-function analysis pass, run once before the main RPO walk, determines which `Mul` values are *fully* subsumed by fusion (every one of their uses is a fusable `Add` pattern — none "escape" to some other consumer) and are therefore safe to suppress entirely, the same way `Phi` is suppressed. This is, not incidentally, a more literal reading of CHECKLIST's own wording for this bullet-group ("maximal munch over the IR **DAG**," not "over the IR tree") — recognizing when a DAG node is fully consumed by a pattern match, not just tree-shaped consumption, is exactly what "over the DAG" implies.
+An earlier draft of this design assumed it was acceptable to leave the fused instruction's own `IntMul`/`Shl` `MachineInst` in place (a "redundant but harmless" simplification). That assumption doesn't hold, for two independent reasons surfaced during design review:
+
+1. **It's not "sometimes redundant," it's "always dead."** `select()` unconditionally visits every real IR `Value` in RPO order and calls `select_inst` on it — nothing skips a `Value`'s own selection based on how a later instruction chooses to consume it. Since SSA def-before-use guarantees a `Mul`/`Shl`'s defining position is visited before any `Add` that might fuse it, it **always** gets its own standalone `IntMul`/`Shl` pushed, whether or not it also gets fused into a `Lea`. Once fused, nothing downstream references that instruction's `dst` — it's unconditionally dead on every single successful fusion, not just when the result happens to be shared. Leaving this unaddressed would mean `lea` synthesis produces the original instruction (dead) *plus* `Lea` — never "one instruction instead of two," contradicting the entire point of this bullet.
+2. **The "shared" case is the common case, not a rare edge case.** `crates/forge-opt/src/gvn.rs` performs dominator-scoped CSE that canonicalizes commutative ops (including `Mul`, sorting operands by `Value` index) and merges syntactically-identical instructions within a dominating scope — confirmed by its own test (`repeated_subexpression_cses_to_one_add`). So two occurrences of the same `b*4`-shaped subexpression (or, after strength-reduction, `b<<2`-shaped) in a dominating scope are *already merged into one shared `Value`* by the time this selector runs. Un-suppressed, that shared value becomes a strict regression when both its uses fuse: the same instruction count as before, but one of them (the standalone `IntMul`/`Shl`) is now pure waste with no compensating benefit (each `Lea` still redoes its own scale-multiply independently — `lea`'s address computation doesn't consume a materialized result at all, it recomputes from raw registers).
+
+**The fix**: a whole-function analysis pass, run once before the main RPO walk, determines which `Mul`- or `Shl`-defined values are *fully* subsumed by fusion (every one of their uses is a fusable `Add` pattern — none "escape" to some other consumer) and are therefore safe to suppress entirely, the same way `Phi` is suppressed. This is, not incidentally, a more literal reading of CHECKLIST's own wording for this bullet-group ("maximal munch over the IR **DAG**," not "over the IR tree") — recognizing when a DAG node is fully consumed by a pattern match, not just tree-shaped consumption, is exactly what "over the DAG" implies.
 
 The analysis:
 1. Compute **total use count** for every real IR `Value` — walking every real instruction's operands (`forge_ir::uses_of`, which covers `Inst` but NOT `Terminator`) *plus* every block's terminator operand (`Terminator::Return(v)`'s `v`, `Terminator::Branch{cond,..}`'s `cond` — easy to miss, since `uses_of` doesn't cover these, and a `Value` that's directly `return`ed or branched-on must never be silently suppressed).
-2. Compute **fusable use count** for every real IR `Value` by walking every real `Inst::Add(a, b)` where the type is `I64` and applying the *exact same* shape-matching logic `select_inst` will use (a single shared helper function, not two independent implementations that could drift out of sync) to determine which ONE of `a`/`b` (if either) this `Add` would fuse — incrementing that one `Value`'s fusable-use count. (When *both* operands are individually Mul-by-pow2-shaped, e.g. `Add(Mul(x,4), Mul(y,8))`, only one becomes the fused `index` operand per the `a`-then-`b` preference order below; the other remains an ordinary `Value` reference used as the `Lea`'s `base` operand and must NOT be counted as fusable — it still needs its own independent computation.)
-3. A `Value` is safe to suppress exactly when `fusable_uses[v] == total_uses[v]` (every use without exception was absorbed by a fusion) — collected into `Selector::fully_fusable_muls: HashSet<Value>`, computed once and stored on `Selector` alongside `func`/`next_value`.
-4. The **existing** `Inst::Mul` dispatch arm (shared with `Add`/`Sub`/`Div`/`Rem` per Task 2's `Ty`-dispatch pattern from 7a) gains one new check: for the `I64` case, if `self.fully_fusable_muls.contains(&dst)` (`dst` being *this* `Mul` instruction's own defining `Value`), emit nothing — exactly like `Phi`'s no-op arm — instead of `IntMul`.
+2. Compute **fusable use count** for every real IR `Value` by walking every real `Inst::Add(a, b)` where the type is `I64` and applying the *exact same* shape-matching logic `select_inst` will use (a single shared helper function, not two independent implementations that could drift out of sync) to determine which ONE of `a`/`b` (if either) this `Add` would fuse — incrementing that one `Value`'s fusable-use count. (When *both* operands are individually scaled-index-shaped, e.g. `Add(Mul(x,4), Shl(y,3))`, only one becomes the fused `index` operand per the `a`-then-`b` preference order below; the other remains an ordinary `Value` reference used as the `Lea`'s `base` operand and must NOT be counted as fusable — it still needs its own independent computation.)
+3. A `Value` is safe to suppress exactly when `fusable_uses[v] == total_uses[v]` (every use without exception was absorbed by a fusion) — collected into `Selector::fully_fusable_scaled_indices: HashSet<Value>`, computed once and stored on `Selector` alongside `func`/`next_value`.
+4. The **existing** `Inst::Mul` dispatch arm (shared with `Add`/`Sub`/`Div`/`Rem` per Task 2's `Ty`-dispatch pattern from 7a) AND the **existing** `Inst::Shl` arm (previously unconditional) BOTH gain the same new check: for the `I64` case, if `self.fully_fusable_scaled_indices.contains(&dst)` (`dst` being *this* instruction's own defining `Value`), emit nothing — exactly like `Phi`'s no-op arm — instead of `IntMul`/`Shl`.
 
-This makes `lea` synthesis genuinely redundancy-free for every case the analysis can prove safe, while remaining conservative (never suppresses a `Mul` with ANY non-fusable use) and correct by construction (the suppression decision and the fusion decision are driven by the same shared shape-matcher, so they can never disagree about which operand is "the fused one").
+This makes `lea` synthesis genuinely redundancy-free for every case the analysis can prove safe, while remaining conservative (never suppresses a value with ANY non-fusable use) and correct by construction (the suppression decision and the fusion decision are driven by the same shared shape-matcher, so they can never disagree about which operand is "the fused one").
 
 ## Components
 
@@ -105,26 +109,27 @@ Lea { dst: Value, base: Value, index: Value, scale: u8, disp: i32 },
 ```rust
 /// Free function (not a Selector method) so it has a single call site
 /// usable both by the whole-function suppression pre-pass (which runs
-/// BEFORE any Selector exists) and by Selector::try_synthesize_lea during
-/// the main walk -- the suppression decision and the fusion decision MUST
-/// agree about which operand (if any) is "the fused one," so there is
-/// exactly one implementation of this shape check, not two that could
-/// drift out of sync.
+/// BEFORE any Selector exists) and by Selector's Add arm during the main
+/// walk -- the suppression decision and the fusion decision MUST agree
+/// about which operand (if any) is "the fused one," so there is exactly
+/// one implementation of this shape check, not two that could drift out
+/// of sync.
 ///
-/// Checks whether `mul_candidate` is a real IR value (an index into
-/// func.insts -- synthetic values are never Mul-defined and always
-/// return None here) defined by `Mul(index, ConstI64(k))` or
-/// `Mul(ConstI64(k), index)` for k in {2,4,8}; if so, returns
-/// (base, index, k) with `base` set to the OTHER argument passed in.
-fn match_mul_by_pow2(func: &Function, mul_candidate: Value, other: Value) -> Option<(Value, Value, u8)> {
-    if (mul_candidate.0 as usize) >= func.insts.len() {
+/// Checks whether `candidate` is a real IR value (an index into
+/// func.insts -- synthetic values are never Mul/Shl-defined and always
+/// return None here) defined by a "scaled index" shape: `Mul(index,
+/// ConstI64(k))`/`Mul(ConstI64(k), index)` for k in {2,4,8}, OR
+/// `Shl(index, ConstI64(s))` for s in {1,2,3} (equivalent to k = 2^s --
+/// see "Why both Mul and Shl must be recognized": strength-reduction
+/// rewrites the former into the latter for realistic optimized input, so
+/// both are live, real shapes on different execution tiers, not a
+/// primary-plus-vestigial-fallback pair). If matched, returns (base,
+/// index, scale) with `base` set to the OTHER argument passed in.
+fn match_scaled_index(func: &Function, candidate: Value, other: Value) -> Option<(Value, Value, u8)> {
+    if (candidate.0 as usize) >= func.insts.len() {
         return None;
     }
-    let (m_a, m_b) = match &func.insts[mul_candidate.0 as usize] {
-        Inst::Mul(x, y) => (*x, *y),
-        _ => return None,
-    };
-    let scale_from = |v: Value| -> Option<u8> {
+    let const_scale = |v: Value| -> Option<u8> {
         if (v.0 as usize) >= func.insts.len() {
             return None;
         }
@@ -133,28 +138,45 @@ fn match_mul_by_pow2(func: &Function, mul_candidate: Value, other: Value) -> Opt
             _ => None,
         }
     };
-    if let Some(k) = scale_from(m_b) {
-        return Some((other, m_a, k));
+    match &func.insts[candidate.0 as usize] {
+        Inst::Mul(m_a, m_b) => {
+            if let Some(k) = const_scale(*m_b) {
+                return Some((other, *m_a, k));
+            }
+            if let Some(k) = const_scale(*m_a) {
+                return Some((other, *m_b, k));
+            }
+            None
+        }
+        Inst::Shl(index, shift_amount) => {
+            if (shift_amount.0 as usize) >= func.insts.len() {
+                return None;
+            }
+            match &func.insts[shift_amount.0 as usize] {
+                Inst::ConstI64(s) if matches!(s, 1 | 2 | 3) => {
+                    Some((other, *index, 1u8 << s))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
-    if let Some(k) = scale_from(m_a) {
-        return Some((other, m_b, k));
-    }
-    None
 }
 
-/// Tries both operand orderings of an Add(a, b) for the Mul-by-pow2-scale
-/// shape, preferring `a` as the fused Mul if both individually qualify
-/// (Add(Mul(x,4), Mul(y,8)) picks x/4 as index, leaving y's Mul as an
-/// ordinary Value feeding the Lea's `base` -- NOT itself fused/suppressed).
+/// Tries both operand orderings of an Add(a, b) for the scaled-index
+/// shape, preferring `a` as the fused operand if both individually
+/// qualify (Add(Mul(x,4), Shl(y,3)) picks x/4 as index, leaving y's Shl
+/// as an ordinary Value feeding the Lea's `base` -- NOT itself
+/// fused/suppressed).
 fn find_fusable_add(func: &Function, a: Value, b: Value) -> Option<(Value, Value, u8)> {
-    match_mul_by_pow2(func, a, b).or_else(|| match_mul_by_pow2(func, b, a))
+    match_scaled_index(func, a, b).or_else(|| match_scaled_index(func, b, a))
 }
 
 /// Run once, before the main RPO walk, over the WHOLE function. Determines
-/// which real IR Values, if any, are Mul results fully subsumed by lea
+/// which real IR Values, if any, are Mul/Shl results fully subsumed by lea
 /// fusion (every use is a fusable Add pattern, none escape to any other
 /// consumer) and therefore safe to suppress the same way Phi is.
-fn find_fully_fusable_muls(func: &Function) -> std::collections::HashSet<Value> {
+fn find_fully_fusable_scaled_indices(func: &Function) -> std::collections::HashSet<Value> {
     use std::collections::HashMap;
     let mut total_uses: HashMap<Value, u32> = HashMap::new();
     for inst in &func.insts {
@@ -174,21 +196,22 @@ fn find_fully_fusable_muls(func: &Function) -> std::collections::HashSet<Value> 
     }
 
     // NOTE: this must key on the OUTER Add's own operand (`a` or `b` --
-    // one of which IS the Mul's defining Value) that matched, NOT on
-    // find_fusable_add's returned `index` (which is the raw scaled
-    // register INSIDE the matched Mul, e.g. `b` in `Mul(b, 4)` -- a
+    // one of which IS the Mul/Shl's defining Value) that matched, NOT on
+    // match_scaled_index's returned `index` (which is the raw scaled
+    // register INSIDE the matched Mul/Shl, e.g. `b` in `Mul(b, 4)` -- a
     // completely different Value that happens to share a variable name
     // with this comment's own `b` in `Add(a, b)`). Keying on the wrong
     // Value here silently defeats suppression entirely -- verified by
-    // hand-tracing during design review that the naive
-    // `find_fusable_add(...).map(|(_, index, _)| index)` version fails
-    // to suppress ANY case, including the trivial single-consumer one.
+    // hand-tracing (and literally executing) during design review that
+    // the naive `find_fusable_add(...).map(|(_, index, _)| index)`
+    // version fails to suppress ANY case, including the trivial
+    // single-consumer one.
     let mut fusable_uses: HashMap<Value, u32> = HashMap::new();
     for inst in &func.insts {
         if let Inst::Add(a, b) = inst {
-            if match_mul_by_pow2(func, *a, *b).is_some() {
+            if match_scaled_index(func, *a, *b).is_some() {
                 *fusable_uses.entry(*a).or_insert(0) += 1;
-            } else if match_mul_by_pow2(func, *b, *a).is_some() {
+            } else if match_scaled_index(func, *b, *a).is_some() {
                 *fusable_uses.entry(*b).or_insert(0) += 1;
             }
         }
@@ -204,6 +227,8 @@ fn find_fully_fusable_muls(func: &Function) -> std::collections::HashSet<Value> 
 
 **A pathological but SSA-legal shape worth noting explicitly**: `Add(Mul_v, Mul_v)` (the same `Value` as both operands of one `Add`). `uses_of` counts this as 2 total uses of `Mul_v`; the fusable-use loop above only ever increments `Mul_v`'s count by at most 1 per `Add` instruction (it matches `a` XOR `b`, via the `if`/`else if`, never both). So `fusable_uses[Mul_v] < total_uses[Mul_v]` here, and `Mul_v` is correctly never suppressed — which is exactly right, since the synthesized `Lea`'s `base` field is set to `other = Mul_v` itself in this shape, so `Mul_v`'s real computed register genuinely still needs to exist at runtime. Not a case requiring special-case code; called out here because it's easy to worry about and the algorithm already handles it correctly by construction.
 
+**Why the `Ty::I64`-only gating is safe even though the pre-pass itself never checks `Ty`**: `find_fully_fusable_scaled_indices`'s loop calls `match_scaled_index` against every `Inst::Add` regardless of type, purely structurally. In principle this looks like it could misfire against an `F64`-typed `Add` whose operand happens to be defined by an `I64`-shaped `Mul`/`Shl` pattern. This is provably unreachable for real compiled IR, not just unlikely: `crates/forge-ir/src/lower.rs`'s binary-expression lowering unconditionally inserts an explicit `Inst::IToF` coercion for any `I64`-typed operand feeding an `F64`-typed result — so a genuinely `F64`-typed `Add`/`Mul` can never have a literal `Inst::ConstI64` operand feeding it directly; that path always goes through `IToF` first, landing on a different `Value` with a different defining instruction. This safety property rests on an invariant `lower.rs` maintains (not re-checked by `forge_ir::verify()`, which only checks dominance/SSA structure, not type consistency) — worth a one-line comment noting the dependency, not a reason to add a runtime `Ty` check that real IR can never need.
+
 ```rust
 // Selector gains one new field:
 struct Selector<'a> {
@@ -211,24 +236,25 @@ struct Selector<'a> {
     insts: Vec<MachineInst>,
     synthetic_types: HashMap<Value, Ty>,
     next_value: u32,
-    fully_fusable_muls: std::collections::HashSet<Value>, // NEW
+    fully_fusable_scaled_indices: std::collections::HashSet<Value>, // NEW
 }
 ```
 
 ```rust
-// select()'s setup, extended -- find_fully_fusable_muls(func) MUST run
-// BEFORE the Selector is constructed (it needs a value at construction
-// time, and takes &Function directly, not &Selector -- there is no
-// Selector yet at this point). select()'s final return is also extended
-// to populate coalescing_hints, computed from the now-complete insts list.
+// select()'s setup, extended -- find_fully_fusable_scaled_indices(func)
+// MUST run BEFORE the Selector is constructed (it needs a value at
+// construction time, and takes &Function directly, not &Selector --
+// there is no Selector yet at this point). select()'s final return is
+// also extended to populate coalescing_hints, computed from the now-
+// complete insts list.
 pub fn select(func: &Function) -> SelectedFunction {
-    let fully_fusable_muls = find_fully_fusable_muls(func);
+    let fully_fusable_scaled_indices = find_fully_fusable_scaled_indices(func);
     let mut sel = Selector {
         func,
         insts: Vec::new(),
         synthetic_types: HashMap::new(),
         next_value: func.insts.len() as u32,
-        fully_fusable_muls,
+        fully_fusable_scaled_indices,
     };
     for block in forge_ir::dominance::reverse_postorder(func) {
         for &v in &func.blocks[block.0 as usize].insts {
@@ -270,7 +296,7 @@ Inst::Add(a, b) => match self.ty_of(*a) {
 Inst::Mul(a, b) => match self.ty_of(*a) {
     Ty::F64 => self.insts.push(MachineInst::FloatMul { dst, lhs: *a, rhs: *b }),
     Ty::I64 => {
-        if !self.fully_fusable_muls.contains(&dst) {
+        if !self.fully_fusable_scaled_indices.contains(&dst) {
             self.insts.push(MachineInst::IntMul { dst, lhs: *a, rhs: *b });
         }
         // else: fully subsumed by lea fusion, nothing to emit -- same
@@ -280,22 +306,37 @@ Inst::Mul(a, b) => match self.ty_of(*a) {
 },
 ```
 
+```rust
+// select_inst's EXISTING Inst::Shl arm (from 7a Task 2, previously
+// unconditional) gains the SAME suppression check as Mul above -- this
+// is the arm that actually matters most on realistic optimized input,
+// per "Why both Mul and Shl must be recognized" above (strength-
+// reduction rewrites Mul-by-pow2 into exactly this shape).
+Inst::Shl(a, b) => {
+    if !self.fully_fusable_scaled_indices.contains(&dst) {
+        self.insts.push(MachineInst::Shl { dst, lhs: *a, rhs: *b });
+    }
+    // else: fully subsumed by lea fusion, nothing to emit.
+}
+```
+
 ## Testing
 
-Golden `Vec<MachineInst>` tests, same style as 7a:
-- `compute_coalescing_hints`: one test covering a representative binary op (proves `dst -> lhs`, not `dst -> rhs`), one for a unary op, one confirming `IntDiv`/`IntRem` produce NO hint entry, one confirming a `MachineInst` with no natural hint (e.g. `Param`, `Jump`) is correctly absent from the map.
-- `lea` synthesis, single-consumer case: `Add(Mul(b,4), c)` and `Add(c, Mul(b,4))` (operand-order symmetry) each assert the FULL selected sequence has NO `IntMul` for the `Mul`'s `Value` at all — only the `Lea` — proving suppression actually happens, not just that fusion happens.
-- `lea` synthesis, negative cases (no `Lea`, ordinary `IntMul`+`IntAdd`, no suppression): multiplier isn't a power-of-2-in-{2,4,8} constant (e.g. `Mul(b, 3)`); the "constant" operand is itself non-constant (e.g. `Mul(b, c)`, both real values).
-- `lea` synthesis, shared-`Mul` case (the GVN-realistic scenario): one `Mul(b,4)` `Value` consumed by TWO different `Add`s (`Add(Mul_v, c1)` and `Add(Mul_v, c2)`) — asserts BOTH `Add`s become `Lea`s and the `Mul`'s own `IntMul` is still fully suppressed (both uses were fusable, so `fusable_uses == total_uses`), proving the suppression pass correctly handles the multi-consumer case, not just the single-consumer one.
-- `lea` synthesis, escaping-use case (suppression must NOT happen): a `Mul(b,4)` `Value` used by one fusable `Add` AND also directly `Return`ed (or used by a second, non-`Add` consumer) — asserts the `Lea` is still emitted for the `Add`, but the `Mul`'s own `IntMul` is ALSO still present (since not every use was fusable) — this is the test that would have caught the original design flaw, and specifically exercises the terminator-use-counting fix (a `Value` used only by `Return` must never be wrongly suppressed).
-- `lea` synthesis, both-operands-fusable case: `Add(Mul(x,4), Mul(y,8))` — asserts exactly one of the two (per the `a`-then-`b` preference order) becomes the `Lea`'s `index`, the other remains an ordinary `Value` reference as `base` and gets its own independent, non-suppressed `IntMul`.
+Golden `Vec<MachineInst>` tests, same style as 7a. Every `Mul`-shaped case below is paired with an equivalent `Shl`-shaped case (e.g. `Mul(b, ConstI64(4))` vs. `Shl(b, ConstI64(2))`, both scale=4) — since `Shl` is the shape that actually occurs on realistic optimized input (per "Why both Mul and Shl must be recognized"), testing only the `Mul` side would leave the practically-important path unverified:
+- `compute_coalescing_hints`: one test covering a representative binary op (proves `dst -> lhs`, not `dst -> rhs`), one for a unary op, one confirming `IntDiv`/`IntRem` produce NO hint entry, one confirming a `MachineInst` with no natural hint (e.g. `Param`, `Jump`) is correctly absent from the map, one confirming `Lea` specifically produces NO hint entry (real x86 `lea` is non-destructive).
+- `lea` synthesis, single-consumer case: `Add(Mul(b,4), c)`, `Add(c, Mul(b,4))` (operand-order symmetry), AND the `Shl` equivalents `Add(Shl(b,2), c)`/`Add(c, Shl(b,2))` — each asserts the FULL selected sequence has NO `IntMul`/`Shl` for the scaled-index `Value` at all — only the `Lea` — proving suppression actually happens, not just that fusion happens.
+- `lea` synthesis, negative cases (no `Lea`, ordinary `IntMul`/`Shl`+`IntAdd`, no suppression): multiplier isn't a power-of-2-in-{2,4,8} constant (e.g. `Mul(b, 3)`); the "constant" operand is itself non-constant (e.g. `Mul(b, c)`, both real values); a `Shl` by an amount outside `{1,2,3}` (e.g. `Shl(b, 4)`, scale=16 — not a legal SIB scale).
+- `lea` synthesis, shared-consumer case (the GVN-realistic scenario): one `Shl(b,2)` `Value` consumed by TWO different `Add`s — asserts BOTH `Add`s become `Lea`s and the `Shl`'s own `MachineInst::Shl` is still fully suppressed (both uses were fusable), proving the suppression pass correctly handles the multi-consumer case, not just the single-consumer one.
+- `lea` synthesis, escaping-use case (suppression must NOT happen): a `Mul(b,4)` `Value` used by one fusable `Add` AND also directly `Return`ed — asserts the `Lea` is still emitted for the `Add`, but the `Mul`'s own `IntMul` is ALSO still present (since not every use was fusable) — this is the test that would have caught the original design flaw, and specifically exercises the terminator-use-counting fix.
+- `lea` synthesis, both-operands-fusable case: `Add(Mul(x,4), Shl(y,3))` (deliberately mixing shapes, not just two `Mul`s, to prove the shared matcher treats both uniformly) — asserts exactly one of the two (per the `a`-then-`b` preference order) becomes the `Lea`'s `index`, the other remains an ordinary `Value` reference as `base` and gets its own independent, non-suppressed computation.
+- `lea` synthesis, `Add(Mul_v, Mul_v)` self-referential case: confirms the pathological-but-safe behavior documented above (never suppressed, correctly requires the real computed register).
 
 ## Exit criteria
 
-1. `SelectedFunction::coalescing_hints` exists, populated by `compute_coalescing_hints`, covering every 2-address-destructive `MachineInst` variant, correctly excluding `IntDiv`/`IntRem`.
-2. `MachineInst::Lea` exists; `select_inst`'s `Inst::Add`/`I64` case recognizes `Add(Mul(b,k),c)`/`Add(c,Mul(b,k))` for `k ∈ {2,4,8}` and emits it via the shared `find_fusable_add` helper; falls back to plain `IntAdd` for every other shape.
-3. `find_fully_fusable_muls` correctly suppresses a fused `Mul`'s standalone `IntMul` exactly when every one of its uses (across both `Inst` operands AND block terminators) was absorbed by fusion, and never suppresses it otherwise.
-4. Tests cover both operand orderings, both negative cases, the shared-consumer suppression case, the escaping-use non-suppression case, and the both-operands-fusable preference-order case.
+1. `SelectedFunction::coalescing_hints` exists, populated by `compute_coalescing_hints`, covering every 2-address-destructive `MachineInst` variant, correctly excluding `IntDiv`/`IntRem`, and correctly excluding `Lea` (non-destructive).
+2. `MachineInst::Lea` exists; `select_inst`'s `Inst::Add`/`I64` case recognizes `Add(scaled-index, c)`/`Add(c, scaled-index)` for BOTH `Mul(b,k)` (`k ∈ {2,4,8}`) and `Shl(b,s)` (`s ∈ {1,2,3}`) via the shared `find_fusable_add`/`match_scaled_index` helpers; falls back to plain `IntAdd` for every other shape.
+3. `find_fully_fusable_scaled_indices` correctly suppresses a fused `Mul`'s or `Shl`'s standalone `MachineInst` exactly when every one of its uses (across both `Inst` operands AND block terminators) was absorbed by fusion, and never suppresses it otherwise. Both the `Inst::Mul` arm AND the `Inst::Shl` arm carry this suppression check.
+4. Tests cover both operand orderings for both `Mul` and `Shl` shapes, all negative cases (including the out-of-range shift amount), the shared-consumer suppression case, the escaping-use non-suppression case, the mixed-shape both-operands-fusable preference-order case, and the self-referential pathological case.
 5. `cargo test --workspace` green, `cargo clippy --workspace -- -D warnings` and `cargo fmt --check` clean.
 6. No regressions in any Phase 6 `forge-x64` test, Phase 7a's `machine_inst` tests, or any other crate's tests.
 7. CHECKLIST.md's "Two-address fixup," "Addressing-mode folding," and "`lea` synthesis" bullets are annotated to reflect what was actually built (or explicitly why not, for addressing-mode folding), and the "`Select`→`cmov`" bullet is annotated as deferred to the newly-named Phase 7f.
