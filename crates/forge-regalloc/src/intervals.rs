@@ -940,13 +940,22 @@ mod tests {
             "if a > b then (a * c) + (b * c) else a - b",
             "if a > b then (a - b) - (a + b) else c - a",
             "if a > b then fma(a, b, c) else a * c",
+            // Float/XMM-side counterexamples found during a follow-up
+            // confirmation pass -- the bug this test guards isn't
+            // int-instruction-specific, and these two independently
+            // trigger the same forward-hint failure mode without the
+            // fix, on the FloatAdd/FloatSub/FloatDiv/Fma instruction set.
+            "if x > y then (x * y) + (x - y) else x / y",
+            "if x > y then fma(x, y, z) * x else fma(y, x, z) - y",
         ] {
             let func = front_end(src);
             let selected = select(&func);
             let intervals = build_intervals(&func, &selected);
 
+            let mut hinted_count = 0usize;
             for iv in &intervals {
                 let Some(h) = iv.hint else { continue };
+                hinted_count += 1;
                 let hinted = intervals.iter().find(|x| x.value == h).unwrap_or_else(|| {
                     panic!(
                         "{src:?}: {:?} hints at {h:?}, which has no interval",
@@ -962,6 +971,13 @@ mod tests {
                     (hinted.start, hinted.end)
                 );
             }
+            // Non-vacuousness check: a program with two-address ops and/or
+            // phis MUST actually produce hints, or this test would pass
+            // trivially even if hint population were entirely broken.
+            assert!(
+                hinted_count > 0,
+                "{src:?}: expected at least one hint, got none"
+            );
         }
     }
 
