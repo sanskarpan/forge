@@ -26,13 +26,19 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AluOp, Assembler};
+    use crate::Assembler;
 
     #[test]
     fn sysv_callee_saved_excludes_rbp() {
         assert_eq!(
             SYSV_CALLEE_SAVED,
-            &[PhysReg::Rbx, PhysReg::R12, PhysReg::R13, PhysReg::R14, PhysReg::R15]
+            &[
+                PhysReg::Rbx,
+                PhysReg::R12,
+                PhysReg::R13,
+                PhysReg::R14,
+                PhysReg::R15
+            ]
         );
         assert!(!SYSV_CALLEE_SAVED.contains(&PhysReg::Rbp));
     }
@@ -258,8 +264,13 @@ use crate::{AluOp, Assembler, PhysReg};
 /// (a different, larger callee-saved set including XMM6-15, which need a
 /// movsd-to-memory save sequence rather than push/pop) is deliberately
 /// not built here -- see the design doc for why.
-pub const SYSV_CALLEE_SAVED: &[PhysReg] =
-    &[PhysReg::Rbx, PhysReg::R12, PhysReg::R13, PhysReg::R14, PhysReg::R15];
+pub const SYSV_CALLEE_SAVED: &[PhysReg] = &[
+    PhysReg::Rbx,
+    PhysReg::R12,
+    PhysReg::R13,
+    PhysReg::R14,
+    PhysReg::R15,
+];
 
 /// Computes the actual byte count `sub rsp, N` / `add rsp, N` should use:
 /// `requested`, padded up to the next value making the TOTAL frame
