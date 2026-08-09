@@ -3,7 +3,7 @@
 /// built so far -- their encoding numbers are still real data worth
 /// representing now, since gating actual usability is an AVX-512-era
 /// concern, not a `PhysReg` concern).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PhysReg {
     Rax,
     Rcx,
