@@ -1,4 +1,3 @@
-
 use super::*;
 use forge_ir::builder::Builder;
 use forge_ir::{Inst, Terminator, Ty};
