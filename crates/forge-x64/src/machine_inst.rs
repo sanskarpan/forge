@@ -230,6 +230,11 @@ impl<'a> Selector<'a> {
         v
     }
 
+    /// Deliberately has NO wildcard (`_ =>`) arm -- same exhaustiveness
+    /// rationale as forge-ir's `uses_of`/`replace_in_inst`: a new `Inst`
+    /// variant must get an explicit arm here, or this fails to compile.
+    /// If you hit that compile error, ADD A REAL ARM, don't silence it
+    /// with `_ => {}` -- that would defeat the whole point of this match.
     fn select_inst(&mut self, dst: Value, inst: &Inst) {
         match inst {
             Inst::ConstF64(bits) => self
@@ -365,7 +370,14 @@ impl<'a> Selector<'a> {
             Inst::Phi { .. } => {
                 // Deliberately emits nothing -- see the design doc's "φ
                 // handling" section. This Inst's destination Value is
-                // resolved entirely by Phase 8's SSA deconstruction.
+                // resolved entirely by Phase 8's SSA deconstruction
+                // (assign the same physical register/slot where possible;
+                // insert parallel-copy moves at predecessor block ends
+                // otherwise). That strategy is only safe when no CFG edge
+                // into a phi's block is a critical edge -- true for
+                // today's if/else-only lowering, but NOT enforced or
+                // checked anywhere yet. Re-verify this once loops
+                // (currently a stretch goal) can introduce back-edges.
             }
         }
     }
