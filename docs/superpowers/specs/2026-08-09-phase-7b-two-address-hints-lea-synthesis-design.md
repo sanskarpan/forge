@@ -14,6 +14,8 @@ Both pieces live in `crates/forge-x64/src/machine_inst.rs`, extending `Selector`
 
 **Coalescing hints** are a new `SelectedFunction::coalescing_hints: HashMap<Value, Value>` field (`dst -> preferred-same-location-as`), populated by a new pass `compute_coalescing_hints(insts: &[MachineInst]) -> HashMap<Value, Value>` that runs once, after `select_inst`/`select_term` have produced the full `Vec<MachineInst>`. For every 2-address-destructive `MachineInst` variant (binary: `IntAdd`/`IntSub`/`IntMul`/`And`/`Or`/`Xor`/`Shl`/`Shr`/`Sar`/`FloatAdd`/`FloatSub`/`FloatMul`/`FloatDiv`/`FloatMin`/`FloatMax`, where the real x86 instruction computes `dst = dst OP rhs` and so wants `dst`'s register to already hold `lhs`'s value; unary: `IntNeg`/`Not`/`FloatNeg`/`FloatAbs`, where `dst` wants to already hold `src`'s value), record `dst -> lhs` (or `dst -> src`). `IntDiv`/`IntRem` are excluded — their real hardware constraint is fixed `RAX`/`RDX` placement, not "same register as an operand," a different kind of hint Phase 8 will need to handle as a *fixed-register* constraint (already anticipated by CHECKLIST's Phase 8 `Interval.fixed` field), not a coalescing one. This is purely a lookup table — it doesn't change `insts` at all, matching 7a's principle that `MachineInst` stays 3-address SSA form throughout Phase 7.
 
+**Scope note on CHECKLIST's literal `a + b*k + c` wording**: `forge_ir::Inst::Add` is strictly binary, so a genuine three-additive-term chain (`Add(Add(a, Mul(b,k)), c)` or similar, spanning two real `Add` instructions) is NOT recognized by this design — only the two-term shape `Add(Mul(b,k), c)` is. This is a reasonable, explicit scope reduction (the two-term case is both the common one and the one CHECKLIST's own bullet title emphasizes — "`lea` synthesis for `a + b*k + c`" names the general x86 addressing-mode shape `lea` supports, not a specific requirement that every use of it be recognized), not an oversight.
+
 **`lea` synthesis** extends `select_inst`'s existing `Inst::Add` arm (7a's `Ty`-dispatching match). Before falling through to the existing `IntAdd`/`FloatAdd` dispatch, the `I64` case is checked against two tree shapes: `Add(Mul(b, ConstI64(k)), c)` and `Add(c, Mul(b, ConstI64(k)))`, for `k ∈ {2, 4, 8}` (`lea`'s only legal SIB scale values — `k=1` is deliberately excluded, since scale=1 buys nothing over a plain `IntAdd` and isn't worth the special-casing). Recognizing the shape means looking at an *operand's defining instruction* (`func.insts[operand.0 as usize]`, via a shared free function — see below) for the first time in this selector — 7a's arms only ever looked at an operand's *type* (`ty_of`), never its *defining instruction*. When the shape matches, `select_inst` emits `MachineInst::Lea { dst, base: c, index: b, scale: k, disp: 0 }` instead of `IntAdd`. That fusion, on its own, is only half the story — see the next section for why the fused `Mul`'s own computation must also be suppressed.
 
 ## Lea synthesis must suppress the fused `Mul`'s own computation — this is genuinely required, not an optional refinement
@@ -91,7 +93,7 @@ pub fn compute_coalescing_hints(insts: &[MachineInst]) -> HashMap<Value, Value> 
 }
 ```
 
-`select(func)` (7a's entry point) calls this once at the end, populating `SelectedFunction::coalescing_hints`.
+`select(func)` (7a's entry point) calls this once at the end, populating `SelectedFunction::coalescing_hints`. `MachineInst::Lea` deliberately does NOT appear in `compute_coalescing_hints`'s match (it falls into the `_ => {}` arm) — this is intentional, not an omission: real x86 `lea` is a genuinely non-destructive 3-operand instruction (`dst` doesn't need to start out holding any operand's value), so it has no two-address constraint to hint around at all.
 
 ### `MachineInst::Lea`, the shared shape-matcher, the suppression pre-pass, and `select_inst`
 
@@ -171,11 +173,23 @@ fn find_fully_fusable_muls(func: &Function) -> std::collections::HashSet<Value> 
         }
     }
 
+    // NOTE: this must key on the OUTER Add's own operand (`a` or `b` --
+    // one of which IS the Mul's defining Value) that matched, NOT on
+    // find_fusable_add's returned `index` (which is the raw scaled
+    // register INSIDE the matched Mul, e.g. `b` in `Mul(b, 4)` -- a
+    // completely different Value that happens to share a variable name
+    // with this comment's own `b` in `Add(a, b)`). Keying on the wrong
+    // Value here silently defeats suppression entirely -- verified by
+    // hand-tracing during design review that the naive
+    // `find_fusable_add(...).map(|(_, index, _)| index)` version fails
+    // to suppress ANY case, including the trivial single-consumer one.
     let mut fusable_uses: HashMap<Value, u32> = HashMap::new();
     for inst in &func.insts {
         if let Inst::Add(a, b) = inst {
-            if let Some((_, index, _)) = find_fusable_add(func, *a, *b) {
-                *fusable_uses.entry(index).or_insert(0) += 1;
+            if match_mul_by_pow2(func, *a, *b).is_some() {
+                *fusable_uses.entry(*a).or_insert(0) += 1;
+            } else if match_mul_by_pow2(func, *b, *a).is_some() {
+                *fusable_uses.entry(*b).or_insert(0) += 1;
             }
         }
     }
@@ -188,14 +202,49 @@ fn find_fully_fusable_muls(func: &Function) -> std::collections::HashSet<Value> 
 }
 ```
 
+**A pathological but SSA-legal shape worth noting explicitly**: `Add(Mul_v, Mul_v)` (the same `Value` as both operands of one `Add`). `uses_of` counts this as 2 total uses of `Mul_v`; the fusable-use loop above only ever increments `Mul_v`'s count by at most 1 per `Add` instruction (it matches `a` XOR `b`, via the `if`/`else if`, never both). So `fusable_uses[Mul_v] < total_uses[Mul_v]` here, and `Mul_v` is correctly never suppressed — which is exactly right, since the synthesized `Lea`'s `base` field is set to `other = Mul_v` itself in this shape, so `Mul_v`'s real computed register genuinely still needs to exist at runtime. Not a case requiring special-case code; called out here because it's easy to worry about and the algorithm already handles it correctly by construction.
+
 ```rust
-// Selector gains one new field, computed once in select()'s setup:
+// Selector gains one new field:
 struct Selector<'a> {
     func: &'a Function,
     insts: Vec<MachineInst>,
     synthetic_types: HashMap<Value, Ty>,
     next_value: u32,
     fully_fusable_muls: std::collections::HashSet<Value>, // NEW
+}
+```
+
+```rust
+// select()'s setup, extended -- find_fully_fusable_muls(func) MUST run
+// BEFORE the Selector is constructed (it needs a value at construction
+// time, and takes &Function directly, not &Selector -- there is no
+// Selector yet at this point). select()'s final return is also extended
+// to populate coalescing_hints, computed from the now-complete insts list.
+pub fn select(func: &Function) -> SelectedFunction {
+    let fully_fusable_muls = find_fully_fusable_muls(func);
+    let mut sel = Selector {
+        func,
+        insts: Vec::new(),
+        synthetic_types: HashMap::new(),
+        next_value: func.insts.len() as u32,
+        fully_fusable_muls,
+    };
+    for block in forge_ir::dominance::reverse_postorder(func) {
+        for &v in &func.blocks[block.0 as usize].insts {
+            let inst = &func.insts[v.0 as usize];
+            sel.select_inst(v, inst);
+        }
+        if let Some(term) = &func.blocks[block.0 as usize].term {
+            sel.select_term(term);
+        }
+    }
+    let coalescing_hints = compute_coalescing_hints(&sel.insts);
+    SelectedFunction {
+        insts: sel.insts,
+        synthetic_types: sel.synthetic_types,
+        coalescing_hints,
+    }
 }
 ```
 
