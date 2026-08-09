@@ -58,7 +58,7 @@ fn pop_reg_extended_register_sets_rex_b() {
 }
 ```
 
-**IMPORTANT — before trusting the disassembly strings above**: verify all four empirically. This is the first instruction shape in this crate with NO ModRM byte at all combined with a possible REX byte (every prior REX test paired REX with a ModRM byte) — low risk for the mnemonic/register naming, but confirm nothing unexpected happens with the `iced-x86` formatter for this shape before trusting it.
+**IMPORTANT — before trusting the disassembly strings above**: verify all four empirically. This shape (opcode-plus-register, no ModRM, possible REX byte) already exists in this crate — `mov_reg_imm`'s `movabs` form uses it too, and is already tested with an extended register — so this is low risk, but confirm nothing unexpected happens with the `iced-x86` formatter here before trusting it.
 
 - [ ] **Step 2: Run to confirm failure**
 
@@ -105,7 +105,7 @@ git commit -m "feat(forge-x64): push_reg, pop_reg"
 
 ## Context for this task
 
-This is the foundational task for this slice — the first `impl Assembler` block for calling-convention instructions, which Task 2 will extend with `call_reg`/`call_rel32`/`ret`. `push_reg`/`pop_reg` are opcode-plus-register forms with NO ModRM byte at all, a genuinely different shape than everything built in 6a-6e (which always paired a REX byte with a ModRM byte when REX was needed). If `push_reg_extended_register_sets_rex_b` fails, check that the REX byte and the opcode-plus-register byte are in the right order (REX always immediately precedes the opcode, same rule established in 6e) and that `& 7` is masking the register encoding correctly for the opcode's low 3 bits.
+This is the foundational task for this slice — the first `impl Assembler` block for calling-convention instructions, which Task 2 will extend with `call_reg`/`call_rel32`/`ret`. `push_reg`/`pop_reg` are opcode-plus-register forms with NO ModRM byte at all — the same shape `mov_reg_imm`'s `movabs` form already uses (see `assembler.rs`'s existing `mov_reg_imm`), so the REX-without-ModRM mechanics are already proven in this crate; this task just applies that same shape to a new opcode pair. If `push_reg_extended_register_sets_rex_b` fails, check that the REX byte and the opcode-plus-register byte are in the right order (REX always immediately precedes the opcode, same rule established in 6e) and that `& 7` is masking the register encoding correctly for the opcode's low 3 bits.
 
 Work from: `/Users/sanskar/dev/Research/Projects/JIT-Compiler`
 
