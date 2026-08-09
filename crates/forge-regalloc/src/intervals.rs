@@ -424,13 +424,43 @@ fn populate_fixed_registers(func: &Function) {
     // this function's own doc comment above.
 }
 
+/// Per-(instruction position, Value) register exclusions -- currently
+/// only populated for IntDiv/IntRem's rhs (divisor), which must never be
+/// assigned Rax or Rdx (cqo/idiv would destroy it before idiv ever reads
+/// it -- see the design doc's idiv-clobber resolution, sub-problem 2).
+/// 8b's design doc consumes this as an extra candidate-set filter in
+/// pick_register, on top of ordinary availability.
+///
+/// `func` is unused directly (everything needed is in `selected.insts`) --
+/// kept as a parameter for API symmetry with `build_intervals`.
+pub fn excluded_registers(
+    func: &Function,
+    selected: &SelectedFunction,
+) -> HashMap<(usize, Value), Vec<forge_x64::PhysReg>> {
+    let _ = func;
+    let mut excluded = HashMap::new();
+    for (i, inst) in selected.insts.iter().enumerate() {
+        match inst {
+            forge_x64::MachineInst::IntDiv { rhs, .. }
+            | forge_x64::MachineInst::IntRem { rhs, .. } => {
+                excluded.insert(
+                    (i, *rhs),
+                    vec![forge_x64::PhysReg::Rax, forge_x64::PhysReg::Rdx],
+                );
+            }
+            _ => {}
+        }
+    }
+    excluded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use forge_ir::builder::Builder;
     use forge_ir::{Function, Inst, Terminator, Ty};
     use forge_syntax::span::Span;
-    use forge_x64::select;
+    use forge_x64::{select, PhysReg};
 
     fn dummy_span() -> Span {
         Span::new(0, 0)
@@ -1234,5 +1264,42 @@ mod tests {
             intervals, sorted,
             "build_intervals' output must already be in sorted order"
         );
+    }
+
+    #[test]
+    fn int_div_rhs_is_excluded_from_rax_and_rdx() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let a = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let c = b.emit(entry, Inst::ConstI64(3), Ty::I64, dummy_span());
+        let q = b.emit(entry, Inst::Div(a, c), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(q));
+
+        let selected = select(&b.f);
+        let excluded = excluded_registers(&b.f, &selected);
+
+        // c (rhs of the Div) must be excluded from Rax/Rdx AT the IntDiv
+        // instruction's position specifically.
+        let div_pos = selected
+            .insts
+            .iter()
+            .position(|i| matches!(i, forge_x64::MachineInst::IntDiv { .. }))
+            .unwrap();
+        let excl = excluded
+            .get(&(div_pos, c))
+            .expect("c must have an exclusion entry at div_pos");
+        assert!(excl.contains(&PhysReg::Rax));
+        assert!(excl.contains(&PhysReg::Rdx));
+        // The dividend is NOT excluded -- emission fixes it with a copy.
+        assert!(!excluded.contains_key(&(div_pos, a)));
     }
 }
