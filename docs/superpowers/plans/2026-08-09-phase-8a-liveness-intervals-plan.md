@@ -1316,6 +1316,45 @@ Task 4's code alone will not compile (`populate_fixed_registers` is undefined). 
 
 ## Task 5: Hints and fixed/excluded registers for `Param`/`IntDiv`/`IntRem`
 
+> ### ⚠️ SUPERSEDED — DONE, nothing left to execute from this task
+>
+> **Task 5 is already implemented, and the code and tests written out below
+> are the ORIGINAL, now-SUPERSEDED versions.** Do not execute them. Two
+> post-implementation corrections landed after this task shipped and
+> replaced substantial parts of what this section shows:
+>
+> 1. **Commit `89a2182`** — removed the whole-lifetime `Interval::fixed`
+>    pins for `Param`/`IntDiv`/`IntRem` entirely. The original design
+>    below (`iv.fixed = Some(SYSV_INT_ARGS[gpr_seen])`,
+>    `iv.fixed = Some(PhysReg::Rax)`/`Some(PhysReg::Rdx)`) produced
+>    UNSATISFIABLE constraint sets on ordinary programs (e.g. `a/b + c/d`
+>    pins two overlapping `dst`s to `Rax` simultaneously). All three are
+>    now resolved as emission-time copies with NO interval-level marking;
+>    `populate_fixed_registers` retains only the ABI-overflow `assert!`,
+>    and `param_value_by_index` was deleted along with its
+>    `params_are_found_by_scanning_not_by_assuming_value_index_equals_param_index`
+>    test. The `mixed_type_params_get_class_relative_fixed_registers` and
+>    `int_div_dst_fixed_rax_int_rem_dst_fixed_rdx` tests below were
+>    likewise replaced by their `fixed == None` counterparts.
+> 2. **Commit `9dc2110`** — corrected the φ-group mutual-hint mechanism
+>    that `89a2182` introduced: the hint anchor is the group's
+>    SMALLEST-numbered `Value`, not the φ's own destination (anchoring on
+>    the φ pointed every hint FORWARD in 8b's `(start, end, value)` scan
+>    order, since a φ's `Value` is minted after its incoming values), and
+>    `populate_two_address_hints` now checks `iv.hint.is_none()` before
+>    writing, so an ordinary two-address hint can never overwrite the
+>    strictly-harder φ-coalescing hint.
+>
+> **Authoritative current design:** the "Fixed registers" and "Hints"
+> sections of
+> `docs/superpowers/specs/2026-08-09-phase-8a-liveness-intervals-design.md`
+> (both corrected in place). **Authoritative current code:**
+> `crates/forge-regalloc/src/intervals.rs` — read it directly rather than
+> this section, which is deliberately left un-rewritten as a record of the
+> original plan rather than being kept line-for-line in sync.
+>
+> Everything below this box is retained for historical context only.
+
 **Files:**
 - Modify: `crates/forge-regalloc/src/intervals.rs`
 
@@ -1587,6 +1626,16 @@ git commit -m "feat(forge-regalloc): build_intervals with liveness, phi-merging 
 
 ## Task 6: `rhs`-exclusion side channel for `IntDiv`/`IntRem`
 
+> **STILL TO DO — this is the one part of this plan not yet implemented**
+> (confirmed: `excluded_registers` does not appear anywhere in
+> `crates/forge-regalloc/`). Task 6 is UNAFFECTED by the corrections noted
+> on Task 5: `excluded_registers` is a separate candidate-exclusion side
+> channel that never touched `Interval::fixed`, and the design doc still
+> calls `rhs` the one genuinely allocation-time idiv constraint (a divisor
+> in `Rax`/`Rdx` is destroyed by `cqo`/`idiv` before it can be read, so
+> unlike `lhs`/`dst` it cannot be fixed by an emission-time copy). Task 6's
+> code below is current; execute it as written.
+
 **Files:**
 - Modify: `crates/forge-regalloc/src/intervals.rs`
 - Modify: `crates/forge-regalloc/src/lib.rs`
@@ -1677,7 +1726,7 @@ pub use liveness::{compute_liveness, Liveness};
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test -p forge-regalloc --lib 2>&1 | tail -60`
-Expected: 18 tests pass (3 scaffolding + 2 liveness + 4 build_intervals + 5 hints/fixed + 1 rhs-exclusion + the corpus test + the two critical-edge tests + params-by-scanning).
+Expected: 21 tests pass — the 20 currently passing on `main` (3 scaffolding + 2 liveness + 15 in `intervals.rs`, after the Task 5 corrections noted above changed which tests exist), plus this task's 1 new rhs-exclusion test.
 
 - [ ] **Step 6: Run the FULL workspace test suite, fmt, clippy**
 
@@ -1702,7 +1751,7 @@ git commit -m "feat(forge-regalloc): rhs register-exclusion side channel for Int
 
 - [ ] **Step 1: Full workspace test run**
 
-Run: `cargo test --workspace 2>&1 | tail -80`. Expect approximately 385 tests total across the workspace (per this plan's own execution-based review), with `forge-regalloc` contributing ~18 and `forge-x64` lib contributing 95 (up from 94 pre-Task-1). Report exact final counts.
+Run: `cargo test --workspace 2>&1 | tail -80`. As of the post-Task-5-correction state of `main`, the workspace is at 388 passing with `forge-regalloc` contributing 20; Task 6 adds one more test, so expect 389 / 21 once it lands. (An earlier draft of this plan predicted ~385 / ~18 — the difference is the extra regression tests the two post-implementation corrections added, not a discrepancy.) Report exact final counts.
 
 - [ ] **Step 2: Clippy**
 
