@@ -3,5 +3,10 @@ name = "forge-x64"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+forge-ir = { path = "../forge-ir" }
+
 [dev-dependencies]
 iced-x86.workspace = true
+forge-syntax = { path = "../forge-syntax" }
+smallvec.workspace = true

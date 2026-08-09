@@ -129,7 +129,10 @@ version = "0.1.0"
 name = "forge-x64"
 version = "0.1.0"
 dependencies = [
+ "forge-ir",
+ "forge-syntax",
  "iced-x86",
+ "smallvec",
 ]
 
 [[package]]
