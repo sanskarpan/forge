@@ -83,13 +83,18 @@ extern "C" {
 pub fn libm_address(func: LibFunc) -> i64 {
     type Unary = unsafe extern "C" fn(f64) -> f64;
     type Binary = unsafe extern "C" fn(f64, f64) -> f64;
+    // The extra `as usize` hop before `as i64` is required, not stylistic:
+    // casting a function pointer directly to i64 trips clippy::fn_to_numeric_cast
+    // (a default-warn lint under this project's -D warnings gate) -- casting
+    // through usize first (the pointer-width unsigned integer type) is the
+    // idiomatic way to convert a fn pointer to an integer without tripping it.
     match func {
-        LibFunc::Sin => sin as Unary as i64,
-        LibFunc::Cos => cos as Unary as i64,
-        LibFunc::Tan => tan as Unary as i64,
-        LibFunc::Exp => exp as Unary as i64,
-        LibFunc::Log => log as Unary as i64,
-        LibFunc::Pow => pow as Binary as i64,
+        LibFunc::Sin => sin as Unary as usize as i64,
+        LibFunc::Cos => cos as Unary as usize as i64,
+        LibFunc::Tan => tan as Unary as usize as i64,
+        LibFunc::Exp => exp as Unary as usize as i64,
+        LibFunc::Log => log as Unary as usize as i64,
+        LibFunc::Pow => pow as Binary as usize as i64,
     }
 }
 ```
@@ -108,7 +113,9 @@ Exported from `lib.rs` as `pub use libm::libm_address;`.
 
 ## Testing
 
-- `libm_address` returns a distinct, real, callable address for at least one representative unary function (`Sin`) and the one binary function (`Pow`) — cast back through the same `Unary`/`Binary` function-pointer types used internally, call with representative inputs, compare against `f64::sin()`/`f64::powf()` for **bit-exact** equality (not approximate — same underlying libm implementation, so exact equality is the correct, achievable bar, matching this project's existing FMA-vs-approximation precision discipline of never silently accepting approximate behavior where exact is achievable).
+**Existing test that must be replaced, not just left alone**: `machine_inst/tests.rs` currently has `select_panics_on_call_with_a_clear_deferral_message`, a `#[should_panic(expected = "Phase 7e")]` test asserting `Inst::Call` still panics — a direct consequence of 7a-7d's `unimplemented!("libm call lowering ships in Phase 7e")` message. Once this slice replaces that panic with a real `CallLibm` push, this test's premise is gone and it must be deleted and replaced with a real assertion on the produced `MachineInst` (folded into the two golden-`Vec<MachineInst>` tests below) — otherwise the suite ships with a guaranteed-failing test.
+
+- `libm_address` returns a distinct, real, callable address for at least one representative unary function (`Sin`) and the one binary function (`Pow`) — cast back through the same `Unary`/`Binary` function-pointer types used internally, call with representative inputs, compare against `f64::sin()`/`f64::powf()` for **bit-exact** equality (not approximate — same underlying libm implementation, so exact equality is the correct, achievable bar, matching this project's existing FMA-vs-approximation precision discipline of never silently accepting approximate behavior where exact is achievable). **Hazard, already hit once by this codebase**: `crates/forge-opt/src/strength.rs`'s own comments (around its `libm_pow` test oracle) document that at `--release`, LLVM's `LibCallSimplifier` recognizes calls literally named `pow`/`sin`/etc — even through a hand-written `extern "C"` declaration, not just `f64::powf` — and rewrites special-cased exponents/inputs (e.g. `pow(x, 2.0)`, `pow(x, -1.0)`, `pow(x, 0.5)`) to `fmul`/`fdiv`/`sqrt` at compile time, which would make comparing against `f64::powf` for exactly those inputs circular (both sides silently become the same rewritten expression, not independent implementations). Avoid this two ways: (1) don't pick test inputs matching a known special-cased identity — the representative inputs already chosen for this task (`{0.5, 1.0, 2.0, -1.5}` unary, `(2.0, 10.0)` for `Pow`) aren't special-cased and are fine as-is; (2) route the `f64::*` oracle side through `std::hint::black_box` as well, the same fix `strength.rs` already applies to its own oracle, for defense in depth against a future test-writer adding a special-cased input without realizing the risk.
 - `libm_address` returns six pairwise-distinct addresses (one assertion, all six `LibFunc` variants) — guards against a copy-paste mistake where two arms accidentally return the same extern symbol's address.
 - `select_inst`'s new `Inst::Call` arm: golden-`Vec<MachineInst>`-style tests (matching every other `machine_inst/tests.rs` test), one for a unary call (`sin(x)` → `CallLibm { dst, func: LibFunc::Sin, args: [x] }`) and one for the binary case (`pow(x, y)` → `CallLibm { dst, func: LibFunc::Pow, args: [x, y] }`), confirming the exact `MachineInst` shape produced, not just "doesn't panic."
 - A coalescing-hints regression test: `compute_coalescing_hints` on a `CallLibm`-containing instruction sequence produces no hint entry for the call's `dst` (guards against a future accidental match-arm addition reintroducing an incorrect hint).
@@ -121,6 +128,7 @@ Exported from `lib.rs` as `pub use libm::libm_address;`.
 3. `libm_address(func: LibFunc) -> i64` exists in `crates/forge-x64/src/libm.rs`, exported from `lib.rs`, correctly resolving all 6 `LibFunc` variants to real, distinct, callable libc symbol addresses.
 4. `CallLibm` does not produce a coalescing hint and does not get wrongly suppressed by the lea-fusion pre-pass.
 5. Tests cover: `libm_address`'s bit-exact correctness against Rust's own math functions (at least `Sin` and `Pow`), all-six-addresses-distinct, `select_inst`'s new arm's exact `MachineInst` output for both unary and binary calls, the coalescing-hints non-participation, and the fusable-scaled-index non-suppression.
+5a. The now-obsolete `select_panics_on_call_with_a_clear_deferral_message` test is removed and replaced by real `CallLibm`-shape assertions (see "Testing" section) — the suite has no test left asserting `Inst::Call` panics.
 6. `cargo test --workspace` green, `cargo clippy --workspace -- -D warnings` and `cargo fmt --check` clean.
 7. No regressions in any Phase 6/7a-7d `forge-x64` test or any other crate's tests.
 8. CHECKLIST.md's remaining Phase 7 bullets get accurate `**note (Phase 7e):**` annotations distinguishing what this slice actually delivers (selection + address resolution) from what's explicitly still deferred to the new "final code-emission pipeline" task (the real spill/marshal/align/call/restore byte sequence and all four integration tests) — so nothing here gets silently miscounted as done.
