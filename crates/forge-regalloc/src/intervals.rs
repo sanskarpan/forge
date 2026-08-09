@@ -15,12 +15,18 @@ use std::collections::HashMap;
 /// approximation: `end` covers every position a value is live across, not
 /// just its last textual use inside its own block. φ destinations and all
 /// their incoming values are then merged into one shared range AND given
-/// mutual hints toward the φ's own destination (see `merge_phi_intervals`),
-/// and two-address hints are copied from
-/// `SelectedFunction::coalescing_hints`. NOTHING populates `Interval::fixed`
-/// -- see `populate_fixed_registers`' own doc comment and the design doc's
-/// corrected "Fixed registers" section for why `Param`/`IntDiv`/`IntRem`
-/// are emission-time copies rather than whole-lifetime register pins.
+/// mutual hints toward the group's SMALLEST-numbered `Value` -- not toward
+/// the φ's own destination, which would point every hint forward in scan
+/// order (see `merge_phi_intervals`). Two-address hints are copied from
+/// `SelectedFunction::coalescing_hints` afterwards, and deliberately do NOT
+/// overwrite a φ-group hint already set (see `populate_two_address_hints`).
+/// NOTHING populates `Interval::fixed` -- see `populate_fixed_registers`'
+/// own doc comment and the design doc's corrected "Fixed registers" section
+/// for why `Param`/`IntDiv`/`IntRem` are emission-time copies rather than
+/// whole-lifetime register pins. `rhs` (the divisor) is NOT handled here
+/// either -- it's the one genuinely allocation-time idiv constraint,
+/// exposed separately via `excluded_registers` (Task 6; not yet implemented
+/// as of this commit).
 ///
 /// The returned `Vec` is sorted by `(start, end, value)`: construction is
 /// `HashMap`-backed, whose iteration order is not stable across runs on
@@ -241,10 +247,12 @@ fn merge_phi_intervals(func: &Function, intervals: &mut HashMap<Value, Interval>
         }
     }
 
-    // One pass to collect each class's merged bounds, one to write them
-    // back -- a member with no interval (a φ whose block never selected,
-    // say) simply contributes nothing and receives nothing.
+    // One pass to collect each class's merged bounds AND membership, one
+    // to write bounds back, one to set mutual hints -- a member with no
+    // interval (a φ whose block never selected, say) simply contributes
+    // nothing and receives nothing.
     let mut bounds: HashMap<Value, (u32, u32)> = HashMap::new();
+    let mut group_members: HashMap<Value, Vec<Value>> = HashMap::new();
     for &m in &members {
         let Some(iv) = intervals.get(&m) else {
             continue;
@@ -253,6 +261,7 @@ fn merge_phi_intervals(func: &Function, intervals: &mut HashMap<Value, Interval>
         let entry = bounds.entry(root).or_insert((iv.start, iv.end));
         entry.0 = entry.0.min(iv.start);
         entry.1 = entry.1.max(iv.end);
+        group_members.entry(root).or_default().push(m);
     }
     for &m in &members {
         let root = find(&mut parent, m);
@@ -265,35 +274,29 @@ fn merge_phi_intervals(func: &Function, intervals: &mut HashMap<Value, Interval>
         }
     }
 
-    // Beyond the range merge, every group member ALSO needs a mutual hint
-    // toward one canonical anchor (the phi's own destination) -- N
-    // intervals with an identical range and no hint look like N mutually
-    // interfering values to 8b, not one coalescing group. The hint is
-    // soft (per this project's established "not honoring a hint is not
-    // an error" convention); the deferred final-emission task is
-    // responsible for inserting a real parallel copy for any group
-    // member 8b/8c didn't manage to co-locate -- the fallback Phase 7a's
-    // own design doc already anticipated ("insert parallel-copy moves at
-    // predecessor block ends otherwise") but which doesn't exist yet.
-    //
-    // This is a genuinely separate pass over `func.insts` rather than a
-    // fold into the bounds loop above: that loop iterates `members`, a
-    // flat list of every value touched by ANY phi across the whole
-    // function, so it cannot cleanly derive which phi is a given value's
-    // anchor -- re-walking `Inst::Phi` directly can.
-    for (i, inst) in func.insts.iter().enumerate() {
-        let Inst::Phi { incoming } = inst else {
-            continue;
-        };
-        let phi_value = Value(i as u32);
-        if !intervals.contains_key(&phi_value) {
+    // Mutual hints: every non-anchor member hints toward the group's
+    // SMALLEST-Value-number member, NOT the phi's own destination. After
+    // the bounds merge above, every group member shares an identical
+    // range, so 8b's scan-order tie-break falls to raw Value number --
+    // and a phi's own Value is virtually always numbered HIGHER than its
+    // incoming values (SSA construction builds predecessor blocks, and
+    // the values within them, before sealing the join block and minting
+    // the phi). Anchoring on the phi would point every hint FORWARD in
+    // scan order, violating the documented "a hint always points at an
+    // already-assigned interval" contract this file depends on -- see the
+    // design doc's twice-corrected "phi-operand hints" section for the
+    // full reasoning and the empirical case that caught this.
+    for members_of_group in group_members.values() {
+        if members_of_group.len() < 2 {
             continue;
         }
-        for &(_, incoming_value) in incoming.iter() {
-            if let Some(iv) = intervals.get_mut(&incoming_value) {
-                if iv.hint.is_none() {
-                    iv.hint = Some(phi_value);
-                }
+        let anchor = *members_of_group.iter().min_by_key(|v| v.0).unwrap();
+        for &m in members_of_group {
+            if m == anchor {
+                continue;
+            }
+            if let Some(iv) = intervals.get_mut(&m) {
+                iv.hint = Some(anchor);
             }
         }
     }
@@ -339,7 +342,16 @@ fn populate_two_address_hints(
 ) {
     for (&dst, &preferred) in &selected.coalescing_hints {
         if let Some(iv) = intervals.get_mut(&dst) {
-            iv.hint = Some(preferred);
+            // A phi-group hint (set by merge_phi_intervals, which runs
+            // before this function) is a HARD co-location requirement
+            // with no cheap fallback except a not-yet-built parallel
+            // copy at a predecessor block's end -- it must never be
+            // overwritten by an ordinary two-address hint, which is
+            // always trivially fixable by a `mov` at emission time
+            // regardless of whether it's honored.
+            if iv.hint.is_none() {
+                iv.hint = Some(preferred);
+            }
         }
     }
 }
@@ -568,12 +580,196 @@ mod tests {
         assert_eq!((else_iv.start, else_iv.end), (2, 6));
         assert_eq!((phi_iv.start, phi_iv.end), (2, 6));
 
-        // Beyond the range merge, both incoming values must ALSO hint toward
-        // the phi's own destination -- the merge alone isn't enough signal
-        // for an allocator to treat these as one coalescing group rather
-        // than N mutually interfering values with identical ranges.
-        assert_eq!(then_iv.hint, Some(phi));
-        assert_eq!(else_iv.hint, Some(phi));
+        // Beyond the range merge, every group member must ALSO hint toward
+        // one canonical anchor -- the merge alone isn't enough signal for
+        // an allocator to treat these as one coalescing group rather than
+        // N mutually interfering values with identical ranges. The anchor
+        // is the group's SMALLEST Value number, NOT the phi: emission
+        // order here is cond, then_val, else_val, phi, so then_val is the
+        // smallest of the three group members and the phi is the largest.
+        // Anchoring on the phi would point every hint FORWARD in 8b's
+        // (start, end, value) scan order, since all three share an
+        // identical range after the merge.
+        let anchor = *[then_val, else_val, phi]
+            .iter()
+            .min_by_key(|v| v.0)
+            .unwrap();
+        assert_eq!(anchor, then_val);
+        assert_eq!(then_iv.hint, None);
+        assert_eq!(else_iv.hint, Some(anchor));
+        assert_eq!(phi_iv.hint, Some(anchor));
+    }
+
+    #[test]
+    fn phi_hints_take_precedence_over_two_address_hints() {
+        // Uses a+b / a-b as the if/else arms specifically because they
+        // produce REAL two-address hints (dst->lhs) from compute_coalescing_
+        // hints -- a constants-only fixture has nothing for the phi hint to
+        // beat, so it can't distinguish "phi hint set" from "phi hint
+        // correctly won a precedence fight it needed to win."
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        let then_block = b.create_block();
+        let else_block = b.create_block();
+        let join = b.create_block();
+        b.add_pred(then_block, entry);
+        b.add_pred(else_block, entry);
+        b.add_pred(join, then_block);
+        b.add_pred(join, else_block);
+        b.seal_block(entry);
+
+        let a = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let bb = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let cond = b.emit(entry, Inst::ConstBool(true), Ty::Bool, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+            cond,
+            then_: then_block,
+            else_: else_block,
+        });
+
+        b.seal_block(then_block);
+        let sum = b.emit(then_block, Inst::Add(a, bb), Ty::I64, dummy_span());
+        b.f.blocks[then_block.0 as usize].term = Some(Terminator::Jump(join));
+
+        b.seal_block(else_block);
+        let diff = b.emit(else_block, Inst::Sub(a, bb), Ty::I64, dummy_span());
+        b.f.blocks[else_block.0 as usize].term = Some(Terminator::Jump(join));
+
+        b.seal_block(join);
+        let phi = b.emit(
+            join,
+            Inst::Phi {
+                incoming: smallvec::smallvec![(then_block, sum), (else_block, diff)],
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        b.f.blocks[join.0 as usize].term = Some(Terminator::Return(phi));
+
+        let selected = select(&b.f);
+        // Sanity check the fixture actually produces competing two-address
+        // hints before asserting anything about precedence -- if this map is
+        // empty, the test isn't exercising what it claims to.
+        assert!(!selected.coalescing_hints.is_empty());
+
+        let intervals = build_intervals(&b.f, &selected);
+        let sum_iv = intervals.iter().find(|iv| iv.value == sum).unwrap();
+        let diff_iv = intervals.iter().find(|iv| iv.value == diff).unwrap();
+        let phi_iv = intervals.iter().find(|iv| iv.value == phi).unwrap();
+
+        // The group's smallest Value is the anchor and keeps whatever hint
+        // it had (possibly None, possibly its own two-address hint toward
+        // `a` -- that's fine, it's not part of THIS group's hinting). The
+        // other two members must point at the anchor, NOT at `a`/`bb` (their
+        // own two-address hints) and NOT at the phi.
+        let group = [sum, diff, phi];
+        let anchor = *group.iter().min_by_key(|v| v.0).unwrap();
+        for (v, iv) in [(sum, sum_iv), (diff, diff_iv), (phi, phi_iv)] {
+            if v != anchor {
+                assert_eq!(
+                    iv.hint,
+                    Some(anchor),
+                    "{v:?}'s hint must point at the group anchor {anchor:?}, not survive as its own \
+                     two-address hint or point at the phi"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn six_int_and_eight_float_params_together_do_not_panic() {
+        // Confirms int and float parameter counts are tracked SEPARATELY
+        // (6 int + 8 float = 14 total, which would incorrectly panic against
+        // either single ABI list if the two classes were merged into one
+        // counter instead of counted independently).
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let mut params = Vec::new();
+        let mut last = None;
+        for i in 0..6u32 {
+            let v = b.emit(
+                entry,
+                Inst::Param {
+                    index: i,
+                    ty: Ty::I64,
+                },
+                Ty::I64,
+                dummy_span(),
+            );
+            params.push((format!("i{i}"), Ty::I64));
+            last = Some(v);
+        }
+        for i in 6..14u32 {
+            let v = b.emit(
+                entry,
+                Inst::Param {
+                    index: i,
+                    ty: Ty::F64,
+                },
+                Ty::F64,
+                dummy_span(),
+            );
+            params.push((format!("f{i}"), Ty::F64));
+            last = Some(v);
+        }
+        b.f.params = params;
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(last.unwrap()));
+
+        let selected = select(&b.f);
+        let _ = build_intervals(&b.f, &selected); // must NOT panic
+    }
+
+    #[test]
+    fn degenerate_branch_with_identical_arms_does_not_falsely_trip_the_critical_edge_tripwire() {
+        // entry --Branch{then_==else_==target}--> target, target has a phi.
+        // Without deduping successors_of's output, this would be miscounted
+        // as 2 successors/2 edges-into-target and wrongly panic as if it
+        // were a critical edge, even though there's only ONE real
+        // control-flow path here.
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        let target = b.create_block();
+        b.add_pred(target, entry);
+        b.seal_block(entry);
+
+        let c0 = b.emit(entry, Inst::ConstI64(1), Ty::I64, dummy_span());
+        let cond = b.emit(entry, Inst::ConstBool(true), Ty::Bool, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+            cond,
+            then_: target,
+            else_: target,
+        });
+
+        b.seal_block(target);
+        let phi = b.emit(
+            target,
+            Inst::Phi {
+                incoming: smallvec::smallvec![(entry, c0)],
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        b.f.blocks[target.0 as usize].term = Some(Terminator::Return(phi));
+
+        let selected = select(&b.f);
+        let _ = build_intervals(&b.f, &selected); // must NOT panic
     }
 
     #[test]
