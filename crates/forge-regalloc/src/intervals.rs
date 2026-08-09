@@ -341,6 +341,14 @@ fn populate_two_address_hints(
     intervals: &mut HashMap<Value, Interval>,
 ) {
     for (&dst, &preferred) in &selected.coalescing_hints {
+        // Read the hinted value's scan key BEFORE taking the mutable
+        // borrow on `dst` below.
+        let Some(preferred_key) = intervals
+            .get(&preferred)
+            .map(|p| (p.start, p.end, p.value.0))
+        else {
+            continue;
+        };
         if let Some(iv) = intervals.get_mut(&dst) {
             // A phi-group hint (set by merge_phi_intervals, which runs
             // before this function) is a HARD co-location requirement
@@ -349,7 +357,20 @@ fn populate_two_address_hints(
             // overwritten by an ordinary two-address hint, which is
             // always trivially fixable by a `mov` at emission time
             // regardless of whether it's honored.
-            if iv.hint.is_none() {
+            //
+            // The second condition (preferred_key < dst's own scan key)
+            // guards a subtler case merge_phi_intervals can create: it
+            // widens a phi-group member's `start` BACKWARD to the group's
+            // minimum, which can push that member's scan position earlier
+            // than its own lhs's definition (e.g. lhs is defined in the
+            // OTHER if/else arm, which RPO lays out first). Without this
+            // check, `dst` would keep a hint pointing FORWARD at a value
+            // 8b hasn't assigned yet by the time it looks the hint up --
+            // violating the "a hint always points at an already-assigned
+            // interval" contract this whole mechanism depends on. Found
+            // empirically on `if a > b then (a*c)+(b*c) else a-b` and
+            // similar nested-arithmetic-in-a-branch programs.
+            if iv.hint.is_none() && preferred_key < (iv.start, iv.end, iv.value.0) {
                 iv.hint = Some(preferred);
             }
         }
@@ -885,6 +906,61 @@ mod tests {
                 for v in reads_of(inst).into_iter().chain(def_of(inst)) {
                     assert!(covered.contains(&v), "{src:?}: {v:?} has no interval");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn every_hint_points_backward_in_8bs_scan_order() {
+        // 8b resolves a hint by looking up the hinted Value in its own
+        // scan-time assignment map, built incrementally as it processes
+        // intervals in (start, end, value) order -- so a hint is only
+        // useful (and only SAFE to look up without a fallback) if it
+        // always points at an interval that sorts strictly earlier. This
+        // property held for every individual fixture test in this file,
+        // but three programs found by an earlier review round violated it
+        // via an interaction between merge_phi_intervals' backward start-
+        // widening and populate_two_address_hints' own hint -- included
+        // here specifically because they're what caught the bug, not
+        // because they're otherwise special.
+        for src in [
+            "3.14159 * r * r",
+            "sin(x) + cos(y)",
+            "(n * 2654435761) >> 16",
+            "x / y",
+            "x + 1",
+            "fma(a, b, c)",
+            "base + i * 8",
+            "let t = a - b in if t > 0.0 then t else -t",
+            "if a > b then (if a > c then a else c) else b",
+            "(if a > b then a else b) + a",
+            "sqrt(x * x + y * y)",
+            "abs(x) + floor(y) + ceil(z)",
+            "(n >> 1) % 7 + (n >> 1) / 7",
+            "if a > b then (a * c) + (b * c) else a - b",
+            "if a > b then (a - b) - (a + b) else c - a",
+            "if a > b then fma(a, b, c) else a * c",
+        ] {
+            let func = front_end(src);
+            let selected = select(&func);
+            let intervals = build_intervals(&func, &selected);
+
+            for iv in &intervals {
+                let Some(h) = iv.hint else { continue };
+                let hinted = intervals.iter().find(|x| x.value == h).unwrap_or_else(|| {
+                    panic!(
+                        "{src:?}: {:?} hints at {h:?}, which has no interval",
+                        iv.value
+                    )
+                });
+                assert!(
+                    (hinted.start, hinted.end, hinted.value.0) < (iv.start, iv.end, iv.value.0),
+                    "{src:?}: {:?} {:?} hints FORWARD at {h:?} {:?} -- 8b resolves hints via \
+                     its scan-time assignment map and would find nothing there",
+                    iv.value,
+                    (iv.start, iv.end),
+                    (hinted.start, hinted.end)
+                );
             }
         }
     }

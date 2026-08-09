@@ -1627,8 +1627,9 @@ git commit -m "feat(forge-regalloc): build_intervals with liveness, phi-merging 
 ## Task 6: `rhs`-exclusion side channel for `IntDiv`/`IntRem`
 
 > **STILL TO DO — this is the one part of this plan not yet implemented**
-> (confirmed: `excluded_registers` does not appear anywhere in
-> `crates/forge-regalloc/`). Task 6 is UNAFFECTED by the corrections noted
+> (confirmed: `excluded_registers` is not implemented anywhere in
+> `crates/forge-regalloc/` — it appears only as a forward-reference in a
+> doc comment). Task 6 is UNAFFECTED by the corrections noted
 > on Task 5: `excluded_registers` is a separate candidate-exclusion side
 > channel that never touched `Interval::fixed`, and the design doc still
 > calls `rhs` the one genuinely allocation-time idiv constraint (a divisor
