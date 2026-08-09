@@ -554,6 +554,52 @@ pub struct Interval {
     pub spill_weight: f32,          // uses / length — spill the cheapest
 }
 
+/// NOTE (Phase 8a): the shipped `Interval`
+/// (`crates/forge-regalloc/src/interval.rs`) keeps all seven fields above,
+/// but diverges from this sketch in three ways that later phases must not
+/// re-derive from the sketch:
+///
+/// 1. `[start, end]` is INCLUSIVE, not the `[start, end)` the doc comment
+///    above states. `end` is the position of the value's LAST READ, and the
+///    value is still live AT that instruction. So `[0,2]` and `[2,4]` DO
+///    overlap, and every overlap predicate (8b's scan, 8d's independent
+///    verifier) must use `a.start <= b.end && b.start <= a.end`, never a
+///    half-open comparison.
+///
+/// 2. `hint` is `Option<Value>`, not `Option<PhysReg>`. Hints are populated
+///    when intervals are built, before any register has been assigned to
+///    anything, so `Option<PhysReg>` genuinely cannot represent the thing a
+///    hint needs to say: "co-locate with whatever register some OTHER
+///    not-yet-allocated value ends up in." 8b resolves the `Value` through
+///    its own scan-time `assignment` map; this is safe because a hint is
+///    guaranteed by construction to point at a strictly-earlier interval in
+///    `(start, end, value)` scan order (guarded by a corpus-wide property
+///    test in `intervals.rs`).
+///
+/// 3. `fixed` is ALWAYS `None` as of Phase 8a — which also makes `run()`'s
+///    `if let Some(phys) = self.intervals[i].fixed` branch below dead code
+///    for now. This is a finding, not an omission. Treating `fixed` as the
+///    whole-lifetime pin this sketch implies produces UNSATISFIABLE
+///    constraint sets on trivial programs: `a/b + c/d` pins two overlapping
+///    quotients to rax forever, and a 3rd int param (rdx) collides the same
+///    way with an `IntRem` result. Every "fixed register" requirement
+///    currently known — a `Param`'s incoming ABI register, `IntDiv`'s rax,
+///    `IntRem`'s rdx — is really a POINT constraint holding for exactly one
+///    instruction, after which the value is an ordinary virtual register;
+///    expressing a point constraint as a lifetime property is what makes it
+///    unsatisfiable. Properly fixing that needs interval SPLITTING, which
+///    this design has no mechanism for, so those three are handled as
+///    emission-time copies instead (recomputed from the `MachineInst` and
+///    `func.params` with zero `Interval` involvement). The one genuinely
+///    allocation-time case — `idiv`'s DIVISOR, which `cqo`/`idiv` destroys
+///    before any copy could run — is exposed separately by
+///    `excluded_registers() -> HashMap<(usize, Value), Vec<PhysReg>>`,
+///    keyed at the `idiv`'s instruction position rather than over the
+///    divisor's whole lifetime. The field stays in the struct because a
+///    genuinely whole-lifetime hardware constraint may appear in a future
+///    `MachineInst` variant. See the Phase 8a design doc's corrected "Fixed
+///    registers" section.
+
 pub struct LinearScan {
     intervals: Vec<Interval>,       // sorted by start
     active: Vec<usize>,             // sorted by END — the key invariant
