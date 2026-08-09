@@ -311,7 +311,7 @@ impl<'a> Selector<'a> {
             }),
 
             // Remaining variants are filled in by later tasks in this plan.
-            _ => todo!("filled in by Tasks 2-6 of the Phase 7a plan"),
+            _ => todo!("filled in by Tasks 4-6 of the Phase 7a plan"),
         }
     }
 
