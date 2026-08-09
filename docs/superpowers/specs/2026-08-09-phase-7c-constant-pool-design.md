@@ -59,6 +59,8 @@ impl ConstantPool {
 
 `Selector` gains a `pool: ConstantPool` field (alongside `fully_fusable_scaled_indices` etc.), and `SelectedFunction` gains `pub pool: ConstantPool`, populated from `sel.pool` at the end of `select()` — the same "extend the struct, extend the final assembly in `select()`'s return" pattern 7b's `coalescing_hints` already established.
 
+`ConstantPool` and `PoolIndex` are both re-exported from `crates/forge-x64/src/lib.rs` (`pub use machine_inst::{select, ConstantPool, MachineInst, PoolIndex, SelectedFunction};`), matching how `MachineInst`/`SelectedFunction` are already exported — for consistency, and because Phase 8 will need to name these types once register allocation starts consuming `SelectedFunction::pool`, even though nothing outside the crate touches them yet.
+
 Two `select_inst` arms change:
 
 ```rust
@@ -87,6 +89,14 @@ Ty::F64 => {
 
 Note the mask constants are interned as `u64` bit patterns (`i64::MIN as u64`, not `i64::MIN` directly) — `ConstantPool` stores raw 8-byte patterns uniformly regardless of whether they originated as an f64 bit pattern or an i64 bit pattern used as a bitmask; the distinction only matters to whatever eventually loads them (a `movsd`-shaped load for f64 constants vs. a `movq`-into-GPR-then-`andpd`/`xorpd` shaped load for masks — still the emission step's job, unchanged from 7a's original design intent, just now sourced from the pool instead of a synthetic per-call-site immediate).
 
+## `intern` deliberately dedupes across "different kinds" of constant, and this is safe by construction
+
+`ConstantPool::intern` keys purely on the raw `u64` bit pattern, with no notion of "this came from an f64 literal" vs. "this came from a sign mask." This is a deliberate choice, not an oversight, and it has a real, worked consequence worth stating explicitly: `i64::MIN as u64` (`0x8000_0000_0000_0000`, `Neg`'s mask) is bit-for-bit identical to the IEEE-754 encoding of `-0.0f64`. So a function containing both a literal `-0.0` and a `Neg` on any f64 value will have `LoadImmF64`'s `pool_index` and `FloatNeg`'s `mask_pool` collide onto the *same* `PoolIndex` — deliberately, not as a bug.
+
+This is safe because the load *strategy* is determined by which `MachineInst` variant references a `PoolIndex`, never by inspecting the pool entry itself: `LoadImmF64{pool_index}` unconditionally means "load these 8 bytes as an f64 value" (eventually a `movsd_reg_riprel`); `FloatAbs`/`FloatNeg{mask_pool}` unconditionally means "load these 8 bytes as a bitmask" (eventually a GPR round-trip + `andpd`/`xorpd`). The pool is a passive, read-only byte store — both interpretations read the identical, unmutated 8 bytes, there's no write/aliasing hazard, and both interpretations are independently *correct* for their own purpose, since the bits genuinely are the value each call site wants. Keying `intern` on raw bits rather than on `f64` equality is itself required for correctness elsewhere too: it's what keeps `+0.0` (`0x0`) and `-0.0` (`0x8000...0`) in *separate* pool slots despite comparing equal under IEEE `==` — an f64-equality-keyed pool would incorrectly merge them.
+
+**One real second-order consequence for a future slice, not this one**: if the eventual byte-emission/wiring step ever wants to give mask-only pool entries stricter alignment than value-only entries (e.g. 16-byte alignment to support a direct memory operand for `andpd`/`xorpd` instead of the GPR round-trip), it can no longer assume "each entry only ever needs one alignment class" — a shared entry like the `-0.0`/`Neg`-mask collision needs the *union* of whatever every consumer of that entry requires. The simplest fix (align every pool entry uniformly, regardless of how it's used) sidesteps this entirely and is cheap; noted here so whoever designs that later slice isn't surprised by it.
+
 ## Testing
 
 Golden-`SelectedFunction` tests (checking both `insts` and the new `pool`):
@@ -98,6 +108,7 @@ Golden-`SelectedFunction` tests (checking both `insts` and the new `pool`):
 - **Two `Abs` calls in one function share the mask pool entry**: `abs(x) + abs(y)` asserts both `FloatAbs`s reference the SAME `PoolIndex`, and `pool.entries().len() == 1` (just the one mask, even with two `Abs` call sites).
 - **`Abs` and `Neg` do NOT share a pool entry with each other** (different masks): a function using both asserts `pool.entries().len() == 2` and the two `PoolIndex`es differ.
 - Confirm `Fma`'s `mul_tmp` mechanism is genuinely unchanged: one test rebuilding 7a's original `Fma` golden-sequence test unmodified, confirming it still passes byte-for-byte identically (proving this slice didn't accidentally touch unrelated code).
+- **Cross-kind collision, the case worked through above**: a function containing a literal `-0.0` (`Inst::ConstF64((-0.0f64).to_bits())`) AND a `Neg` on some other f64 value — asserts `LoadImmF64`'s `pool_index` and `FloatNeg`'s `mask_pool` are the SAME `PoolIndex`, and `pool.entries().len() == 1`. This is the intended, correct behavior (not a bug to guard against), and the test's own comment should say so explicitly, so a future reader doesn't "fix" it.
 
 ## Exit criteria
 
@@ -106,6 +117,7 @@ Golden-`SelectedFunction` tests (checking both `insts` and the new `pool`):
 3. `MachineInst::LoadImmF64` carries `pool_index: PoolIndex` instead of `bits: u64`; `Inst::ConstF64`'s arm interns instead of embedding.
 4. `MachineInst::FloatAbs`/`FloatNeg` carry `mask_pool: PoolIndex` instead of `mask_tmp: Value`; their arms intern the fixed mask constant instead of minting a synthetic `Value` + `LoadImmI64`.
 5. Every existing 7a/7b test referencing the old `LoadImmF64`/`FloatAbs`/`FloatNeg` shapes is updated to the new shape (compile errors will force this — Rust's exhaustive field requirements make silently missing one impossible).
-6. Tests cover single-constant interning, cross-call-site deduplication (both for f64 literals and for shared masks), non-deduplication of genuinely different constants, and confirm `Fma`'s unrelated `mul_tmp` mechanism is untouched.
-7. `cargo test --workspace` green, `cargo clippy --workspace -- -D warnings` and `cargo fmt --check` clean.
-8. No regressions in any Phase 6 `forge-x64` test or any other crate's tests.
+6. Tests cover single-constant interning, cross-call-site deduplication (both for f64 literals and for shared masks), non-deduplication of genuinely different constants, the deliberate cross-kind collision (`-0.0` literal and `Neg`'s mask sharing one `PoolIndex`), and confirm `Fma`'s unrelated `mul_tmp` mechanism is untouched.
+7. `ConstantPool`/`PoolIndex` are re-exported from `crates/forge-x64/src/lib.rs`.
+8. `cargo test --workspace` green, `cargo clippy --workspace -- -D warnings` and `cargo fmt --check` clean.
+9. No regressions in any Phase 6 `forge-x64` test or any other crate's tests.
