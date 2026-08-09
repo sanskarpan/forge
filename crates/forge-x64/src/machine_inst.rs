@@ -271,6 +271,10 @@ impl<'a> Selector<'a> {
             },
             Inst::Neg(a) => match self.ty_of(*a) {
                 Ty::F64 => {
+                    // i64::MIN == 0x8000_0000_0000_0000: only the sign bit
+                    // set. XOR-ing this into the value FLIPS the sign bit
+                    // (negation) -- contrast Abs's mask below, which CLEARS
+                    // it via AND instead.
                     let mask_tmp = self.fresh(Ty::I64);
                     self.insts.push(MachineInst::LoadImmI64 { dst: mask_tmp, imm: i64::MIN });
                     self.insts.push(MachineInst::FloatNeg { dst, src: *a, mask_tmp });
@@ -335,6 +339,10 @@ impl<'a> Selector<'a> {
             Inst::FToI(a) => self.insts.push(MachineInst::FloatToInt { dst, src: *a }),
 
             Inst::Abs(a) => {
+                // 0x7FFF_FFFF_FFFF_FFFF: every bit set EXCEPT the sign bit.
+                // AND-ing this into the value CLEARS the sign bit
+                // (absolute value) -- contrast Neg's mask above, which
+                // FLIPS it via XOR instead.
                 let mask_tmp = self.fresh(Ty::I64);
                 self.insts.push(MachineInst::LoadImmI64 {
                     dst: mask_tmp,
@@ -342,6 +350,11 @@ impl<'a> Selector<'a> {
                 });
                 self.insts.push(MachineInst::FloatAbs { dst, src: *a, mask_tmp });
             }
+            // NOT bit-identical to a real hardware FMA (that's a single
+            // rounding; this is two -- multiply rounds once, then add
+            // rounds again). Correct interim behavior until AVX/FMA3
+            // lands (Phase 6's VEX/AVX subsection, not yet built) --
+            // documented loudly rather than silently approximated.
             Inst::Fma { a, b, c } => {
                 let mul_tmp = self.fresh(Ty::F64);
                 self.insts.push(MachineInst::FloatMul { dst: mul_tmp, lhs: *a, rhs: *b });
