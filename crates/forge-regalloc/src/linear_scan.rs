@@ -409,4 +409,42 @@ mod tests {
             "excluded even though it's the hint target's register"
         );
     }
+
+    #[test]
+    fn pick_register_case2_when_active_position_differs_from_interval_index() {
+        // DISCRIMINATION FIXTURE: `pos` (from `active.iter().position(...)`)
+        // indexes `active`, NOT `intervals` directly. Every OTHER Case 2
+        // fixture in this file has `active == vec![0]`, where the two
+        // coincide by coincidence -- so a bug conflating `intervals[pos]`
+        // with `intervals[active[pos]]`, or `active.remove(pos)` with
+        // `active.remove(active[pos])`, would pass every other test in this
+        // file. Here `pos == 0` but `active[pos] == 1`, so the conflation
+        // is genuinely caught: `other` (index 0) is long-lived and holds
+        // Rbx, `target` (index 1) is the real hint target and holds Rcx.
+        let other = iv(0, 0, 100, crate::interval::RegClass::Gpr);
+        let target = iv(1, 1, 3, crate::interval::RegClass::Gpr);
+        let mut dst = iv(2, 3, 5, crate::interval::RegClass::Gpr);
+        dst.hint = Some(Value(1));
+        let mut scan = LinearScan::new(vec![other, target, dst], &HashMap::new(), ALLOCATABLE_GPR);
+        scan.assign(0, Location::Reg(PhysReg::Rbx));
+        scan.assign(1, Location::Reg(PhysReg::Rcx));
+        scan.free_regs.remove(&PhysReg::Rbx);
+        scan.free_regs.remove(&PhysReg::Rcx);
+        // `active` is sorted by `end`: target (end=3) before other (end=100).
+        scan.active = vec![1, 0];
+
+        let picked = scan.pick_register(2, ALLOCATABLE_GPR);
+
+        assert_eq!(
+            picked,
+            Some(PhysReg::Rcx),
+            "must transfer the hint TARGET's register, not some other active interval's"
+        );
+        assert_eq!(
+            scan.active,
+            vec![0],
+            "only the target leaves active, and active stays sorted by end"
+        );
+        assert!(!scan.free_regs.contains(&PhysReg::Rcx));
+    }
 }
