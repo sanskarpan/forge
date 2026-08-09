@@ -202,15 +202,9 @@ pub struct SelectedFunction {
 }
 
 struct Selector<'a> {
-    // `func` and `next_value` are unread until Task 2 wires up `ty_of`'s
-    // and `fresh`'s call sites (Ty-dispatching arithmetic arms, synthetic
-    // mask/mul temps) -- allowed here since Task 1 intentionally leaves
-    // most of `select_inst`'s match as `todo!()`, per the plan.
-    #[allow(dead_code)]
     func: &'a Function,
     insts: Vec<MachineInst>,
     synthetic_types: HashMap<Value, Ty>,
-    #[allow(dead_code)]
     next_value: u32,
 }
 
@@ -221,7 +215,6 @@ impl<'a> Selector<'a> {
     /// pipeline (verified: no pass compacts or renumbers `f.insts`), so
     /// `next_value` seeded from `func.insts.len()` never collides with a
     /// real Value, and this dispatch on index is safe.
-    #[allow(dead_code)]
     fn ty_of(&self, v: Value) -> Ty {
         if (v.0 as usize) < self.func.types.len() {
             self.func.types[v.0 as usize]
@@ -230,7 +223,6 @@ impl<'a> Selector<'a> {
         }
     }
 
-    #[allow(dead_code)]
     fn fresh(&mut self, ty: Ty) -> Value {
         let v = Value(self.next_value);
         self.next_value += 1;
@@ -249,6 +241,50 @@ impl<'a> Selector<'a> {
                 imm: *v as i64,
             }),
             Inst::Param { index, .. } => self.insts.push(MachineInst::Param { dst, index: *index }),
+
+            Inst::Add(a, b) => match self.ty_of(*a) {
+                Ty::F64 => self.insts.push(MachineInst::FloatAdd { dst, lhs: *a, rhs: *b }),
+                Ty::I64 => self.insts.push(MachineInst::IntAdd { dst, lhs: *a, rhs: *b }),
+                Ty::Bool => unreachable!("Add never applies to Bool"),
+            },
+            Inst::Sub(a, b) => match self.ty_of(*a) {
+                Ty::F64 => self.insts.push(MachineInst::FloatSub { dst, lhs: *a, rhs: *b }),
+                Ty::I64 => self.insts.push(MachineInst::IntSub { dst, lhs: *a, rhs: *b }),
+                Ty::Bool => unreachable!("Sub never applies to Bool"),
+            },
+            Inst::Mul(a, b) => match self.ty_of(*a) {
+                Ty::F64 => self.insts.push(MachineInst::FloatMul { dst, lhs: *a, rhs: *b }),
+                Ty::I64 => self.insts.push(MachineInst::IntMul { dst, lhs: *a, rhs: *b }),
+                Ty::Bool => unreachable!("Mul never applies to Bool"),
+            },
+            Inst::Div(a, b) => match self.ty_of(*a) {
+                Ty::F64 => self.insts.push(MachineInst::FloatDiv { dst, lhs: *a, rhs: *b }),
+                Ty::I64 => self.insts.push(MachineInst::IntDiv { dst, lhs: *a, rhs: *b }),
+                Ty::Bool => unreachable!("Div never applies to Bool"),
+            },
+            Inst::Rem(a, b) => match self.ty_of(*a) {
+                Ty::I64 => self.insts.push(MachineInst::IntRem { dst, lhs: *a, rhs: *b }),
+                Ty::F64 => unimplemented!(
+                    "float remainder (fmod) has no native x86 instruction and isn't wired to a libm call yet"
+                ),
+                Ty::Bool => unreachable!("Rem never applies to Bool"),
+            },
+            Inst::Neg(a) => match self.ty_of(*a) {
+                Ty::F64 => {
+                    let mask_tmp = self.fresh(Ty::I64);
+                    self.insts.push(MachineInst::LoadImmI64 { dst: mask_tmp, imm: i64::MIN });
+                    self.insts.push(MachineInst::FloatNeg { dst, src: *a, mask_tmp });
+                }
+                Ty::I64 => self.insts.push(MachineInst::IntNeg { dst, src: *a }),
+                Ty::Bool => unreachable!("Neg never applies to Bool"),
+            },
+            Inst::And(a, b) => self.insts.push(MachineInst::And { dst, lhs: *a, rhs: *b }),
+            Inst::Or(a, b) => self.insts.push(MachineInst::Or { dst, lhs: *a, rhs: *b }),
+            Inst::Xor(a, b) => self.insts.push(MachineInst::Xor { dst, lhs: *a, rhs: *b }),
+            Inst::Not(a) => self.insts.push(MachineInst::Not { dst, src: *a }),
+            Inst::Shl(a, b) => self.insts.push(MachineInst::Shl { dst, lhs: *a, rhs: *b }),
+            Inst::Shr(a, b) => self.insts.push(MachineInst::Shr { dst, lhs: *a, rhs: *b }),
+            Inst::Sar(a, b) => self.insts.push(MachineInst::Sar { dst, lhs: *a, rhs: *b }),
 
             // Remaining variants are filled in by later tasks in this plan.
             _ => todo!("filled in by Tasks 2-6 of the Phase 7a plan"),
@@ -475,5 +511,369 @@ mod tests {
                 else_: else_b
             }
         );
+    }
+
+    /// Builds a block with two i64 params and one binary-op instruction
+    /// between them, returning the op's result -- the shared shape every
+    /// test below uses, parameterized by which Inst to build and which
+    /// MachineInst it should lower to.
+    fn select_i64_binop(
+        inst_ctor: impl FnOnce(Value, Value) -> Inst,
+    ) -> (SelectedFunction, Value, Value, Value) {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let y = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, inst_ctor(x, y), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+        let selected = select(&b.f);
+        (selected, x, y, r)
+    }
+
+    #[test]
+    fn select_lowers_int_add() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Add);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::IntAdd {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_int_sub() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Sub);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::IntSub {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_int_mul() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Mul);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::IntMul {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_int_div() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Div);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::IntDiv {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_int_rem() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Rem);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::IntRem {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    /// Float remainder (`x % y` on f64) is a real, exercised language
+    /// feature (see interp.rs's oracle) but has no native x86 instruction
+    /// and no libm route yet (LibFunc has no Fmod variant) -- deferred
+    /// with a clear panic, exactly like Call. This is NOT the same kind
+    /// of "acceptable interim approximation" as Fma's Mul+Add decomposition:
+    /// a naive `x - trunc(x/y)*y` software sequence can diverge
+    /// arbitrarily (catastrophic cancellation) from Rust's `%` for large
+    /// x/y ratios, which would be a real, unbounded correctness bug, not
+    /// a bounded/documented precision difference -- so it's deferred
+    /// entirely rather than approximated.
+    #[test]
+    #[should_panic(expected = "float remainder")]
+    fn select_panics_on_float_rem_with_a_clear_deferral_message() {
+        let (selected, ..) = select_f64_binop(Inst::Rem);
+        let _ = selected; // unreachable if select_f64_binop itself panics, which it must
+    }
+
+    #[test]
+    fn select_lowers_and() {
+        let (selected, x, y, r) = select_i64_binop(Inst::And);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::And {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_or() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Or);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::Or {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_xor() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Xor);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::Xor {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_shl() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Shl);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::Shl {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_shr() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Shr);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::Shr {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_sar() {
+        let (selected, x, y, r) = select_i64_binop(Inst::Sar);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::Sar {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    fn select_f64_binop(
+        inst_ctor: impl FnOnce(Value, Value) -> Inst,
+    ) -> (SelectedFunction, Value, Value, Value) {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let y = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, inst_ctor(x, y), Ty::F64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+        let selected = select(&b.f);
+        (selected, x, y, r)
+    }
+
+    /// Proves the SAME `Inst::Add` variant dispatches to FloatAdd (not
+    /// IntAdd) for f64 operands -- the exact risk this task's dispatch
+    /// exists to resolve correctly.
+    #[test]
+    fn select_lowers_float_add() {
+        let (selected, x, y, r) = select_f64_binop(Inst::Add);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::FloatAdd {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_float_sub() {
+        let (selected, x, y, r) = select_f64_binop(Inst::Sub);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::FloatSub {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_float_mul() {
+        let (selected, x, y, r) = select_f64_binop(Inst::Mul);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::FloatMul {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_float_div() {
+        let (selected, x, y, r) = select_f64_binop(Inst::Div);
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::FloatDiv {
+                dst: r,
+                lhs: x,
+                rhs: y
+            }
+        );
+    }
+
+    #[test]
+    fn select_lowers_int_neg() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, Inst::Neg(x), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        assert_eq!(selected.insts[1], MachineInst::IntNeg { dst: r, src: x });
+    }
+
+    /// Proves Neg's OTHER branch: an f64 operand mints a synthetic mask
+    /// temp and lowers to FloatNeg, not IntNeg -- the float counterpart to
+    /// select_lowers_int_neg above, both exercising the same dispatching
+    /// `Inst::Neg` arm.
+    #[test]
+    fn select_lowers_float_neg_via_a_synthetic_mask_temp() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, Inst::Neg(x), Ty::F64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        let mask_tmp = match &selected.insts[1] {
+            MachineInst::LoadImmI64 { dst, imm } => {
+                assert_eq!(*imm, i64::MIN);
+                *dst
+            }
+            other => panic!("expected LoadImmI64 for the mask temp, got {:?}", other),
+        };
+        assert_eq!(
+            selected.insts[2],
+            MachineInst::FloatNeg {
+                dst: r,
+                src: x,
+                mask_tmp
+            }
+        );
+        assert_eq!(selected.synthetic_types.get(&mask_tmp), Some(&Ty::I64));
+    }
+
+    #[test]
+    fn select_lowers_not() {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+            dummy_span(),
+        );
+        let r = b.emit(entry, Inst::Not(x), Ty::I64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(r));
+
+        let selected = select(&b.f);
+
+        assert_eq!(selected.insts[1], MachineInst::Not { dst: r, src: x });
     }
 }
