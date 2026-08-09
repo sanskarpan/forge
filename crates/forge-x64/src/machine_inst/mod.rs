@@ -1,6 +1,56 @@
 use forge_ir::{Block, CmpOp, Function, Inst, Terminator, Ty, Value};
 use std::collections::HashMap;
 
+/// An index into a ConstantPool's entries. Opaque outside this module,
+/// same "not usable across a different pool" caveat as Label is for a
+/// different Assembler (Phase 6a's precedent).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PoolIndex(usize);
+
+/// Deduplicating storage for the 8-byte constants (f64 literals, sign
+/// masks) instruction selection needs a real memory location for.
+/// Actual byte layout / RIP-relative addressing happens later, once a
+/// real Assembler and PhysReg assignments exist (post-Phase-8) -- this
+/// is purely the "what constants exist, and which ones are the same
+/// value" bookkeeping.
+///
+/// `intern` dedupes on the raw u64 bit pattern alone, deliberately not
+/// distinguishing "this came from an f64 literal" from "this is an
+/// integer bitmask" -- e.g. i64::MIN's bits equal -0.0f64's bits, and a
+/// function using both will correctly share one pool entry between them.
+/// This is safe: the pool is a passive, read-only byte store, and the
+/// LOAD STRATEGY is determined entirely by which MachineInst variant
+/// references a PoolIndex (LoadImmF64 always means "load as f64 value";
+/// FloatAbs/FloatNeg's mask_pool always means "load as bitmask"), never
+/// by inspecting the pool entry itself. Keying on raw bits rather than
+/// f64 equality is also what correctly keeps +0.0 (0x0) and -0.0
+/// (0x8000...0) in separate entries despite comparing equal under `==`.
+#[derive(Default)]
+pub struct ConstantPool {
+    entries: Vec<u64>,
+    index_of: HashMap<u64, PoolIndex>,
+}
+
+impl ConstantPool {
+    /// Returns the existing PoolIndex if `bits` was already interned,
+    /// otherwise appends a new entry and returns its index. This is the
+    /// ONLY way constants enter the pool -- callers never construct a
+    /// PoolIndex directly (outside this module/its test submodule).
+    pub fn intern(&mut self, bits: u64) -> PoolIndex {
+        if let Some(&idx) = self.index_of.get(&bits) {
+            return idx;
+        }
+        let idx = PoolIndex(self.entries.len());
+        self.entries.push(bits);
+        self.index_of.insert(bits, idx);
+        idx
+    }
+
+    pub fn entries(&self) -> &[u64] {
+        &self.entries
+    }
+}
+
 /// A machine-level instruction operating on virtual registers (SSA Values,
 /// reused directly from forge-ir -- one virtual register per SSA value, no
 /// separate VReg type). Sits between forge-ir's `Inst` and forge-x64's
@@ -21,7 +71,7 @@ pub enum MachineInst {
     },
     LoadImmF64 {
         dst: Value,
-        bits: u64,
+        pool_index: PoolIndex,
     },
 
     // Integer arithmetic -- destructive (dst must end up == lhs's location)
@@ -214,6 +264,7 @@ pub struct SelectedFunction {
     /// otherwise-mandatory `mov dst, lhs` copy. A hint that isn't honored
     /// is not an error -- emission falls back to inserting the copy.
     pub coalescing_hints: HashMap<Value, Value>,
+    pub pool: ConstantPool,
 }
 
 struct Selector<'a> {
@@ -222,6 +273,7 @@ struct Selector<'a> {
     synthetic_types: HashMap<Value, Ty>,
     next_value: u32,
     fully_fusable_scaled_indices: std::collections::HashSet<Value>,
+    pool: ConstantPool,
 }
 
 impl<'a> Selector<'a> {
@@ -253,9 +305,10 @@ impl<'a> Selector<'a> {
     /// with `_ => {}` -- that would defeat the whole point of this match.
     fn select_inst(&mut self, dst: Value, inst: &Inst) {
         match inst {
-            Inst::ConstF64(bits) => self
-                .insts
-                .push(MachineInst::LoadImmF64 { dst, bits: *bits }),
+            Inst::ConstF64(bits) => {
+                let pool_index = self.pool.intern(*bits);
+                self.insts.push(MachineInst::LoadImmF64 { dst, pool_index });
+            }
             Inst::ConstI64(v) => self.insts.push(MachineInst::LoadImmI64 { dst, imm: *v }),
             Inst::ConstBool(v) => self.insts.push(MachineInst::LoadImmI64 {
                 dst,
@@ -547,6 +600,7 @@ pub fn select(func: &Function) -> SelectedFunction {
         synthetic_types: HashMap::new(),
         next_value: func.insts.len() as u32,
         fully_fusable_scaled_indices,
+        pool: ConstantPool::default(),
     };
     for block in forge_ir::dominance::reverse_postorder(func) {
         for &v in &func.blocks[block.0 as usize].insts {
@@ -562,6 +616,7 @@ pub fn select(func: &Function) -> SelectedFunction {
         insts: sel.insts,
         synthetic_types: sel.synthetic_types,
         coalescing_hints,
+        pool: sel.pool,
     }
 }
 

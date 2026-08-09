@@ -41,10 +41,78 @@ fn select_lowers_an_f64_constant() {
     assert_eq!(
         selected.insts,
         vec![
-            MachineInst::LoadImmF64 { dst: c, bits },
+            MachineInst::LoadImmF64 {
+                dst: c,
+                pool_index: PoolIndex(0)
+            },
             MachineInst::Return { value: c },
         ]
     );
+    assert_eq!(selected.pool.entries(), &[bits]);
+}
+
+#[test]
+fn select_dedups_identical_f64_literals_into_one_pool_entry() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let bits = 0.5f64.to_bits();
+    let c1 = b.emit(entry, Inst::ConstF64(bits), Ty::F64, dummy_span());
+    let c2 = b.emit(entry, Inst::ConstF64(bits), Ty::F64, dummy_span());
+    let sum = b.emit(entry, Inst::Add(c1, c2), Ty::F64, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(sum));
+
+    let selected = select(&b.f);
+
+    assert_eq!(
+        selected.insts[0],
+        MachineInst::LoadImmF64 {
+            dst: c1,
+            pool_index: PoolIndex(0)
+        }
+    );
+    assert_eq!(
+        selected.insts[1],
+        MachineInst::LoadImmF64 {
+            dst: c2,
+            pool_index: PoolIndex(0)
+        }
+    );
+    assert_eq!(selected.pool.entries().len(), 1);
+}
+
+#[test]
+fn select_gives_different_f64_literals_different_pool_entries() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let c1 = b.emit(
+        entry,
+        Inst::ConstF64(1.0f64.to_bits()),
+        Ty::F64,
+        dummy_span(),
+    );
+    let c2 = b.emit(
+        entry,
+        Inst::ConstF64(2.0f64.to_bits()),
+        Ty::F64,
+        dummy_span(),
+    );
+    let sum = b.emit(entry, Inst::Add(c1, c2), Ty::F64, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(sum));
+
+    let selected = select(&b.f);
+
+    let pool_index_of = |v: Value| match selected
+        .insts
+        .iter()
+        .find(|i| matches!(i, MachineInst::LoadImmF64 { dst, .. } if *dst == v))
+    {
+        Some(MachineInst::LoadImmF64 { pool_index, .. }) => *pool_index,
+        _ => panic!("expected a LoadImmF64 for {:?}", v),
+    };
+    assert_ne!(pool_index_of(c1), pool_index_of(c2));
+    assert_eq!(selected.pool.entries().len(), 2);
 }
 
 #[test]
