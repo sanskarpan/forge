@@ -1139,6 +1139,24 @@ mod diamond_fusion_tests {
     }
 
     #[test]
+    fn float_eq_ne_diamonds_produce_no_fusion_at_all() {
+        // Closes a real gap found by mutation testing during code-quality
+        // review: no test previously constructed an Eq/Ne-shaped F64
+        // diamond, so a future refactor accidentally broadening the float
+        // table's match guards (e.g. `Lt | Eq`) would silently misclassify
+        // one as FloatMinMax with nothing to catch it.
+        let (func_eq, ..) = build_diamond(Ty::F64, Some(CmpOp::Eq), false, false);
+        let (fusions_eq, skip_eq) = find_fusable_diamonds(&func_eq);
+        assert!(fusions_eq.is_empty(), "Eq must not fuse -- no derived table for it");
+        assert!(skip_eq.is_empty());
+
+        let (func_ne, ..) = build_diamond(Ty::F64, Some(CmpOp::Ne), false, false);
+        let (fusions_ne, skip_ne) = find_fusable_diamonds(&func_ne);
+        assert!(fusions_ne.is_empty(), "Ne must not fuse -- no derived table for it");
+        assert!(skip_ne.is_empty());
+    }
+
+    #[test]
     fn float_third_value_diamond_produces_no_fusion_never_int_cmov() {
         // if a > b then a else c -- val_e (c) is NOT one of the comparison's
         // own operands, so this can't be a min/max rewrite, and it must NOT
