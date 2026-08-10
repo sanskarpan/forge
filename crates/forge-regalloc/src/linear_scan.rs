@@ -454,31 +454,47 @@ pub fn populate_spill_weights(selected: &SelectedFunction, intervals: &mut [Inte
     }
 }
 
-/// Runs linear scan once per register class (GPR, then XMM), merging
-/// both partitions' assignments into one final map. No hint or φ-group
-/// ever crosses a class boundary (every φ's incoming values, and every
-/// arithmetic MachineInst's operands/result, share one Ty and therefore
-/// one RegClass by construction), so splitting before scanning never
-/// orphans a hint that would have resolved across the split.
+/// Runs linear scan once per register class (GPR, then XMM), merging both
+/// partitions' assignments into one final map. No hint or φ-group ever
+/// crosses a class boundary, so splitting before scanning never orphans a
+/// hint that would have resolved across the split. `slot_end` is threaded
+/// GLOBALLY across both class passes (not reset per class) -- a `u32`
+/// slot index is a byte-offset multiplier into the stack frame, and both
+/// GPR- and XMM-class spilled values need 8 bytes, so both classes must
+/// draw from ONE shared numbering space or two independently-zeroed
+/// passes could assign the SAME slot number to two genuinely-live values.
 pub fn allocate(
     intervals: Vec<Interval>,
     excluded_registers: &HashMap<(usize, Value), Vec<PhysReg>>,
-) -> HashMap<Value, Location> {
+    selected: &SelectedFunction,
+) -> (HashMap<Value, Location>, u32) {
+    let mut intervals = intervals;
+    populate_spill_weights(selected, &mut intervals);
+
     let mut assignment = HashMap::new();
+    let mut slot_end: Vec<u32> = Vec::new();
     for (class, pool) in [
-        (RegClass::Gpr, ALLOCATABLE_GPR),
-        (RegClass::Xmm, ALLOCATABLE_XMM),
+        (RegClass::Gpr, SPILL_AWARE_ALLOCATABLE_GPR),
+        (RegClass::Xmm, SPILL_AWARE_ALLOCATABLE_XMM),
     ] {
         let class_intervals: Vec<Interval> = intervals
             .iter()
             .filter(|iv| iv.reg_class == class)
             .cloned()
             .collect();
-        let mut scan = LinearScan::new(class_intervals, excluded_registers, pool);
+        let mut scan = LinearScan::new(class_intervals, excluded_registers, pool, slot_end);
         scan.run();
-        assignment.extend(scan.assignment);
+        // Destructure rather than a consuming method call after a partial
+        // move -- `assignment.extend(scan.assignment)` immediately
+        // followed by a by-value method needing the WHOLE `scan` is a
+        // compile error (E0382) once `scan.assignment` has already been
+        // partially moved out. Destructuring both fields in one statement
+        // avoids ever having a whole-self method call after a partial move.
+        let LinearScan { assignment: class_assignment, slot_end: next_slot_end, .. } = scan;
+        assignment.extend(class_assignment);
+        slot_end = next_slot_end;
     }
-    assignment
+    (assignment, slot_end.len() as u32 * 8) // total bytes, 8 per slot
 }
 
 #[cfg(test)]
@@ -1100,7 +1116,7 @@ mod tests {
         let intervals = crate::intervals::build_intervals(&b.f, &selected);
         let excluded = crate::intervals::excluded_registers(&b.f, &selected);
 
-        let assignment = allocate(intervals, &excluded);
+        let (assignment, _bytes) = allocate(intervals, &excluded, &selected);
 
         // a and c share x's register via Case 2 handoffs (x -> a -> c).
         let x_loc = assignment[&x];
@@ -1119,7 +1135,7 @@ mod tests {
             let intervals = crate::intervals::build_intervals(&func, &selected);
             let excluded = crate::intervals::excluded_registers(&func, &selected);
 
-            let assignment = allocate(intervals.clone(), &excluded);
+            let (assignment, _bytes) = allocate(intervals.clone(), &excluded, &selected);
 
             for i in 0..intervals.len() {
                 for j in (i + 1)..intervals.len() {
@@ -1211,7 +1227,7 @@ mod tests {
             let selected = forge_x64::select(&func);
             let intervals = crate::intervals::build_intervals(&func, &selected);
             let excluded = crate::intervals::excluded_registers(&func, &selected);
-            let assignment = allocate(intervals.clone(), &excluded);
+            let (assignment, _bytes) = allocate(intervals.clone(), &excluded, &selected);
 
             for iv in &intervals {
                 let Some(hinted) = iv.hint else { continue };
@@ -1245,12 +1261,19 @@ mod tests {
             let selected = forge_x64::select(&func);
             let intervals = crate::intervals::build_intervals(&func, &selected);
             let excluded = crate::intervals::excluded_registers(&func, &selected);
-            let assignment = allocate(intervals.clone(), &excluded);
+            let (assignment, bytes) = allocate(intervals.clone(), &excluded, &selected);
 
             assert_eq!(
                 assignment.len(),
                 intervals.len(),
                 "{src:?}: every interval must get a Location"
+            );
+            assert_eq!(
+                bytes, 0,
+                "{src:?}: corpus programs never need a spill even under the narrower \
+                 SPILL_AWARE pools (max measured simultaneous liveness is 4 GPR / 7 XMM, \
+                 nowhere near the 12/14-register reduced pools) -- a nonzero byte count here \
+                 means something in this corpus started needing to spill"
             );
             for loc in assignment.values() {
                 assert!(
