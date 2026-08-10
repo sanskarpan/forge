@@ -131,6 +131,7 @@ pub struct LinearScan<'a> {
     assignment: HashMap<Value, Location>,
     excluded: HashMap<Value, HashSet<PhysReg>>,
     allocatable: &'a [PhysReg],
+    slot_end: Vec<u32>,
 }
 
 impl<'a> LinearScan<'a> {
@@ -138,6 +139,7 @@ impl<'a> LinearScan<'a> {
         intervals: Vec<Interval>,
         excluded_registers: &HashMap<(usize, Value), Vec<PhysReg>>,
         allocatable: &'a [PhysReg],
+        slot_end: Vec<u32>,
     ) -> Self {
         LinearScan {
             intervals,
@@ -146,6 +148,7 @@ impl<'a> LinearScan<'a> {
             assignment: HashMap::new(),
             excluded: precompute_excluded(excluded_registers),
             allocatable,
+            slot_end,
         }
     }
 
@@ -272,6 +275,39 @@ impl<'a> LinearScan<'a> {
         self.assign(i, Location::Reg(phys));
         self.active.push(i);
         self.active.sort_by_key(|&j| self.intervals[j].end);
+    }
+
+    /// Assigns interval `i` a spill slot. `slot_end[s]` records the
+    /// highest `end` any interval placed in slot `s` has ever had; a slot
+    /// is safe to reuse for interval `i` iff `slot_end[s] < i.start` --
+    /// the same inclusive-boundary rule `expire_old_intervals` uses for
+    /// registers (`end >= current_start` still means "in use"), just
+    /// phrased against the requesting interval's own start instead of a
+    /// scan cursor. This is deliberately order-independent: it gives the
+    /// same, correct answer whether `i` is the interval currently being
+    /// scanned or a victim from deep in `active` with a much earlier
+    /// `start` -- an earlier draft of this design instead ported
+    /// expire_old_intervals's cursor-relative expiry mechanism directly
+    /// (parameterized over slots instead of registers, with a `spilled`
+    /// list, `free_slots` stack, and `next_slot` counter) and execution
+    /// proved that literal port wrong twice over (reusing a slot still
+    /// live across a victim's own earlier range; a cross-class free_slots
+    /// thread colliding GPR and XMM spills onto the same slot). Comparing
+    /// only against the interval's own start avoids both failure modes
+    /// and needs no expiry step, no `spilled` list, and no `free_slots`
+    /// stack at all.
+    fn spill(&mut self, i: usize) {
+        self.active.retain(|&j| j != i);
+        let (start, end) = (self.intervals[i].start, self.intervals[i].end);
+        let slot = match self.slot_end.iter().position(|&e| e < start) {
+            Some(s) => s,
+            None => {
+                self.slot_end.push(0);
+                self.slot_end.len() - 1
+            }
+        };
+        self.slot_end[slot] = self.slot_end[slot].max(end);
+        self.assign(i, Location::Spill(slot as u32));
     }
 
     /// Explicitly stubbed, not built -- spilling ships in Phase 8c. This
@@ -500,7 +536,7 @@ mod tests {
 
     #[test]
     fn excluded_at_returns_empty_set_for_unlisted_value() {
-        let scan = LinearScan::new(vec![], &HashMap::new(), ALLOCATABLE_GPR);
+        let scan = LinearScan::new(vec![], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
         assert!(scan.excluded_at(Value(999)).is_empty());
     }
 
@@ -511,7 +547,7 @@ mod tests {
         // freed when processing the interval starting at 2.
         let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let b = iv(1, 2, 4, crate::interval::RegClass::Gpr);
-        let mut scan = LinearScan::new(vec![a.clone(), b], &HashMap::new(), ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![a.clone(), b], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         scan.free_regs.remove(&PhysReg::Rax); // a HOLDS Rax -- it is not free
@@ -530,7 +566,7 @@ mod tests {
     fn expire_old_intervals_frees_genuinely_disjoint_intervals() {
         let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let b = iv(1, 3, 4, crate::interval::RegClass::Gpr); // starts at 3, strictly after a.end=2
-        let mut scan = LinearScan::new(vec![a.clone(), b], &HashMap::new(), ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![a.clone(), b], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         scan.free_regs.remove(&PhysReg::Rax); // a HOLDS Rax -- it is not free
@@ -548,7 +584,7 @@ mod tests {
         let lhs = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let mut dst = iv(1, 2, 4, crate::interval::RegClass::Gpr);
         dst.hint = Some(Value(0));
-        let mut scan = LinearScan::new(vec![lhs.clone(), dst], &HashMap::new(), ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![lhs.clone(), dst], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         // lhs's register is NOT in free_regs (still "active") -- Case 2 must
@@ -580,7 +616,7 @@ mod tests {
         // rather than corpus-derived.
         let mut dst = iv(1, 5, 7, crate::interval::RegClass::Gpr);
         dst.hint = Some(Value(0));
-        let mut scan = LinearScan::new(vec![dst], &HashMap::new(), ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![dst], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
         // Value(0) held Rcx and has since expired: `LinearScan::new` seeds
         // `free_regs` with the whole pool, so Rcx is already free, and
         // Value(0) never enters `active`.
@@ -605,7 +641,7 @@ mod tests {
         let target = iv(0, 0, 10, crate::interval::RegClass::Gpr);
         let mut dst = iv(1, 2, 4, crate::interval::RegClass::Gpr);
         dst.hint = Some(Value(0));
-        let mut scan = LinearScan::new(vec![target.clone(), dst], &HashMap::new(), ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![target.clone(), dst], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         scan.free_regs.remove(&PhysReg::Rax); // target HOLDS Rax -- it is not free
@@ -625,7 +661,7 @@ mod tests {
         dst.hint = Some(Value(0));
         let mut raw: HashMap<(usize, Value), Vec<PhysReg>> = HashMap::new();
         raw.insert((2, Value(1)), vec![PhysReg::Rax]); // dst itself excluded from Rax
-        let mut scan = LinearScan::new(vec![lhs, dst], &raw, ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![lhs, dst], &raw, ALLOCATABLE_GPR, Vec::new());
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         scan.free_regs.remove(&PhysReg::Rax);
@@ -656,7 +692,7 @@ mod tests {
         dst.hint = Some(Value(0));
         let mut raw: HashMap<(usize, Value), Vec<PhysReg>> = HashMap::new();
         raw.insert((2, Value(1)), vec![PhysReg::Rax]); // dst excluded from Rax
-        let mut scan = LinearScan::new(vec![lhs, dst], &raw, ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![lhs, dst], &raw, ALLOCATABLE_GPR, Vec::new());
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         scan.free_regs.remove(&PhysReg::Rax);
@@ -690,7 +726,7 @@ mod tests {
         let target = iv(1, 1, 3, crate::interval::RegClass::Gpr);
         let mut dst = iv(2, 3, 5, crate::interval::RegClass::Gpr);
         dst.hint = Some(Value(1));
-        let mut scan = LinearScan::new(vec![other, target, dst], &HashMap::new(), ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![other, target, dst], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
         scan.assign(0, Location::Reg(PhysReg::Rbx));
         scan.assign(1, Location::Reg(PhysReg::Rcx));
         scan.free_regs.remove(&PhysReg::Rbx);
@@ -720,7 +756,7 @@ mod tests {
             v.fixed = Some(PhysReg::Rax);
             v
         };
-        let mut scan = LinearScan::new(vec![fixed_iv], &HashMap::new(), ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![fixed_iv], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
 
         scan.evict_and_assign(0, PhysReg::Rax);
 
@@ -741,7 +777,7 @@ mod tests {
             v.fixed = Some(PhysReg::Rax);
             v
         };
-        let mut scan = LinearScan::new(vec![occupant, fixed_iv], &HashMap::new(), ALLOCATABLE_GPR);
+        let mut scan = LinearScan::new(vec![occupant, fixed_iv], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
 
@@ -754,6 +790,89 @@ mod tests {
         let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let mut scan = LinearScan::new(vec![a], &HashMap::new(), ALLOCATABLE_GPR);
         scan.spill_at_interval(0);
+    }
+
+    #[test]
+    fn spill_reuses_a_slot_for_genuinely_disjoint_intervals() {
+        let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
+        let b = iv(1, 3, 5, crate::interval::RegClass::Gpr); // disjoint: starts after a.end
+        let mut scan = LinearScan::new(vec![a, b], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+
+        scan.spill(0);
+        scan.spill(1);
+
+        assert_eq!(scan.assignment[&Value(0)], Location::Spill(0));
+        assert_eq!(
+            scan.assignment[&Value(1)],
+            Location::Spill(0),
+            "disjoint intervals must reuse the same slot"
+        );
+    }
+
+    #[test]
+    fn spill_does_not_reuse_a_slot_for_touching_intervals() {
+        // [0,2] and [2,4] TOUCH at position 2 -- under 8a's inclusive
+        // convention this IS an overlap (mirrors expire_old_intervals's
+        // register boundary exactly), so they must NOT share a slot.
+        let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
+        let b = iv(1, 2, 4, crate::interval::RegClass::Gpr);
+        let mut scan = LinearScan::new(vec![a, b], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+
+        scan.spill(0);
+        scan.spill(1);
+
+        assert_ne!(
+            scan.assignment[&Value(0)],
+            scan.assignment[&Value(1)],
+            "touching intervals must NOT share a slot"
+        );
+    }
+
+    #[test]
+    fn spill_slot_choice_depends_on_the_intervals_own_start_not_call_order() {
+        // B4 regression: the original free_slots/next_slot design reused a
+        // slot that was only "free from the current scan cursor onward,"
+        // not free across a victim interval's own (much earlier) start.
+        // X([0,6]) is spilled first; G([5,300]) is spilled second but its
+        // OWN start (5) genuinely overlaps X's range -- it must NOT reuse
+        // X's slot, regardless of scan order.
+        let x = iv(0, 0, 6, crate::interval::RegClass::Gpr);
+        let g = iv(1, 5, 300, crate::interval::RegClass::Gpr);
+        let mut scan = LinearScan::new(vec![x, g], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+
+        scan.spill(0); // X -> some slot, slot_end for it becomes 6
+        scan.spill(1); // G, start=5 -- 6 is NOT < 5, so no reuse
+
+        assert_ne!(
+            scan.assignment[&Value(0)],
+            scan.assignment[&Value(1)],
+            "B4: G's start (5) is behind X's end (6) -- must get a fresh slot"
+        );
+
+        // Positive case, same scan: H([10,20]) spilled AFTER X and G --
+        // X's slot now has slot_end=6, and 6 < 10, so H correctly reuses it.
+        let h = iv(2, 10, 20, crate::interval::RegClass::Gpr);
+        scan.intervals.push(h);
+        scan.spill(2);
+
+        assert_eq!(
+            scan.assignment[&Value(2)],
+            scan.assignment[&Value(0)],
+            "H starts at 10, well past X's slot's recorded end (6) -- must reuse X's slot"
+        );
+    }
+
+    #[test]
+    fn spill_removes_the_interval_from_active_if_present() {
+        let a = iv(0, 0, 10, crate::interval::RegClass::Gpr);
+        let mut scan = LinearScan::new(vec![a], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.active.push(0);
+
+        scan.spill(0);
+
+        assert!(scan.active.is_empty());
+        assert_eq!(scan.assignment[&Value(0)], Location::Spill(0));
     }
 
     #[test]
@@ -870,7 +989,7 @@ mod tests {
                     .filter(|iv| iv.reg_class == class)
                     .cloned()
                     .collect();
-                let mut scan = LinearScan::new(class_intervals, &excluded, pool);
+                let mut scan = LinearScan::new(class_intervals, &excluded, pool, Vec::new());
                 scan.intervals
                     .sort_by_key(|iv| (iv.start, iv.end, iv.value.0));
                 let sorted = |scan: &LinearScan| {
