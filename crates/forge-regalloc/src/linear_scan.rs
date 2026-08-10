@@ -318,17 +318,59 @@ impl<'a> LinearScan<'a> {
         self.assign(i, Location::Spill(slot as u32));
     }
 
-    /// Explicitly stubbed, not built -- spilling ships in Phase 8c. This
-    /// slice's own test corpus is verified (by construction, via the
-    /// real max-simultaneous-liveness measured on this exact corpus --
-    /// 4 GPR / 7 XMM, against pools of 14/16; a separate, more
-    /// adversarial stress corpus used during design review measured up
-    /// to 9 for both classes, still well under the pools) never to
-    /// reach this path through real `build_intervals` output.
-    fn spill_at_interval(&mut self, _i: usize) {
-        unimplemented!(
-            "spilling ships in Phase 8c -- see docs/superpowers/specs/2026-08-09-phase-8-decomposition-design.md"
-        )
+    /// Called when `pick_register` returns `None` for interval `i` -- no
+    /// free, non-excluded register exists in the current class's pool.
+    /// Picks the ACTIVE interval (same class, since spilling an XMM value
+    /// can't free a GPR) with the worst score -- `end / spill_weight`,
+    /// PROMPT.md's own formula, weighting toward "blocks a register for a
+    /// long time AND isn't used much" -- and either:
+    /// - if the victim's `end` is LATER than `i`'s own `end` AND the
+    ///   victim's register isn't excluded for `i`: spill the VICTIM (it
+    ///   was going to cost more to keep than `i` will), hand its now-free
+    ///   register to `i`.
+    /// - otherwise (including when the victim's register IS excluded for
+    ///   `i`): spill `i` itself, leaving the victim exactly as it was.
+    fn spill_at_interval(&mut self, i: usize) {
+        let class = self.intervals[i].reg_class;
+        let victim = self
+            .active
+            .iter()
+            .copied()
+            .filter(|&j| self.intervals[j].reg_class == class)
+            .max_by(|&a, &b| {
+                let score = |k: usize| {
+                    let iv = &self.intervals[k];
+                    iv.end as f32 / iv.spill_weight.max(0.01)
+                };
+                score(a).partial_cmp(&score(b)).unwrap()
+            })
+            .expect(
+                "no active interval to spill -- pick_register returned None with an empty active \
+                 list for this class, which means the class's WHOLE pool is excluded for interval \
+                 i specifically (a real allocator bug, not a spill-heuristic gap: spilling cannot \
+                 help when there's nothing active to spill, and i itself has nowhere to go either)",
+            );
+
+        if self.intervals[victim].end > self.intervals[i].end {
+            let reg = self
+                .location_of(victim)
+                .and_then(|loc| match loc {
+                    Location::Reg(r) => Some(r),
+                    Location::Spill(_) => None,
+                })
+                .expect("an active interval must currently hold a real register, not a spill slot");
+            if self.excluded_at(self.intervals[i].value).contains(&reg) {
+                self.spill(i);
+            } else {
+                self.spill(victim);
+                self.active.retain(|&j| j != victim);
+                self.assign(i, Location::Reg(reg));
+                self.active.push(i);
+                self.active.sort_by_key(|&j| self.intervals[j].end);
+            }
+        } else {
+            self.spill(i);
+        }
     }
 
     /// Debug-only check of the invariant `expire_old_intervals`'s early
@@ -793,10 +835,106 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "spilling ships in Phase 8c")]
-    fn spill_at_interval_panics_with_a_clear_deferral_message() {
-        let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
-        let mut scan = LinearScan::new(vec![a], &HashMap::new(), ALLOCATABLE_GPR);
+    fn spill_at_interval_spills_the_longer_lived_victim_and_hands_i_its_register() {
+        // Branch (a): victim.end (100) > i.end (10) -- spill the victim,
+        // give its now-free register to i.
+        let victim = iv(0, 0, 100, crate::interval::RegClass::Gpr);
+        let current = iv(1, 5, 10, crate::interval::RegClass::Gpr);
+        let mut scan = LinearScan::new(
+            vec![victim, current],
+            &HashMap::new(),
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            Vec::new(),
+        );
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.active.push(0);
+
+        scan.spill_at_interval(1);
+
+        assert!(
+            matches!(scan.assignment[&Value(0)], Location::Spill(_)),
+            "victim must be spilled"
+        );
+        assert_eq!(
+            scan.assignment[&Value(1)],
+            Location::Reg(PhysReg::Rax),
+            "i must receive the victim's freed register"
+        );
+        assert_eq!(scan.active, vec![1], "i replaces the victim in active");
+    }
+
+    #[test]
+    fn spill_at_interval_spills_i_itself_when_the_victim_dies_sooner() {
+        // Branch (b): victim.end (5) is NOT > i.end (20) -- spill i,
+        // leave the victim untouched.
+        let victim = iv(0, 0, 5, crate::interval::RegClass::Gpr);
+        let current = iv(1, 3, 20, crate::interval::RegClass::Gpr);
+        let mut scan = LinearScan::new(
+            vec![victim, current],
+            &HashMap::new(),
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            Vec::new(),
+        );
+        scan.assign(0, Location::Reg(PhysReg::Rbx));
+        scan.active.push(0);
+
+        scan.spill_at_interval(1);
+
+        assert_eq!(
+            scan.assignment[&Value(0)],
+            Location::Reg(PhysReg::Rbx),
+            "victim must be left exactly as it was"
+        );
+        assert!(
+            matches!(scan.assignment[&Value(1)], Location::Spill(_)),
+            "i must be spilled instead"
+        );
+        assert_eq!(scan.active, vec![0], "victim remains the only active interval");
+    }
+
+    #[test]
+    fn spill_at_interval_respects_exclusion_and_spills_i_instead_of_reassigning() {
+        // B6 regression: the victim's register isn't automatically legal
+        // for i -- i may carry its own per-instruction exclusion (e.g. an
+        // IntDiv/IntRem rhs excluded from Rax/Rdx). Even though the
+        // victim's end (100) > i's end (10), handing over Rax must be
+        // refused because i's value excludes it.
+        let victim = iv(0, 0, 100, crate::interval::RegClass::Gpr);
+        let current = iv(1, 5, 10, crate::interval::RegClass::Gpr);
+        let mut raw: HashMap<(usize, Value), Vec<PhysReg>> = HashMap::new();
+        raw.insert((5, Value(1)), vec![PhysReg::Rax]);
+        let mut scan = LinearScan::new(
+            vec![victim, current],
+            &raw,
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            Vec::new(),
+        );
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.active.push(0);
+
+        scan.spill_at_interval(1);
+
+        assert_eq!(
+            scan.assignment[&Value(0)],
+            Location::Reg(PhysReg::Rax),
+            "victim must be left untouched -- it was never a valid source for i"
+        );
+        assert!(
+            matches!(scan.assignment[&Value(1)], Location::Spill(_)),
+            "i must be spilled instead of receiving an excluded register"
+        );
+        assert_eq!(scan.active, vec![0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "no active interval to spill")]
+    fn spill_at_interval_panics_when_active_is_empty_for_the_class() {
+        let a = iv(0, 0, 5, crate::interval::RegClass::Gpr);
+        let mut scan = LinearScan::new(vec![a], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+        // active is empty -- spill_at_interval has nothing to pick a
+        // victim from, which should never happen in practice (an empty
+        // active list means pick_register should have found a free
+        // register), but must fail loudly if it ever does.
         scan.spill_at_interval(0);
     }
 
