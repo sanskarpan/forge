@@ -9,7 +9,7 @@
 
 Phase 8b's final holistic review closed with an explicit, unusually direct prediction for this exact slice: *"Spilling is made of this hazard. Spill-slot reuse asks 'is this slot free?' — free WHEN? Reload insertion asks 'is this value in a register?' — at WHICH position?"* Both 8a (the `fixed`-register whole-lifetime-pin bug) and 8b (the naive hint-interference check) failed by answering exactly these questions wrong once each, at real cost (multiple correction rounds). This design answers both questions explicitly, up front, rather than discovering the wrong answer by execution three rounds in:
 
-- **Spill slots are freed the identical way registers are** — an interval's slot becomes reusable once `current_start` has moved PAST its `end` (the same inclusive-boundary `end < current_start` rule 8b's `expire_old_intervals` already established), never based on a snapshot of "what's free right now" divorced from position. Reusing 8b's exact expiry mechanism (parameterized over slots instead of registers) is the concrete way this design avoids re-deriving the same bug from scratch.
+- **A spill slot becomes reusable once the interval about to occupy it starts after the slot's current occupant ends** — the same inclusive-boundary reasoning 8b's `expire_old_intervals` established for registers (`end >= current_start` still means "in use"), but phrased against the CANDIDATE interval's own start rather than a shared scan cursor, so the answer is correct regardless of scan order. (An earlier draft of this design instead ported `expire_old_intervals`'s cursor-relative expiry mechanism directly, parameterized over slots instead of registers — execution proved that literal port wrong twice over, B4 and B5 below; the `spill()` section has the corrected, cursor-free mechanism actually used.)
 - **A spilled value is never "in a register" for any part of its own recorded interval — that interval describes its life in a SPILL SLOT.** Reload need is a SEPARATE, LOCAL, single-instruction fact (a value must be readable from SOME register at the exact instruction that uses it), resolved by a fixed reservation, not a new allocation decision — detailed below. This sidesteps the recursive "the reload itself needs an interval, which itself might need to spill" problem entirely, by construction, not by hoping it doesn't come up.
 
 ## The central design decision: reload via reserved scratch registers, not recursive interval-splitting
@@ -25,18 +25,44 @@ Textbook linear-scan-with-spilling (and this project's own PROMPT.md sketch, whi
 /// below), not from `linear_scan::ALLOCATABLE_GPR`/`ALLOCATABLE_XMM`
 /// themselves, which stay exactly as 8b shipped them (still the
 /// authoritative "which PhysRegs exist and are encodable" answer).
-pub const SCRATCH_GPR: [PhysReg; 2] = [PhysReg::R14, PhysReg::R15];
+pub const SCRATCH_GPR: [PhysReg; 2] = [PhysReg::R10, PhysReg::R11];
 pub const SCRATCH_XMM: [PhysReg; 2] = [PhysReg::Xmm14, PhysReg::Xmm15];
 ```
 
-**Why 2 per class, not 1**: every current binary `MachineInst` (Add/Sub/Mul/Div/etc.) has two operands (`lhs`, `rhs`); both could independently be spilled at once (e.g. `spilled_a / spilled_b`). Two reserved registers per class covers this — `lhs` (or the sole operand of a unary op) always reloads into `SCRATCH_*[0]`, `rhs` into `SCRATCH_*[1]`, a fixed positional assignment requiring no per-position bookkeeping at all. The destructive 2-address convention (`dst` reuses `lhs`'s register) composes for free: if `lhs` was spilled and reloaded into `SCRATCH_*[0]`, the instruction executes with its result already in `SCRATCH_*[0]`, and — if `dst` is ALSO spilled — the store-after-definition step stores directly from `SCRATCH_*[0]`, no extra register needed. `IntDiv`/`IntRem`/`CallLibm`'s more exotic register needs (`rax`/`rdx`/ABI argument registers) are already handled entirely by emission-time copies per 8a's design and don't interact with this mechanism at all — a spilled operand feeding one of those still just reloads into a scratch register first, then the existing emission-time fixup takes it from there exactly as if it had never been spilled.
+**Why 2 per class, not 1**: every current binary `MachineInst` (Add/Sub/Mul/Div/etc.) has two operands (`lhs`, `rhs`); both could independently be spilled at once (e.g. `spilled_a / spilled_b`). Two reserved registers per class covers this — `lhs` (or the sole operand of a unary op) always reloads into `SCRATCH_*[0]`, `rhs` into `SCRATCH_*[1]`, a fixed positional assignment requiring no per-position bookkeeping at all. The destructive 2-address convention (`dst` reuses `lhs`'s register) composes for free: if `lhs` was spilled and reloaded into `SCRATCH_*[0]`, the instruction executes with its result already in `SCRATCH_*[0]`, and — if `dst` is ALSO spilled — the store-after-definition step stores directly from `SCRATCH_*[0]`, no extra register needed.
 
-**Why `R14`/`R15` and `Xmm14`/`Xmm15` specifically**: arbitrary but principled — the LAST two entries of `ALLOCATABLE_GPR`/`ALLOCATABLE_XMM` (8b's declared order), so removing them shrinks the pool from the end rather than creating a hole in the middle, and callers reading `ALLOCATABLE_GPR[..12]`-style code can see the shrinkage directly. No ABI or encoding reason favors these two over any other pair; picked for order-tidiness only.
+**`IntDiv`/`IntRem`'s interaction with this mechanism, stated precisely (an earlier draft of this doc overclaimed "no interaction at all" — execution-based review caught this)**: `Rax`/`Rdx` themselves remain part of `SPILL_AWARE_ALLOCATABLE_GPR` (they are not scratch-reserved), so `pick_register` can still hand them to an ordinary interval. When `idiv` executes, whatever ordinary values happen to occupy `Rax`/`Rdx` at that point must be displaced and restored — this is 8a's already-accepted "idiv third-party clobber" sub-problem 1, unchanged by spilling. What spilling ADDS to that existing picture: if a displaced occupant's own emission-time save target were naively "the same 2 scratch registers a spilled operand might also need at the very same instruction," 3 GPRs could be wanted simultaneously (rhs's own reload, plus displacing BOTH of rax/rdx's occupants). This is resolvable at emission time via ordinary stack `push`/`pop` for the displaced occupants (not the reload mechanism's scratch registers at all — displacement and reload are two independent needs that happen to occur at the same instruction, not one need competing with itself) — but it needs saying explicitly rather than asserted away, since the two mechanisms sharing an instruction is a real interaction, even though they don't share REGISTERS.
+
+**Why `R10`/`R11` for GPR (corrected — an earlier draft picked `R14`/`R15`, which was factually wrong to call ABI-neutral)**: execution-based review found `R14`/`R15` are BOTH members of `prologue::SYSV_CALLEE_SAVED` — reserving them as scratch would force every spilling function's prologue/epilogue to `push`/`pop` a pair of registers used only transiently, purely because of which two happened to be picked, not because anything requires it. `R10`/`R11` are caller-saved (not in `SYSV_CALLEE_SAVED`), so no such cost. For XMM, `Xmm14`/`Xmm15` remain the choice: ALL XMM registers are caller-saved under System V (SPEC.md §7, no XMM callee-saved set exists at all), so there is no equivalent cost differential to correct for on that side — but this means `Xmm14`/`Xmm15` (like every XMM register) are destroyed by any `CallLibm`, which matters only in that a reload/store sequence must not straddle a libm call without re-reloading afterward (already true of registers generally; not a new constraint from choosing these two).
 
 ```rust
-pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &ALLOCATABLE_GPR[..12]; // 14 - 2 reserved
-pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = &ALLOCATABLE_XMM[..14]; // 16 - 2 reserved
+// R10/R11 sit at indices 8-9 of ALLOCATABLE_GPR (Rax, Rcx, Rdx, Rbx, Rsi,
+// Rdi, R8, R9, R10, R11, R12, R13, R14, R15), NOT the last two entries --
+// `.split_at(12).0` (an earlier draft used this, copying the XMM pattern
+// below without checking) would keep R10/R11 IN the pool while also
+// claiming they're scratch-reserved, a direct contradiction. An explicit
+// literal is the only construction that is correct regardless of which
+// two registers scratch picks, so that's what this uses.
+pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
+    PhysReg::Rax,
+    PhysReg::Rcx,
+    PhysReg::Rdx,
+    PhysReg::Rbx,
+    PhysReg::Rsi,
+    PhysReg::Rdi,
+    PhysReg::R8,
+    PhysReg::R9,
+    PhysReg::R12,
+    PhysReg::R13,
+    PhysReg::R14,
+    PhysReg::R15,
+]; // 14 - 2 reserved (R10, R11 excluded)
+
+// Xmm14/Xmm15 ARE the last two entries of ALLOCATABLE_XMM, so split_at is
+// correct here (unlike the GPR case above).
+pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = ALLOCATABLE_XMM.split_at(14).0; // 16 - 2 reserved
 ```
+(`&ALLOCATABLE_GPR[..12]` — the form an earlier draft used — does NOT compile in a `const` context; slice indexing isn't yet const-stable. `.split_at(N).0` does compile, confirmed by execution, but is only actually CORRECT when the excluded elements are contiguous at one end of the source array — true for XMM here, false for GPR once scratch moved to R10/R11, hence the explicit literal above.)
 
 `allocate()` (8b) is amended to scan against these narrower pools instead of the raw `ALLOCATABLE_GPR`/`ALLOCATABLE_XMM` — the ONLY change to 8b's already-shipped `allocate()`/`LinearScan` call sites this slice makes; `LinearScan` itself is generic over whatever pool it's handed (it already takes `allocatable: &'a [PhysReg]` as a constructor argument, per 8b's design — no structural change needed there, only which constant gets passed in).
 
@@ -74,7 +100,7 @@ pub fn populate_spill_weights(selected: &SelectedFunction, intervals: &mut [Inte
 }
 ```
 
-**Called where**: inside `allocate()` (8b), once, on the full `Vec<Interval>` BEFORE partitioning by class — `reads_of` is already `pub(crate)` in `liveness.rs` and usable here; partitioning happens after, so weights are correct regardless of which class ends up needing them. This is the one place 8c actually touches 8b's `allocate()` beyond swapping in the narrower pools.
+**Called where**: inside `allocate()` (8b), once, on the full `Vec<Interval>` BEFORE partitioning by class — `reads_of` is already `pub(crate)` in `liveness.rs` and usable here; partitioning happens after, so weights are correct regardless of which class ends up needing them. This requires `allocate()` to receive the `SelectedFunction` it's allocating for, which 8b's original signature didn't take (nothing before this needed the MachineInst stream itself, only the `Vec<Interval>` derived from it) — `allocate()`'s signature gains a `selected: &SelectedFunction` parameter for exactly this call (see the `allocate()` code in the `spill()` section below for the full updated signature).
 
 **A φ-merged group's members all share the SAME `[start, end]` by construction (8a), but do NOT necessarily share the same use count** — a φ's own destination might be read many times after the join point while an individual incoming value is read zero times outside the merge itself. `populate_spill_weights` computes weight PER VALUE, not per group, which is correct: if 8b's `pick_register` ever fails to co-locate a φ-group's members (a routine, expected outcome per 8a's design), spilling ONE member of the group should weigh that member's OWN use pattern, not the whole group's — spilling the whole group together isn't even representable in this model (each member is a fully independent `Interval` post-merge), and shouldn't be attempted.
 
@@ -121,11 +147,24 @@ fn spill_at_interval(&mut self, i: usize) {
                 Location::Spill(_) => None,
             })
             .expect("an active interval must currently hold a real register, not a spill slot");
-        self.spill(victim);
-        self.active.retain(|&j| j != victim);
-        self.assign(i, Location::Reg(reg));
-        self.active.push(i);
-        self.active.sort_by_key(|&j| self.intervals[j].end);
+        // B6 (execution-based review): the victim's register is not
+        // automatically legal for `i` -- `i` may carry its own
+        // per-instruction exclusion (e.g. it's an IntDiv/IntRem `rhs`
+        // excluded from Rax/Rdx per 8a's `excluded_registers`). Handing
+        // over an excluded register here would silently violate that
+        // constraint, reachable with real data and invisible to any test
+        // that doesn't specifically combine spilling with exclusion.
+        // Falling back to spilling `i` itself is always safe -- it
+        // leaves the victim exactly as it was, a known-valid assignment.
+        if self.excluded_at(self.intervals[i].value).contains(&reg) {
+            self.spill(i);
+        } else {
+            self.spill(victim);
+            self.active.retain(|&j| j != victim);
+            self.assign(i, Location::Reg(reg));
+            self.active.push(i);
+            self.active.sort_by_key(|&j| self.intervals[j].end);
+        }
     } else {
         self.spill(i);
     }
@@ -136,86 +175,88 @@ fn spill_at_interval(&mut self, i: usize) {
 
 ## `spill()` — assigning a real spill slot, with reuse
 
+**This section was rewritten wholesale after execution-based review** (findings labeled B4/B5/B7 in that review). The ORIGINAL design here used an `active`-shaped tracked list (`spilled: Vec<usize>`, `free_slots: Vec<u32>`, `next_slot: u32`, an `expire_old_spill_slots` expiry step mirroring `expire_old_intervals`). Execution proved that mechanism wrong in two independent, serious ways, both instances of the SAME point-in-time-vs-lifetime bug class this project has now hit at least four times (see the opening section):
+
+- **B4 — a freed slot is only "free from the current scan cursor onward," not free across the interval about to occupy it.** `spill_at_interval`'s victim-reassignment branch can spill a victim whose `start` is far EARLIER than the scan position currently being processed. `free_slots.pop()` at that moment hands back a slot that is free relative to the CURRENT position, not relative to the victim's own `[start, end]` — reproduced concretely: `X([0,6])` assigned `Spill(0)`, later `G([5,300])` also assigned `Spill(0)` by the old mechanism, overlapping at positions 5-6 and silently corrupting one when both are eventually stored to the same stack offset.
+- **B5 — threading `free_slots` (not just `next_slot`) between the GPR and XMM passes causes CROSS-CLASS collisions.** A slot freed relative to the GPR pass's cursor position gets handed to the XMM pass, which restarts its own cursor at 0 — reproduced concretely: GPR `X([0,6])` gets `Spill(0)`, XMM `Y([0,1000])` also gets `Spill(0)`, genuinely overlapping. This is a bug the design's OWN prescribed fix for the (correctly-identified) cross-class risk introduced, not one it solved.
+- **B7 — `self.spilled` was never actually kept sorted**, despite the prose above claiming it must be, so `expire_old_spill_slots`'s prefix-scan could strand a low-`end` slot behind a high-`end` one and never free it.
+
+**The replacement below is immune to all three simultaneously**, because it compares a candidate slot only against the INTERVAL'S OWN start — never a scan cursor, never a per-pass "currently free" snapshot — and therefore needs no expiry step, no `spilled` list, no `free_slots` stack, and no `next_slot` counter at all:
+
 ```rust
-/// Assigns interval `i` a spill slot, reusing an already-vacated slot if
-/// one is available AT `i`'s OWN start position, allocating a fresh one
-/// otherwise. Removes `i` from `active` if present (a spilled interval
-/// never occupies a register, so it has nothing left to track there).
+/// Assigns interval `i` a spill slot. `slot_end[s]` records the highest
+/// `end` any interval placed in slot `s` has ever had; a slot is safe to
+/// reuse for interval `i` iff `slot_end[s] < i.start` -- the same
+/// inclusive-boundary rule `expire_old_intervals` uses for registers
+/// (`end >= current_start` still means "in use"), just phrased against
+/// the requesting interval's own start instead of a scan cursor. This is
+/// deliberately order-independent: it gives the same, correct answer
+/// whether `i` is the interval currently being scanned or a victim from
+/// deep in `active` with a much earlier `start`, which is exactly the
+/// property the original `free_slots`/`next_slot` design lacked (B4/B5).
 fn spill(&mut self, i: usize) {
     self.active.retain(|&j| j != i);
-    self.expire_old_spill_slots(self.intervals[i].start);
-    let slot = self.free_slots.pop().unwrap_or_else(|| {
-        let s = self.next_slot;
-        self.next_slot += 1;
-        s
-    });
-    self.spilled.push(i); // tracked separately from `active` -- see below
-    self.assign(i, Location::Spill(slot));
-}
-
-/// The spill-slot analogue of `expire_old_intervals` -- IDENTICAL
-/// inclusive-boundary reasoning (a slot is reusable once `current_start`
-/// has moved PAST its occupant's `end`, i.e. `end < current_start`;
-/// still reserved when `end >= current_start`, including the
-/// touching-at-one-point case). `self.spilled` must be kept sorted by
-/// `end` for this to be a cheap prefix scan, exactly like `active`.
-fn expire_old_spill_slots(&mut self, current_start: u32) {
-    while let Some(&j) = self.spilled.first() {
-        if self.intervals[j].end >= current_start {
-            break;
+    let (start, end) = (self.intervals[i].start, self.intervals[i].end);
+    let slot = match self.slot_end.iter().position(|&e| e < start) {
+        Some(s) => s,
+        None => {
+            self.slot_end.push(0);
+            self.slot_end.len() - 1
         }
-        self.spilled.remove(0);
-        if let Some(Location::Spill(slot)) = self.location_of(j) {
-            self.free_slots.push(slot);
-        }
-    }
+    };
+    self.slot_end[slot] = self.slot_end[slot].max(end);
+    self.assign(i, Location::Spill(slot as u32));
 }
 ```
 
-**New `LinearScan` fields**: `spilled: Vec<usize>` (interval indices currently occupying a spill slot, sorted by `end` — the direct analogue of `active`), `free_slots: Vec<u32>` (a stack of vacated slot numbers available for reuse), `next_slot: u32` (the next never-before-used slot number, monotonically increasing). `run()` gains one line: `self.expire_old_spill_slots(self.intervals[i].start);` alongside its existing `self.expire_old_intervals(...)` call, at the top of the loop — spill slots expire on the exact same schedule as registers, checked at the exact same point, using the exact same boundary rule, because the underlying question ("is this resource still needed by its current occupant at this position") is identical in shape for both resource kinds.
+**New `LinearScan` field**: `slot_end: Vec<u32>` only — replaces the ORIGINAL design's `spilled`/`free_slots`/`next_slot` trio entirely. `run()` needs no new call anywhere in its loop for this — `slot_end` carries no cursor-relative state to expire, so there is nothing to check at the top of each iteration; `spill()` is self-contained.
 
-**Slot numbering is GLOBAL, not per-class**: a `u32` slot index is a byte offset multiplier into the stack frame, and both GPR-class and XMM-class spilled values need 8 bytes each (this language's `i64`/`bool` and `f64` values are both 8 bytes; no smaller/larger spill footprint exists yet) — so slots are drawn from ONE shared numbering space across both `LinearScan` instances `allocate()` runs (GPR pass, then XMM pass). This means `allocate()` must thread `next_slot`/`free_slots` state BETWEEN the two per-class `LinearScan` instances, not reset it for each — a real, easy-to-miss detail: naively constructing two independent `LinearScan`s (as 8b's `allocate()` already does for `active`/`free_regs`, correctly, since registers ARE class-scoped) would each start slot numbering at 0, and TWO different values — one GPR-spilled, one XMM-spilled — could be assigned the SAME slot number while both are genuinely live simultaneously, silently corrupting one when final emission writes both to the same stack offset. `allocate()`'s signature and body change to carry a shared slot-allocation state across both passes:
+**Slot numbering is GLOBAL, not per-class, and this is still true and still load-bearing** with the new mechanism, for the identical underlying reason as before: a `u32` slot index is a byte-offset multiplier into the stack frame, and GPR- and XMM-class spilled values both need 8 bytes (this language's `i64`/`bool` and `f64` values are both 8 bytes; no smaller/larger spill footprint exists yet), so both classes must draw from ONE shared `slot_end` vector across `allocate()`'s GPR pass and XMM pass, not two independently-zeroed ones — otherwise a GPR-spilled and an XMM-spilled value, both genuinely live at once, could land on the same slot number exactly as B5 reproduced above. `allocate()` threads `slot_end` forward between the two per-class `LinearScan` instances:
 
 ```rust
 pub fn allocate(
     intervals: Vec<Interval>,
     excluded_registers: &HashMap<(usize, Value), Vec<PhysReg>>,
+    selected: &SelectedFunction,
 ) -> (HashMap<Value, Location>, u32) {
-    // ^ return type gains a u32: the total number of spill slots used,
-    //   which the deferred final-emission task needs to size the stack
-    //   frame (feeding prologue::emit_prologue's spill_bytes parameter --
-    //   this is the FIRST real producer of that value; Phase 7d built it
+    // ^ two signature changes from 8b: `selected` (populate_spill_weights
+    //   needs it -- see the `spill_weight` section above) and the return
+    //   type gaining a u32, the total spill-frame byte count, which the
+    //   deferred final-emission task needs to size the stack frame
+    //   (feeding prologue::emit_prologue's spill_bytes parameter -- this
+    //   is the FIRST real producer of that value; Phase 7d built it
     //   parameterized specifically awaiting this).
+    let mut intervals = intervals;
+    populate_spill_weights(selected, &mut intervals);
+
     let mut assignment = HashMap::new();
-    let mut slot_state = SpillSlotState::default(); // { free_slots: Vec<u32>, next_slot: u32 }
+    let mut slot_end: Vec<u32> = Vec::new();
     for (class, pool) in [
         (RegClass::Gpr, SPILL_AWARE_ALLOCATABLE_GPR),
         (RegClass::Xmm, SPILL_AWARE_ALLOCATABLE_XMM),
     ] {
         let class_intervals: Vec<Interval> =
             intervals.iter().filter(|iv| iv.reg_class == class).cloned().collect();
-        let mut scan = LinearScan::new(class_intervals, excluded_registers, pool, slot_state);
+        let mut scan = LinearScan::new(class_intervals, excluded_registers, pool, slot_end);
         scan.run();
-        assignment.extend(scan.assignment);
-        slot_state = scan.into_slot_state(); // carry forward into the next class's pass
+        // B2 (execution-based review): an earlier draft did
+        // `assignment.extend(scan.assignment)` and THEN
+        // `scan.into_slot_state()` -- a by-value method call needing the
+        // WHOLE `scan`, which no longer compiles once `scan.assignment`
+        // has already been partially moved out (E0382). Destructuring
+        // both fields out of `scan` in a single statement avoids ever
+        // having a whole-`self` method call after a partial move.
+        let LinearScan { assignment: class_assignment, slot_end: next_slot_end, .. } = scan;
+        assignment.extend(class_assignment);
+        slot_end = next_slot_end;
     }
-    (assignment, slot_state.next_slot * 8) // total bytes, 8 per slot
+    (assignment, slot_end.len() as u32 * 8) // total bytes, 8 per slot
 }
 ```
 
-This is a real, deliberate change to `allocate()`'s public signature (adding the `u32` return) and a real new piece of cross-pass state-threading — flagged explicitly here because it's exactly the kind of thing that looks like an internal implementation detail but is actually load-bearing: get it wrong (reset slot numbering per class) and two independently-correct-looking `LinearScan` runs silently produce a corrupt combined allocation, with no single-class test able to catch it (each class's own intervals would look perfectly fine in isolation).
+This is a real, deliberate change to `allocate()`'s public signature (a new `selected` parameter, and the added `u32` return) and a real piece of cross-pass state-threading — flagged explicitly here because it's exactly the kind of thing that looks like an internal implementation detail but is actually load-bearing: get it wrong (reset `slot_end` per class) and two independently-correct-looking `LinearScan` runs silently produce a corrupt combined allocation, with no single-class test able to catch it (each class's own intervals would look perfectly fine in isolation).
 
-`SpillSlotState` itself is a small, plain carrier — the SAME two fields `LinearScan` already needs internally, just extracted so they can move between instances:
-
-```rust
-#[derive(Default)]
-struct SpillSlotState {
-    free_slots: Vec<u32>,
-    next_slot: u32,
-}
-```
-
-`LinearScan::new` gains this as a 4th constructor argument (alongside `intervals`, `excluded_registers`, `allocatable`), storing its two fields directly as `LinearScan`'s own `free_slots`/`next_slot` fields (no separate storage — `SpillSlotState` only exists as a transit shape between `LinearScan` instances, not a field ON `LinearScan` itself). `into_slot_state(self) -> SpillSlotState` is the mirror-image extraction, called once per class pass in `allocate()`, threading the real state forward instead of each `LinearScan::new` implicitly starting fresh at `next_slot: 0`.
+`LinearScan::new` gains `slot_end: Vec<u32>` as a 4th constructor argument (alongside `intervals`, `excluded_registers`, `allocatable`), storing it directly as `LinearScan`'s own `slot_end` field — no separate carrier type is needed (the earlier `SpillSlotState` struct this draft used is gone; a bare `Vec<u32>` is the whole state, so wrapping it added a type with no behavior of its own).
 
 ## `evict_and_assign`'s deferred victim case — NOT wired up in this slice, and here's why that's a deliberate choice, not an oversight
 
@@ -225,21 +266,24 @@ struct SpillSlotState {
 
 - `populate_spill_weights` on a hand-built `SelectedFunction`/`Vec<Interval>`: a value used 4 times in a 2-position-long interval gets weight `4.0/2.0 = 2.0`; a value used once across a 10-position interval gets `1.0/10.0 = 0.1` — confirms the "used often in a tight window scores high, rarely-used-and-long-lived scores low" property PROMPT.md's own comment describes, and confirms the actual arithmetic, not just the ordering.
 - `spill_at_interval`'s two branches, both hand-built (mirroring the corpus-pressure reality that NEITHER branch is reachable from the current real corpus, per the SPILL_AWARE pool-shrinkage note above): (a) victim's `end` > current's `end` → victim spilled, current gets the freed register, `active` correctly updated; (b) victim's `end` <= current's `end` → current itself spilled, victim untouched.
-- `spill`/`expire_old_spill_slots`: two non-overlapping spilled intervals get the SAME slot number (reuse); two overlapping spilled intervals get DIFFERENT slot numbers (no corruption) — the direct analogue of 8b's `expire_old_intervals` boundary tests, same touching-at-one-point case (`[0,2]` and `[2,4]` spilled — must NOT share a slot, symmetric with the register case).
-- **The cross-class slot-numbering test — this project's newest instance of the "looks like an implementation detail, is actually load-bearing" pattern**: force BOTH a GPR-class and an XMM-class spill (via deliberately oversized hand-built interval sets exceeding `SPILL_AWARE_ALLOCATABLE_GPR`/`_XMM`'s reduced pools) with genuinely overlapping ranges, and confirm they get DIFFERENT slot numbers — this is the one test that would fail if `allocate()` naively reset `next_slot`/`free_slots` per class instead of threading them through.
+- **B6 regression — `spill_at_interval`'s reassignment branch respects exclusion**: hand-build a victim holding an excluded register (construct `excluded_registers` so `i`'s value excludes exactly the register the victim currently holds) and confirm `i` is spilled instead of ever receiving that register, and that the victim is left untouched (still active, still in its original register) — this is the one scenario the pre-fix code would have gotten silently wrong.
+- **B4 regression — reusing a slot across a victim's own earlier start**: hand-build a scan where interval `X` (`start=0, end=6`) gets spilled first, then later, while the scan cursor sits well past position 6, a SECOND interval `G` (`start=5, end=300`) is spilled via `spill_at_interval`'s victim-reassignment branch (i.e. `G`'s own `start` is far behind the current cursor). Confirm `X` and `G` do NOT receive the same slot number, since `[0,6]` and `[5,300]` genuinely overlap — this is the exact scenario the original `free_slots`-based mechanism got wrong (it consulted "free right now," not "free across `G`'s own range").
+- `spill`'s slot reuse, via `slot_end` directly: two NON-overlapping spilled intervals (e.g. `[0,2]` then `[3,5]`) get the SAME slot number; two overlapping or touching-at-one-point spilled intervals (`[0,2]` and `[2,4]`) get DIFFERENT slot numbers — the direct analogue of 8b's `expire_old_intervals` boundary tests, same inclusive-boundary reasoning, now expressed as "reuse iff `slot_end[s] < start`" rather than an expiry step.
+- **B5 regression, folded into the cross-class test below** — the SAME cross-class scenario that broke `free_slots` threading (a GPR spill and an XMM spill with genuinely overlapping ranges) must now get DIFFERENT slot numbers under the `slot_end`-threading mechanism.
+- **The cross-class slot-numbering test — this project's newest instance of the "looks like an implementation detail, is actually load-bearing" pattern**: force BOTH a GPR-class and an XMM-class spill (via deliberately oversized hand-built interval sets exceeding `SPILL_AWARE_ALLOCATABLE_GPR`/`_XMM`'s reduced pools) with genuinely overlapping ranges, and confirm they get DIFFERENT slot numbers — this is the one test that would fail if `allocate()` naively reset `slot_end` per class instead of threading it through.
 - `SCRATCH_GPR`/`SCRATCH_XMM` are correctly excluded from `SPILL_AWARE_ALLOCATABLE_GPR`/`_XMM` (disjoint sets, union recovers the original 14/16).
-- An end-to-end hand-built-high-pressure test: construct (not via the front-end, since no real program reaches this) an `Interval` set exceeding `SPILL_AWARE_ALLOCATABLE_GPR`'s 12-register pool, run `allocate()`, confirm at least one `Location::Spill` appears, confirm the returned byte count is `(max concurrent spills) * 8`, and confirm the SAME corrected no-overlap property test from 8b (disjoint-or-legitimate-handoff) STILL holds when `Location::Spill` entries are included (extend the property: two `Spill(n)` locations sharing the same `n` must also be disjoint-or-touching, mirroring the register case exactly).
+- An end-to-end hand-built-high-pressure test: construct (not via the front-end, since no real program reaches this) an `Interval` set exceeding `SPILL_AWARE_ALLOCATABLE_GPR`'s 12-register pool, run `allocate()`, confirm at least one `Location::Spill` appears, confirm the returned byte count is **`>=` `(max concurrent spills) * 8` AND a multiple of 8** (NOT exact equality — first-fit slot selection isn't guaranteed to find the theoretically-optimal minimum slot count even with the `slot_end` fix, so the byte count is a valid-but-not-necessarily-tight upper bound; asserting exact equality would make the test fragile to an allocation-order change that is still entirely correct), and confirm the SAME corrected no-overlap property test from 8b (disjoint-or-legitimate-handoff) STILL holds when `Location::Spill` entries are included (extend the property: two `Spill(n)` locations sharing the same `n` must also be disjoint-or-touching, mirroring the register case exactly).
 - Re-run 8b's ENTIRE existing corpus-wide test suite (`run_never_shares_a_register_...`, `run_honors_a_non_trivial_fraction_of_hints`, `run_produces_only_reg_locations_never_spill_for_the_corpus` — this last one's NAME becomes slightly inaccurate once `SPILL_AWARE_*` pools are in use and MUST be re-confirmed still passing with the narrower pools, not just assumed unaffected, since shrinking the pool by 2 is exactly the kind of change that could theoretically tip some corpus program into needing a spill it didn't need before) against the corrected `allocate()` — regression coverage, not new coverage, but essential given `allocate()`'s signature and pool arguments both changed.
 
 ## Exit criteria
 
-1. `SCRATCH_GPR`/`SCRATCH_XMM` (2 registers each) and `SPILL_AWARE_ALLOCATABLE_GPR`/`_XMM` (the remainder) exist and are disjoint-and-union-complete with 8b's original constants.
-2. `populate_spill_weights` computes `uses/length` correctly and is called once, up front, inside `allocate()` before class-partitioning.
-3. `spill_at_interval` is fully implemented (no longer `unimplemented!()`), matching PROMPT.md's victim-selection formula, with the `.expect()` invariant documented and tested.
-4. `spill`/`expire_old_spill_slots` correctly reuse slots only once genuinely expired (inclusive boundary, same rule as `expire_old_intervals`), tracked via new `spilled`/`free_slots`/`next_slot` fields on `LinearScan`.
-5. Slot numbering is GLOBAL across both class passes (threaded through `allocate()`, not reset per class) — the cross-class test in Testing passes.
-6. `allocate()`'s signature changes to return `(HashMap<Value, Location>, u32)`, the `u32` being the total spill-frame byte count — the first real producer of the value `prologue::emit_prologue`/`emit_epilogue`'s `spill_bytes` parameter has been waiting for since Phase 7d.
+1. `SCRATCH_GPR`/`SCRATCH_XMM` (2 registers each) and `SPILL_AWARE_ALLOCATABLE_GPR`/`_XMM` (the remainder) exist and are disjoint-and-union-complete with 8b's original constants — including for GPR, where the excluded pair (`R10`/`R11`) is NOT at the end of `ALLOCATABLE_GPR`'s declared order, so this must be checked by actual set membership, not merely "the pool has 12 entries."
+2. `populate_spill_weights` computes `uses/length` correctly and is called once, up front, inside `allocate()` before class-partitioning, using the newly-added `selected: &SelectedFunction` parameter.
+3. `spill_at_interval` is fully implemented (no longer `unimplemented!()`), matching PROMPT.md's victim-selection formula, with the `.expect()` invariant documented and tested, AND its reassignment branch consults `excluded_at` before handing the victim's register to `i` (B6), falling back to spilling `i` itself when that register is excluded.
+4. `spill` reuses a slot only when that slot's recorded `slot_end[s] < i.start` (comparing against the INTERVAL's own start, never a scan cursor or per-pass snapshot) — tracked via a single new `slot_end: Vec<u32>` field on `LinearScan`, with no `spilled` list, `free_slots` stack, or `next_slot` counter (all three removed from the design after B4/B5/B7).
+5. Slot numbering is GLOBAL across both class passes (`slot_end` threaded through `allocate()`, not reset per class) — the cross-class test in Testing passes, including the B5 overlapping-ranges regression specifically.
+6. `allocate()`'s signature changes to accept `selected: &SelectedFunction` and to return `(HashMap<Value, Location>, u32)`, the `u32` being the total spill-frame byte count — the first real producer of the value `prologue::emit_prologue`/`emit_epilogue`'s `spill_bytes` parameter has been waiting for since Phase 7d. `allocate()`'s body correctly destructures each `LinearScan` (moving `assignment` and `slot_end` out via one destructuring statement, never via a whole-`self` consuming method after a partial move) — B2's compile error does not reproduce.
 7. `evict_and_assign`'s victim case remains `unimplemented!()`, deliberately not wired to `spill()` in this slice, with the reasoning stated explicitly (no real `Interval::fixed` producer to test against).
 8. All of 8b's existing tests still pass against the new `SPILL_AWARE_*` pools and the new `allocate()` signature (call-site updates only, no behavior regressions).
-9. Tests cover every item in Testing above, including the cross-class slot-numbering regression and the extended no-overlap property covering `Location::Spill`.
+9. Tests cover every item in Testing above, including the B4 (slot-reuse-across-an-earlier-start), B5 (cross-class overlapping-range collision), and B6 (exclusion-respecting reassignment) regressions specifically, and the extended no-overlap property covering `Location::Spill`.
 10. `cargo test --workspace` green, `cargo clippy --workspace -- -D warnings` and `cargo fmt --check` clean.
