@@ -21,6 +21,20 @@ pub struct PressurePoint {
 /// interval's own `end`, and silently under-sizing the report would leave
 /// those trailing positions unrepresented rather than correctly reported
 /// as zero pressure. Callers pass `selected.insts.len()`.
+///
+/// Dense (one entry per position, not a sparse step-function) because the
+/// stated consumer is a workbench chart plotting pressure across the
+/// instruction-index axis directly -- a sparse representation would just
+/// push the same expansion work onto every future caller instead of
+/// doing it once here.
+///
+/// The peak of this curve is an UPPER BOUND on register demand, not equal
+/// to it: `pick_register`'s Case 2 deliberately puts two simultaneously
+/// live intervals in ONE register at a touching position (the same
+/// legitimate handoff `verify_allocation` exempts). Measured on
+/// `if a > b then (a * c) + (b * c) else a - b`: peak 7 live XMM values,
+/// only 6 distinct XMM registers ever occupied. Do not read a point on
+/// this curve as "this many registers are needed here."
 pub fn register_pressure(intervals: &[Interval], program_length: usize) -> Vec<PressurePoint> {
     let mut gpr_delta = vec![0i32; program_length + 1];
     let mut xmm_delta = vec![0i32; program_length + 1];

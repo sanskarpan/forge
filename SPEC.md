@@ -817,6 +817,78 @@ impl LinearScan {
 /// competing for one and potentially forcing a further spill, recursively.
 /// `ALLOCATABLE_GPR`/`ALLOCATABLE_XMM` are unchanged and remain the
 /// authoritative "which PhysRegs exist and are encodable" answer.
+
+/// NOTE (Phase 8d): CHECKLIST bullets 17-18 — the independent verifier and the
+/// register-pressure report — are now built, in two new files that this section
+/// never sketched: `crates/forge-regalloc/src/verify.rs`
+/// (`verify_allocation(intervals: &[Interval], assignment: &HashMap<Value,
+/// Location>) -> Result<(), String>`) and `crates/forge-regalloc/src/pressure.rs`
+/// (`register_pressure(intervals: &[Interval], program_length: usize) ->
+/// Vec<PressurePoint>`, `PressurePoint { gpr: u32, xmm: u32 }`). Both are
+/// re-exported from `forge_regalloc`. Neither is wired into a compile pipeline —
+/// PROMPT.md's "run the register-allocation verifier after every pass in debug
+/// builds" is Phase 11's job, and the workbench pressure panel needs a frontend
+/// that does not exist yet; this slice produces the two functions and the data.
+///
+/// Three corrections to what the notes ABOVE say about these bullets, all found
+/// by execution rather than by reading:
+///
+/// 1. **The Phase 8b note's item 3 understates PROMPT.md's sketch.** That note
+///    says the property "no two overlapping intervals share a register" is FALSE
+///    of the correct allocator's output — true — but the shipped verifier had to
+///    correct PROMPT.md's sketch on TWO axes, not one, and the two defects
+///    CANCEL. Measured against the real 18-program corpus: PROMPT.md's literal
+///    sketch (half-open `a.start < b.end && b.start < a.end` AND no handoff
+///    exemption) rejects 0/18 — its real failure mode is a FALSE NEGATIVE, not
+///    the over-strictness the 8b note implies. The half-open test is exactly
+///    false for a touching pair, so the sketch silently ACCEPTS a genuine
+///    double-booking at a touching, non-handoff position without ever reaching
+///    the exemption question. Only the half-fixed variant (inclusive predicate,
+///    no exemption) is over-strict, and that one rejects 17/18. Fixing either
+///    defect alone is worse than fixing neither.
+///
+/// 2. **The Phase 8b note's claim that "a φ-group pair can never satisfy the
+///    exemption — a merged group's range structurally spans at least two
+///    positions — so this is a narrow, checkable exemption, not a loophole" is
+///    unsound as reasoning and points the wrong way.** Unsound: a zero-length
+///    pair (`start == end` for both) satisfies `a.end == b.start` without
+///    involving two distinct positions at all. Wrong way: the exemption is not
+///    at risk of being too WIDE for φ-groups, it is too NARROW. The real,
+///    recorded limitation is that `verify_allocation` currently REJECTS a
+///    correct φ-coalesced allocation — `merge_phi_intervals` (8a) gives every
+///    group member an IDENTICAL range plus a mutual hint at the anchor, and
+///    identical ranges fail the exemption's `a.end == b.start` precondition, so
+///    two φ-group members sharing one register read as a conflict even though
+///    honoring the hint there would be entirely correct. This is unreachable
+///    TODAY only because `pick_register` structurally cannot honor a φ hint
+///    (Case 1 needs the target's register already free, never true for an
+///    identical-range pair; Case 2 needs `target.end == this.start`, false when
+///    both ends are equal) — re-measured at 8d's final review: 10 φ-shaped
+///    identical-range hinted pairs across the corpus, zero of them co-located.
+///    The FIRST time φ coalescing is made to work, this verifier will reject the
+///    correct code it produces. Deliberately not pre-fixed (no real producer to
+///    test an exemption against); revisit together with φ coalescing.
+///
+/// 3. **The property now covers `Location::Spill` too, with NO exemption.** The
+///    8b note states the corrected property only for registers, because
+///    `Location::Spill` did not exist when it was written. Two values sharing a
+///    spill slot must be STRICTLY disjoint: a stack slot has no
+///    same-instruction handoff mechanism, so the register exemption must not be
+///    copy-pasted onto it. Unreachable from today's `spill()` (its
+///    `slot_end[s] < start` reuse test is already strict), and kept anyway —
+///    leaning on `spill()`'s own invariant is exactly the "shares a bug with
+///    the thing it checks" failure the verifier exists to avoid.
+///
+/// One consequence of item 1 that the pressure report makes visible, and that
+/// matters for the workbench panel: **peak register pressure is an UPPER BOUND
+/// on register demand, not equal to it.** `register_pressure` counts
+/// simultaneously-live intervals; `pick_register`'s Case 2 handoff legitimately
+/// puts two live intervals in ONE register at a touching position. Measured on
+/// `if a > b then (a * c) + (b * c) else a - b`: peak 7 simultaneously-live XMM
+/// values, but only 6 distinct XMM registers ever occupied. A chart plotting
+/// this curve against a "machine register count" line overstates demand by
+/// exactly the number of live handoffs — the same exemption `verify_allocation`
+/// had to encode, seen from the other side.
 ```
 
 ### ABI constraints
