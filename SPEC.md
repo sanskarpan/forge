@@ -748,6 +748,75 @@ impl LinearScan {
 /// and the verifier snippet's `Location::Reg(ra)` both reference but which
 /// SPEC.md never defines, is defined in Phase 8b as
 /// `pub enum Location { Reg(PhysReg), Spill(u32) }`.
+
+/// NOTE (Phase 8c): the `spill_at_interval` sketch above is now implemented
+/// for real, and — like `run()` before it — it is right in SHAPE (score every
+/// active interval by `end / spill_weight.max(0.01)`, take the worst, spill
+/// the victim if it outlives `i` and otherwise spill `i`) while being wrong or
+/// incomplete in FOUR specifics that later phases must not re-derive from it:
+///
+/// 1. **It never maintains `active`.** The sketch assigns the victim's
+///    register to `i` and spills the victim without removing the victim from
+///    `active`, without inserting `i`, and without re-sorting — so the next
+///    `expire_old_intervals` prefix scan (whose early `break` depends on
+///    `active` being sorted by `end`) runs against a stale, unsorted list, and
+///    the victim's register stays double-booked. The shipped code does all
+///    three. It also assigns `i` only AFTER spilling the victim, so the freed
+///    register passes directly from one owner to the next and never re-enters
+///    `free_regs` — the same handoff `pick_register`'s Case 2 performs, for
+///    the same reason (a register that becomes "free" at the current scan
+///    position is not thereby free across anyone else's whole range).
+///
+/// 2. **`self.intervals[victim].end > self.intervals[i].end` must stay a
+///    STRICT `>`.** On a tie there is nothing to gain by evicting the victim,
+///    reassigning its register, and re-sorting `active` when it dies at the
+///    same position `i` would; the shipped code falls through and spills `i`.
+///
+/// 3. **The victim's register is not automatically legal for `i`.** The
+///    sketch hands it over unconditionally. `i` may carry a per-instruction
+///    exclusion — today, an `IntDiv`/`IntRem` `rhs` barred from `Rax`/`Rdx`
+///    per the Phase 8a note — and handing it an excluded register is a silent
+///    wrong answer, not a crash. The shipped reassignment branch consults the
+///    same `excluded_at` filter `pick_register` uses and falls back to
+///    spilling `i` itself when the freed register is excluded. This is only
+///    reachable when register pressure and a per-instruction exclusion occur
+///    together, so it is invisible to any test exercising either alone.
+///
+/// 4. **`spill_slots: u32` in the struct above is not a sufficient
+///    representation and does not exist in the shipped code.** Neither is the
+///    obvious upgrade of it (a `free_slots` stack plus an expiry step
+///    mirroring `expire_old_intervals`), which was drafted and proven wrong by
+///    execution twice: `spill_at_interval` can spill a victim whose `start` is
+///    far BEHIND the current scan cursor, so a slot that is free *at the
+///    cursor* is not free across that victim's own range; and threading such a
+///    stack between the GPR and XMM passes lets a slot freed against the GPR
+///    cursor be reused by the XMM pass restarting at 0, colliding two
+///    simultaneously-live spills. The shipped state is one `slot_end: Vec<u32>`
+///    holding the highest `end` ever placed in each slot, with reuse allowed
+///    iff `slot_end[s] < i.start` — compared against the REQUESTING INTERVAL'S
+///    OWN start, never a cursor — which is order-independent and needs no
+///    expiry step at all. Slot numbering is GLOBAL: `slot_end` is threaded
+///    forward from the GPR pass into the XMM pass and never reset, because a
+///    slot index is a byte-offset multiplier and both classes spill 8 bytes.
+///
+/// Two further Phase 8c changes that this section cannot show because it never
+/// sketched them. First, `allocate` is now
+/// `allocate(intervals, excluded_registers, selected: &SelectedFunction)
+/// -> (HashMap<Value, Location>, u32)`: `selected` feeds
+/// `populate_spill_weights` (`uses / length`, computed once up front over ALL
+/// intervals before class-partitioning, so the heuristic can never be derived
+/// twice and drift), and the `u32` is the total spill-frame byte count
+/// (slot count * 8, UNPADDED) — the first real producer of
+/// `emit_prologue`/`emit_epilogue`'s `spill_bytes`, which pads for 16-byte
+/// alignment itself and must not be handed a pre-padded value. Second, the
+/// pools `allocate` scans are now `SPILL_AWARE_ALLOCATABLE_GPR`/`_XMM` (12 and
+/// 14 registers), because `SCRATCH_GPR = [R10, R11]` and
+/// `SCRATCH_XMM = [Xmm14, Xmm15]` are reserved exclusively for reload/store
+/// traffic and never handed to an ordinary interval — which is what lets a
+/// spilled value's reload target a compile-time-known register instead of
+/// competing for one and potentially forcing a further spill, recursively.
+/// `ALLOCATABLE_GPR`/`ALLOCATABLE_XMM` are unchanged and remain the
+/// authoritative "which PhysRegs exist and are encodable" answer.
 ```
 
 ### ABI constraints
