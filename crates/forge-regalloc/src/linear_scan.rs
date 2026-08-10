@@ -296,6 +296,14 @@ impl<'a> LinearScan<'a> {
     /// only against the interval's own start avoids both failure modes
     /// and needs no expiry step, no `spilled` list, and no `free_slots`
     /// stack at all.
+    ///
+    /// Does not touch `free_regs` -- if `i` currently holds a register,
+    /// that register is never returned to the pool by this function;
+    /// every real caller either never assigned `i` a register in the
+    /// first place, or (as in `spill_at_interval`'s victim-reassignment
+    /// branch) hands the freed register directly to another interval
+    /// without it ever passing through `free_regs`, mirroring
+    /// `pick_register`'s Case 2 handoff.
     fn spill(&mut self, i: usize) {
         self.active.retain(|&j| j != i);
         let (start, end) = (self.intervals[i].start, self.intervals[i].end);
