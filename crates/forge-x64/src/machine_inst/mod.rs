@@ -621,6 +621,195 @@ fn find_fully_fusable_scaled_indices(func: &Function) -> std::collections::HashS
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MinMaxOp {
+    Min,
+    Max,
+}
+
+/// A diamond eligible for branchless fusion (see design doc). Keyed by
+/// the diamond's BRANCH block in the map `find_fusable_diamonds` returns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DiamondFusion {
+    FloatMinMax {
+        dst: Value,
+        op: MinMaxOp,
+        lhs: Value,
+        rhs: Value,
+    },
+    IntCmov {
+        dst: Value,
+        cond: Value,
+        then_val: Value,
+        else_val: Value,
+    },
+}
+
+/// Run once, before the main RPO walk, over the WHOLE function -- exact
+/// architectural mirror of `find_fully_fusable_scaled_indices` above.
+/// Detects every diamond eligible for fusion: a Branch block whose two
+/// arms are BOTH EMPTY (BlockData::insts.is_empty()) and both Jump to
+/// the SAME merge block, which has no other predecessor, and which has
+/// exactly one Phi whose two incoming values genuinely DIFFER (any other
+/// Phis at the merge block must be trivial -- same value on both edges
+/// -- or the diamond isn't fused; a real corpus function can have
+/// several phis at one merge block, only one of which is this diamond's
+/// own payload). See design doc for the full correctness reasoning
+/// (why empty arms specifically, why this can't just use `RegClass`).
+pub fn find_fusable_diamonds(
+    func: &Function,
+) -> (HashMap<Block, DiamondFusion>, std::collections::HashSet<Block>) {
+    let mut fusions = HashMap::new();
+    let mut skip = std::collections::HashSet::new();
+
+    // Predecessor counts re-derived from real terminators, never trusted
+    // from BlockData::preds (which is Builder's own bookkeeping and can
+    // be stale on a hand-built Function) -- same discipline already
+    // established in forge-regalloc/src/intervals.rs's critical-edge check.
+    let mut pred_count: HashMap<Block, u32> = HashMap::new();
+    for block in &func.blocks {
+        match &block.term {
+            Some(Terminator::Jump(b)) => *pred_count.entry(*b).or_insert(0) += 1,
+            Some(Terminator::Branch { then_, else_, .. }) => {
+                *pred_count.entry(*then_).or_insert(0) += 1;
+                if then_ != else_ {
+                    *pred_count.entry(*else_).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ty_of = |v: Value| -> Ty {
+        if (v.0 as usize) < func.types.len() {
+            func.types[v.0 as usize]
+        } else {
+            // No synthetic values exist at the IR level (only select()
+            // mints those) -- func.types must always cover a real IR Value.
+            unreachable!("Value {v:?} has no IR-level type")
+        }
+    };
+
+    for (idx, block_data) in func.blocks.iter().enumerate() {
+        let pred = Block(idx as u32);
+        let Some(Terminator::Branch { cond, then_: t, else_: e }) = &block_data.term else {
+            continue;
+        };
+        if t == e {
+            continue;
+        }
+        let t_data = &func.blocks[t.0 as usize];
+        let e_data = &func.blocks[e.0 as usize];
+        if !t_data.insts.is_empty() || !e_data.insts.is_empty() {
+            continue;
+        }
+        let (Some(Terminator::Jump(mt)), Some(Terminator::Jump(me))) = (&t_data.term, &e_data.term)
+        else {
+            continue;
+        };
+        if mt != me {
+            continue;
+        }
+        let m = *mt;
+        if pred_count.get(&m).copied().unwrap_or(0) != 2 {
+            continue;
+        }
+        // Both arms must ALSO have exactly one predecessor each (the
+        // Branch block itself) -- found by mutation testing during plan
+        // review: without this check, a third, unrelated block that also
+        // jumps INTO an otherwise-eligible arm block still gets skipped by
+        // select() (both arms are still "empty," matching rule 2), so that
+        // third block's real Jump target vanishes with nothing to redirect
+        // it -- unreachable from this front-end's structured if/else
+        // lowering today, but not something find_fusable_diamonds's other
+        // checks happen to rule out on their own, so it's checked directly.
+        if pred_count.get(t).copied().unwrap_or(0) != 1
+            || pred_count.get(e).copied().unwrap_or(0) != 1
+        {
+            continue;
+        }
+
+        let m_data = &func.blocks[m.0 as usize];
+        let mut payload: Option<(Value, Value, Value)> = None; // (phi_dst, val_t, val_e)
+        let mut two_differing = false;
+        for &v in &m_data.insts {
+            if let Inst::Phi { incoming } = &func.insts[v.0 as usize] {
+                if incoming.len() != 2 {
+                    continue;
+                }
+                let (b0, v0) = incoming[0];
+                let (b1, v1) = incoming[1];
+                let (val_t, val_e) = if b0 == *t && b1 == *e {
+                    (v0, v1)
+                } else if b0 == *e && b1 == *t {
+                    (v1, v0)
+                } else {
+                    continue; // this phi's edges don't match t/e at all -- ignore
+                };
+                if val_t != val_e {
+                    if payload.is_some() {
+                        two_differing = true;
+                    }
+                    payload = Some((v, val_t, val_e));
+                }
+            }
+        }
+        if two_differing {
+            continue;
+        }
+        let Some((dst, val_t, val_e)) = payload else {
+            continue; // no differing phi at all -- nothing this diamond fuses
+        };
+
+        // Float min/max table (see design doc for the corrected 4-row
+        // derivation -- else-arm value is ALWAYS rhs, never determined by
+        // the comparison operator alone).
+        if let Inst::Cmp { op, lhs, rhs } = &func.insts[cond.0 as usize] {
+            if ty_of(*lhs) == Ty::F64 {
+                let rewrite = match op {
+                    CmpOp::Lt if val_t == *lhs && val_e == *rhs => {
+                        Some(DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Min, lhs: *lhs, rhs: *rhs })
+                    }
+                    CmpOp::Lt if val_t == *rhs && val_e == *lhs => {
+                        Some(DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Max, lhs: *rhs, rhs: *lhs })
+                    }
+                    CmpOp::Gt if val_t == *lhs && val_e == *rhs => {
+                        Some(DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Max, lhs: *lhs, rhs: *rhs })
+                    }
+                    CmpOp::Gt if val_t == *rhs && val_e == *lhs => {
+                        Some(DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Min, lhs: *rhs, rhs: *lhs })
+                    }
+                    _ => None,
+                };
+                if let Some(fusion) = rewrite {
+                    fusions.insert(pred, fusion);
+                    skip.insert(*t);
+                    skip.insert(*e);
+                }
+                // F64 comparison but not the min/max shape (Le/Ge, a
+                // third unrelated value, or Eq/Ne) -- NEVER falls through
+                // to IntCmov (that path is Ty::I64/Bool only). Simply
+                // unfused, whether or not `rewrite` matched above.
+                continue;
+            }
+        }
+
+        // General integer path -- hard type gate, not a fallback. `dst`'s
+        // type (not `cond`'s) determines whether IntCmov is legal, since
+        // `dst` is what the cmov actually writes.
+        if ty_of(dst) != Ty::F64 {
+            fusions.insert(
+                pred,
+                DiamondFusion::IntCmov { dst, cond: *cond, then_val: val_t, else_val: val_e },
+            );
+            skip.insert(*t);
+            skip.insert(*e);
+        }
+    }
+
+    (fusions, skip)
+}
+
 pub fn select(func: &Function) -> SelectedFunction {
     let fully_fusable_scaled_indices = find_fully_fusable_scaled_indices(func);
     let mut sel = Selector {
@@ -695,3 +884,337 @@ pub fn compute_coalescing_hints(insts: &[MachineInst]) -> HashMap<Value, Value> 
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod diamond_fusion_tests {
+    use super::*;
+    use forge_ir::{Block, BlockData, CmpOp, Function, Inst, Terminator, Ty, Value};
+
+    /// Mirrors Builder::emit's exact logic (push to insts/types/spans, push
+    /// the index into the target block's insts) without going through
+    /// Builder itself, since this file only needs the plain data shape.
+    fn push_inst(func: &mut Function, block: Block, inst: Inst, ty: Ty) -> Value {
+        let v = Value(func.insts.len() as u32);
+        func.insts.push(inst);
+        func.types.push(ty);
+        func.spans.push(forge_syntax::span::Span::new(0, 0));
+        func.blocks[block.0 as usize].insts.push(v);
+        v
+    }
+
+    fn empty_func(num_blocks: usize) -> Function {
+        Function {
+            insts: Vec::new(),
+            types: Vec::new(),
+            spans: Vec::new(),
+            blocks: vec![BlockData::default(); num_blocks],
+            entry: Block(0),
+            params: Vec::new(),
+        }
+    }
+
+    /// Builds: entry(0) has Branch(cond, t=1, e=2); t and e are empty,
+    /// both Jump to m=3; m has a Phi(t: val_t, e: val_e) plus optionally
+    /// a trivial phi (same value on both edges), then Return(phi_dst).
+    /// Returns (func, cond, val_t, val_e, phi_dst).
+    fn build_diamond(
+        val_ty: Ty,
+        cmp: Option<CmpOp>,
+        swap_incoming: bool,
+        extra_trivial_phi: bool,
+    ) -> (Function, Value, Value, Value, Value) {
+        let mut func = empty_func(4);
+        let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
+
+        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: val_ty }, val_ty);
+        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: val_ty }, val_ty);
+        let cond = if let Some(op) = cmp {
+            push_inst(&mut func, entry, Inst::Cmp { op, lhs: a, rhs: c }, Ty::Bool)
+        } else {
+            push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool)
+        };
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
+        func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
+
+        let (val_t, val_e) = if swap_incoming { (c, a) } else { (a, c) };
+        let phi_dst = push_inst(
+            &mut func,
+            m,
+            Inst::Phi { incoming: smallvec::smallvec![(t, val_t), (e, val_e)] },
+            val_ty,
+        );
+        if extra_trivial_phi {
+            push_inst(
+                &mut func,
+                m,
+                Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, a)] },
+                val_ty,
+            );
+        }
+        func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
+
+        (func, cond, val_t, val_e, phi_dst)
+    }
+
+    #[test]
+    fn eligible_diamond_is_detected_as_int_cmov() {
+        let (func, cond, val_t, val_e, phi_dst) = build_diamond(Ty::I64, None, false, false);
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert_eq!(fusions.len(), 1);
+        match fusions.values().next().unwrap() {
+            DiamondFusion::IntCmov { dst, cond: c, then_val, else_val } => {
+                assert_eq!(*dst, phi_dst);
+                assert_eq!(*c, cond);
+                assert_eq!(*then_val, val_t);
+                assert_eq!(*else_val, val_e);
+            }
+            other => panic!("expected IntCmov, got {other:?}"),
+        }
+        assert_eq!(skip.len(), 2);
+    }
+
+    #[test]
+    fn non_empty_arm_is_rejected() {
+        let mut func = empty_func(4);
+        let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
+        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
+        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
+        let cond = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        // t computes a real division -- NOT empty. This is the
+        // correctness-critical near-miss: fusing this would unconditionally
+        // execute IntDiv, which traps on c==0 even when cond would have
+        // avoided taking this arm.
+        let divided = push_inst(&mut func, t, Inst::Div(a, c), Ty::I64);
+        func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
+        func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
+        let phi_dst = push_inst(
+            &mut func,
+            m,
+            Inst::Phi { incoming: smallvec::smallvec![(t, divided), (e, c)] },
+            Ty::I64,
+        );
+        func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
+
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert!(fusions.is_empty(), "a non-empty arm must never be fused -- IntDiv traps");
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn multiple_phis_at_merge_only_the_differing_one_is_the_payload() {
+        let (func, _cond, _val_t, _val_e, phi_dst) =
+            build_diamond(Ty::I64, None, false, true); // extra trivial phi
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert_eq!(fusions.len(), 1, "the trivial phi must not block fusion");
+        match fusions.values().next().unwrap() {
+            DiamondFusion::IntCmov { dst, .. } => assert_eq!(*dst, phi_dst),
+            other => panic!("expected IntCmov, got {other:?}"),
+        }
+        assert_eq!(skip.len(), 2);
+    }
+
+    #[test]
+    fn two_differing_phis_at_merge_is_rejected() {
+        // Two independent values differ between the arms -- this design's
+        // single-value fusion cannot represent that; must not fuse.
+        let mut func = empty_func(4);
+        let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
+        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
+        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
+        let cond = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
+        func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
+        let phi1 = push_inst(
+            &mut func,
+            m,
+            Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, c)] },
+            Ty::I64,
+        );
+        push_inst(
+            &mut func,
+            m,
+            Inst::Phi { incoming: smallvec::smallvec![(t, c), (e, a)] },
+            Ty::I64,
+        );
+        func.blocks[m.0 as usize].term = Some(Terminator::Return(phi1));
+
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert!(fusions.is_empty());
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn third_predecessor_of_merge_is_rejected() {
+        let mut func = empty_func(5);
+        let (entry, t, e, other, m) = (Block(0), Block(1), Block(2), Block(3), Block(4));
+        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
+        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
+        let cond = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
+        func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
+        // `other` is an unrelated block that ALSO jumps to `m` -- a genuine
+        // 3rd predecessor, unreachable from `entry` in this fixture (that's
+        // fine; find_fusable_diamonds only counts real terminator edges
+        // into `m`, it never requires the whole function be reachable).
+        func.blocks[other.0 as usize].term = Some(Terminator::Jump(m));
+        let phi_dst = push_inst(
+            &mut func,
+            m,
+            Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, c)] },
+            Ty::I64,
+        );
+        func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
+
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert!(fusions.is_empty(), "m has a 3rd predecessor (`other`) -- must not fuse");
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn float_min_max_table_row_1_lt_a_b_is_min() {
+        let (func, ..) = build_diamond(Ty::F64, Some(CmpOp::Lt), false, false);
+        let (fusions, _) = find_fusable_diamonds(&func);
+        assert_eq!(fusions.len(), 1);
+        match fusions.values().next().unwrap() {
+            DiamondFusion::FloatMinMax { op: MinMaxOp::Min, .. } => {}
+            other => panic!("expected FloatMinMax::Min, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_min_max_table_row_2_lt_b_a_is_max_with_swapped_operands() {
+        let (func, _, val_t, val_e, _) = build_diamond(Ty::F64, Some(CmpOp::Lt), true, false);
+        let (fusions, _) = find_fusable_diamonds(&func);
+        assert_eq!(fusions.len(), 1);
+        match fusions.values().next().unwrap() {
+            DiamondFusion::FloatMinMax { op: MinMaxOp::Max, lhs, rhs, .. } => {
+                // The else-arm value (val_e) must be rhs; the then-arm
+                // value (val_t) must be lhs -- this is the exact defect
+                // execution-based design review found and fixed.
+                assert_eq!(*lhs, val_t);
+                assert_eq!(*rhs, val_e);
+            }
+            other => panic!("expected FloatMinMax::Max, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_min_max_table_row_3_gt_a_b_is_max() {
+        let (func, ..) = build_diamond(Ty::F64, Some(CmpOp::Gt), false, false);
+        let (fusions, _) = find_fusable_diamonds(&func);
+        match fusions.values().next().unwrap() {
+            DiamondFusion::FloatMinMax { op: MinMaxOp::Max, .. } => {}
+            other => panic!("expected FloatMinMax::Max, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_min_max_table_row_4_gt_b_a_is_min_with_swapped_operands() {
+        let (func, _, val_t, val_e, _) = build_diamond(Ty::F64, Some(CmpOp::Gt), true, false);
+        let (fusions, _) = find_fusable_diamonds(&func);
+        match fusions.values().next().unwrap() {
+            DiamondFusion::FloatMinMax { op: MinMaxOp::Min, lhs, rhs, .. } => {
+                assert_eq!(*lhs, val_t);
+                assert_eq!(*rhs, val_e);
+            }
+            other => panic!("expected FloatMinMax::Min, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_le_ge_diamonds_produce_no_fusion_at_all() {
+        let (func_le, ..) = build_diamond(Ty::F64, Some(CmpOp::Le), false, false);
+        let (fusions_le, skip_le) = find_fusable_diamonds(&func_le);
+        assert!(fusions_le.is_empty(), "Le must not fuse -- no derived table for it");
+        assert!(skip_le.is_empty());
+
+        let (func_ge, ..) = build_diamond(Ty::F64, Some(CmpOp::Ge), false, false);
+        let (fusions_ge, skip_ge) = find_fusable_diamonds(&func_ge);
+        assert!(fusions_ge.is_empty(), "Ge must not fuse -- no derived table for it");
+        assert!(skip_ge.is_empty());
+    }
+
+    #[test]
+    fn float_third_value_diamond_produces_no_fusion_never_int_cmov() {
+        // if a > b then a else c -- val_e (c) is NOT one of the comparison's
+        // own operands, so this can't be a min/max rewrite, and it must NOT
+        // fall through to IntCmov either (that path is Ty::I64/Bool only --
+        // this is the exact miscompile execution-based design review found).
+        let mut func = empty_func(4);
+        let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
+        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::F64 }, Ty::F64);
+        let bb = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::F64 }, Ty::F64);
+        let cc = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::F64 }, Ty::F64);
+        let cond = push_inst(&mut func, entry, Inst::Cmp { op: CmpOp::Gt, lhs: a, rhs: bb }, Ty::Bool);
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
+        func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
+        let phi_dst = push_inst(
+            &mut func,
+            m,
+            Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, cc)] },
+            Ty::F64,
+        );
+        func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
+
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert!(fusions.is_empty(), "float third-value diamond must produce NO fusion, never IntCmov");
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn f64_diamond_with_a_non_cmp_cond_is_gated_off_the_int_cmov_path() {
+        // Closes a real coverage gap execution-based plan review found by
+        // mutation testing: float_third_value_diamond_produces_no_fusion
+        // above never actually reaches the `ty_of(dst) != Ty::F64` hard
+        // gate, because its `cond` is an Inst::Cmp over F64 operands,
+        // which the EARLIER min/max-table branch already rejects (`continue`)
+        // before the general IntCmov path is ever considered. Deleting the
+        // hard gate entirely left every existing test passing -- this
+        // fixture uses a non-Cmp cond (an ordinary bool value, matching
+        // `cmp: None` in build_diamond) with F64-typed arm values, which
+        // is the ONLY shape that actually exercises the gate: nothing
+        // about `cond` routes it through the min/max branch at all, so
+        // without the hard gate this would silently become an IntCmov
+        // over Xmm-classed values -- the exact miscompile this design's
+        // whole "general cmov path" section exists to prevent.
+        let (func, ..) = build_diamond(Ty::F64, None, false, false);
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert!(fusions.is_empty(), "F64 dst must never become an IntCmov");
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn arm_with_an_extra_predecessor_is_rejected() {
+        // Found by mutation testing during plan review: deleting the
+        // `pred_count[t] == 1 && pred_count[e] == 1` guard left the whole
+        // test suite green -- nothing else exercises "an arm block has a
+        // second, unrelated predecessor." Without the guard, `t` still
+        // looks empty (rule 2 only checks t/e's own insts), so `other`'s
+        // real Jump(t) target silently vanishes once t is skipped.
+        let mut func = empty_func(5);
+        let (entry, t, e, m, other) = (Block(0), Block(1), Block(2), Block(3), Block(4));
+        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
+        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
+        let cond = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
+        func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
+        func.blocks[other.0 as usize].term = Some(Terminator::Jump(t));
+        let phi_dst = push_inst(
+            &mut func,
+            m,
+            Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, c)] },
+            Ty::I64,
+        );
+        func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
+
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert!(fusions.is_empty(), "arm `t` has a 2nd predecessor -- must not fuse");
+        assert!(skip.is_empty());
+    }
+}
