@@ -144,6 +144,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_the_symmetric_touching_case_without_a_matching_hint() {
+        // Mirrors accepts_the_symmetric_handoff_direction's geometry (b's
+        // range earlier, a's range later, touching at one point) but with
+        // no hint relationship -- must be rejected. Closes a real gap: an
+        // asymmetric weakening of the overlap predicate's first `<=` to
+        // `<` (verify_allocation's `a.start <= b.end && b.start <= a.end`)
+        // would make this pair look non-overlapping instead of correctly
+        // rejected, and nothing else in this file's tests would catch it.
+        let a = iv(0, 2, 4, RegClass::Gpr); // later range
+        let b = iv(1, 0, 2, RegClass::Gpr); // earlier range, no hint at all
+        let mut assignment = HashMap::new();
+        assignment.insert(a.value, Location::Reg(forge_x64::PhysReg::Rax));
+        assignment.insert(b.value, Location::Reg(forge_x64::PhysReg::Rax));
+
+        assert!(
+            verify_allocation(&[a, b], &assignment).is_err(),
+            "touching positions alone must not be enough in either direction -- the hint must \
+             actually match"
+        );
+    }
+
+    #[test]
     fn rejects_touching_intervals_sharing_a_register_without_a_matching_hint() {
         let a = iv(0, 0, 2, RegClass::Gpr);
         let b = iv(1, 2, 4, RegClass::Gpr); // touches a, but no hint at all
