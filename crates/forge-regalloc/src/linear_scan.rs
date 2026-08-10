@@ -2,7 +2,8 @@ use crate::interval::{Interval, RegClass};
 use crate::liveness::reads_of;
 use forge_ir::Value;
 use forge_x64::{PhysReg, SelectedFunction};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
 
 /// A virtual register's final storage location, once Phase 8 has assigned
 /// one. SPEC.md's §7 pseudocode references `Location` but never defines
@@ -112,26 +113,26 @@ pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = ALLOCATABLE_XMM.split_at(14)
 /// sufficient -- no reference to the intervals themselves is needed here.
 fn precompute_excluded(
     excluded_registers: &HashMap<(usize, Value), Vec<PhysReg>>,
-) -> HashMap<Value, HashSet<PhysReg>> {
-    let mut out: HashMap<Value, HashSet<PhysReg>> = HashMap::new();
+) -> FxHashMap<Value, FxHashSet<PhysReg>> {
+    let mut out: FxHashMap<Value, FxHashSet<PhysReg>> = FxHashMap::default();
     for (&(_, value), regs) in excluded_registers {
         out.entry(value).or_default().extend(regs.iter().copied());
     }
     out
 }
 
-// `HashSet::new()` is not `const fn`, so this needs a lazily-initialized
-// static, not a plain `static _: HashSet<_> = HashSet::new();` (a compile
-// error).
-static EMPTY_EXCLUSION_SET: std::sync::LazyLock<HashSet<PhysReg>> =
-    std::sync::LazyLock::new(HashSet::new);
+// `FxHashSet::default()` is not `const fn`, so this needs a
+// lazily-initialized static, not a plain
+// `static _: FxHashSet<_> = FxHashSet::default();` (a compile error).
+static EMPTY_EXCLUSION_SET: std::sync::LazyLock<FxHashSet<PhysReg>> =
+    std::sync::LazyLock::new(FxHashSet::default);
 
 pub struct LinearScan<'a> {
     intervals: Vec<Interval>,
     active: Vec<usize>,
-    free_regs: HashSet<PhysReg>,
-    assignment: HashMap<Value, Location>,
-    excluded: HashMap<Value, HashSet<PhysReg>>,
+    free_regs: FxHashSet<PhysReg>,
+    assignment: FxHashMap<Value, Location>,
+    excluded: FxHashMap<Value, FxHashSet<PhysReg>>,
     allocatable: &'a [PhysReg],
     slot_end: Vec<u32>,
 }
@@ -147,7 +148,7 @@ impl<'a> LinearScan<'a> {
             intervals,
             active: Vec::new(),
             free_regs: allocatable.iter().copied().collect(),
-            assignment: HashMap::new(),
+            assignment: FxHashMap::default(),
             excluded: precompute_excluded(excluded_registers),
             allocatable,
             slot_end,
@@ -164,7 +165,7 @@ impl<'a> LinearScan<'a> {
 
     /// Returns an EMPTY set (not a missing-key panic) for any `Value`
     /// with no exclusion entry -- the overwhelming common case.
-    fn excluded_at(&self, value: Value) -> &HashSet<PhysReg> {
+    fn excluded_at(&self, value: Value) -> &FxHashSet<PhysReg> {
         self.excluded.get(&value).unwrap_or(&EMPTY_EXCLUSION_SET)
     }
 
@@ -512,6 +513,7 @@ pub fn allocate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn phys_reg_hash_derive_works() {
@@ -646,7 +648,7 @@ mod tests {
 
         let excluded = precompute_excluded(&raw);
 
-        let v1: HashSet<PhysReg> = excluded[&Value(1)].clone();
+        let v1 = excluded[&Value(1)].clone();
         assert_eq!(v1, [PhysReg::Rax, PhysReg::Rdx].into_iter().collect());
         assert_eq!(excluded[&Value(2)], [PhysReg::Rcx].into_iter().collect());
     }
