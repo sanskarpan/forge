@@ -147,6 +147,27 @@ pub enum MachineInst {
         disp: i32,
     },
 
+    /// Branchless select: dst = (cond != 0) ? then_val : else_val. Produced
+    /// ONLY by diamond fusion (find_fusable_diamonds) -- select_inst never
+    /// constructs this directly, since there is no Inst::Select to match
+    /// on (see the design doc). 2-address destructive like every other
+    /// x86 binary op: dst starts as a copy of then_val (a coalescing hint
+    /// records dst -> then_val -- see compute_coalescing_hints), and
+    /// emission (deferred, task #68) overwrites it with else_val
+    /// conditionally via `test cond, cond` (reads cond's already-
+    /// materialized 0/1 value directly, NOT the flags from whatever
+    /// produced it) followed by `cmovz dst, else_val`. Requires cond to
+    /// be genuinely zero-extended to 64 bits by whatever materialized it
+    /// (setcc alone only writes 1 byte) -- a real precondition on task
+    /// #68's emission of IntCmp/FloatCmp, not something this variant or
+    /// its selection-time construction can itself guarantee.
+    IntCmov {
+        dst: Value,
+        cond: Value,
+        then_val: Value,
+        else_val: Value,
+    },
+
     // Float arithmetic -- destructive (dst must end up == lhs's location)
     FloatAdd {
         dst: Value,
@@ -869,6 +890,9 @@ pub fn compute_coalescing_hints(insts: &[MachineInst]) -> HashMap<Value, Value> 
             | MachineInst::FloatMin { dst, lhs, .. }
             | MachineInst::FloatMax { dst, lhs, .. } => {
                 hints.insert(*dst, *lhs);
+            }
+            MachineInst::IntCmov { dst, then_val, .. } => {
+                hints.insert(*dst, *then_val);
             }
             MachineInst::IntNeg { dst, src }
             | MachineInst::Not { dst, src }

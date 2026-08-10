@@ -1508,6 +1508,18 @@ fn coalescing_hints_no_entry_for_ops_with_no_natural_hint() {
     assert_eq!(selected.coalescing_hints.get(&p), None);
 }
 
+#[test]
+fn int_cmov_gets_a_coalescing_hint_to_then_val() {
+    let insts = vec![MachineInst::IntCmov {
+        dst: Value(3),
+        cond: Value(2),
+        then_val: Value(0),
+        else_val: Value(1),
+    }];
+    let hints = compute_coalescing_hints(&insts);
+    assert_eq!(hints.get(&Value(3)), Some(&Value(0)));
+}
+
 /// Distinct from the test above: `Param` has a `dst` field that's
 /// simply not one of the hinted variants. `Jump`/`Return` are a
 /// structurally different case -- they have no `dst` at all, so

@@ -38,6 +38,9 @@ pub(crate) fn reads_of(inst: &MachineInst) -> Vec<Value> {
         MachineInst::IntCmp { lhs, rhs, .. } | MachineInst::FloatCmp { lhs, rhs, .. } => {
             vec![*lhs, *rhs]
         }
+        MachineInst::IntCmov { cond, then_val, else_val, .. } => {
+            vec![*cond, *then_val, *else_val]
+        }
         MachineInst::CallLibm { args, .. } => args.iter().copied().collect(),
         MachineInst::Jump { .. } => vec![],
         MachineInst::Branch { cond, .. } => vec![*cond],
@@ -69,6 +72,7 @@ pub(crate) fn def_of(inst: &MachineInst) -> Option<Value> {
         | MachineInst::Shr { dst, .. }
         | MachineInst::Sar { dst, .. }
         | MachineInst::Lea { dst, .. }
+        | MachineInst::IntCmov { dst, .. }
         | MachineInst::FloatAdd { dst, .. }
         | MachineInst::FloatSub { dst, .. }
         | MachineInst::FloatMul { dst, .. }
