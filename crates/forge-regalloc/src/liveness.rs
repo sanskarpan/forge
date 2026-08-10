@@ -132,13 +132,18 @@ impl Liveness {
 /// the SAME value earlier in the same block (a value defined and used
 /// within one block never needs to appear in that block's live_in).
 ///
-/// `func` is unused directly (only blocks reachable via `select()`'s own
-/// `reverse_postorder` walk appear in `block_starts`, and everything this
-/// function needs about them comes from `selected`) -- kept as a
-/// parameter for API symmetry with `build_intervals`, which DOES need it
-/// (for phi handling, which lives entirely in the IR, not MachineInst).
+/// CFG successors are derived from `func`'s own real `Terminator`, NOT by
+/// re-scanning `selected.insts` for `Jump`/`Branch` -- diamond fusion
+/// (Phase 7f) replaces a fused block's real Branch with a branchless
+/// FloatMin/FloatMax/IntCmov in `selected.insts`, so that MachineInst
+/// stream alone no longer reflects the pred -> merge edge for a fused
+/// block. `func`'s IR terminator is never touched by fusion (fusion
+/// operates entirely on `select()`'s MachineInst output -- see the design
+/// doc), so it always has the real edge. For every non-fused block this
+/// is behavior-preserving: `select_term` translates each `Terminator`
+/// 1:1 into the matching `Jump`/`Branch` MachineInst, so the two sources
+/// already agreed exactly before fusion existed.
 pub fn compute_liveness(func: &Function, selected: &SelectedFunction) -> Liveness {
-    let _ = func;
     let blocks: Vec<Block> = selected.block_starts.iter().map(|(b, _)| *b).collect();
 
     let mut uses: HashMap<Block, HashSet<Value>> = HashMap::new();
@@ -149,7 +154,6 @@ pub fn compute_liveness(func: &Function, selected: &SelectedFunction) -> Livenes
         let range = block_range_at(selected, pos);
         let mut block_defs: HashSet<Value> = HashSet::new();
         let mut block_uses: HashSet<Value> = HashSet::new();
-        let mut succs = Vec::new();
         for inst in &selected.insts[range] {
             for used in reads_of(inst) {
                 if !block_defs.contains(&used) {
@@ -159,15 +163,12 @@ pub fn compute_liveness(func: &Function, selected: &SelectedFunction) -> Livenes
             if let Some(d) = def_of(inst) {
                 block_defs.insert(d);
             }
-            match inst {
-                MachineInst::Jump { target } => succs.push(*target),
-                MachineInst::Branch { then_, else_, .. } => {
-                    succs.push(*then_);
-                    succs.push(*else_);
-                }
-                _ => {}
-            }
         }
+        let succs = match &func.blocks[block.0 as usize].term {
+            Some(forge_ir::Terminator::Jump(target)) => vec![*target],
+            Some(forge_ir::Terminator::Branch { then_, else_, .. }) => vec![*then_, *else_],
+            _ => Vec::new(),
+        };
         uses.insert(block, block_uses);
         defs.insert(block, block_defs);
         successors.insert(block, succs);
@@ -278,5 +279,66 @@ mod tests {
         // cond, by contrast, is used inside entry (the Branch) and never
         // escapes it.
         assert!(!liveness.live_out(entry).contains(&cond));
+    }
+
+    /// Reproduces a real bug: once select() actually fuses an eligible
+    /// diamond (Phase 7f) into a branchless FloatMax/IntCmov, the fused
+    /// block's real Branch terminator is GONE from `selected.insts` --
+    /// only the real forge_ir `Terminator` (untouched by fusion) still
+    /// records the pred -> merge edge. `compute_liveness` used to derive
+    /// CFG successors purely by re-scanning `selected.insts` for
+    /// `Jump`/`Branch`, so a fused block's successors came out empty,
+    /// silently dropping that edge from the dataflow graph.
+    ///
+    /// `c` here is defined in `entry` (the diamond's own Branch block),
+    /// is NOT an operand of the diamond at all (the diamond fuses `a`/`b`
+    /// into a FloatMax), and is used only after the merge block via
+    /// `c + max(a, b)`. Correct liveness must keep `c` live out of
+    /// `entry` all the way to the merge block's use -- a value the buggy
+    /// successor-scan drops entirely, since `entry`'s scanned
+    /// `selected.insts` range ends in `FloatMax`, not `Branch`.
+    #[test]
+    fn value_live_across_a_fused_diamond_survives_in_pred_live_out() {
+        let src = "c + (if a > b then a else b)";
+        let (tokens, diags) = forge_syntax::lexer::lex(src);
+        assert!(diags.is_empty(), "lex errors: {diags:?}");
+        let (ast, diags) = forge_syntax::parser::parse(&tokens);
+        assert!(diags.is_empty(), "parse errors: {diags:?}");
+        let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
+            .unwrap_or_else(|e| panic!("type errors: {e:?}"));
+        let func = forge_ir::lower::lower(&typed);
+
+        let selected = select(&func);
+        // Confirm this string genuinely produces a fused diamond (no
+        // MachineInst::Branch survives selection) -- otherwise this test
+        // would pass vacuously without ever exercising the bug.
+        assert!(
+            !selected.insts.iter().any(|i| matches!(i, MachineInst::Branch { .. })),
+            "expected select() to fuse this diamond away entirely"
+        );
+        assert!(
+            selected.insts.iter().any(|i| matches!(i, MachineInst::FloatMax { .. })),
+            "expected the diamond to fuse into a FloatMax"
+        );
+
+        // `c` is the pass-through: the FloatAdd combining it with the
+        // fused max's dst is the only FloatAdd in this program.
+        let pass_through = selected
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                MachineInst::FloatAdd { lhs, .. } => Some(*lhs),
+                _ => None,
+            })
+            .expect("expected a FloatAdd combining c with the fused max");
+
+        let liveness = compute_liveness(&func, &selected);
+
+        assert!(
+            liveness.live_out(func.entry).contains(&pass_through),
+            "c is defined before the diamond and used after the merge block -- \
+             it must stay live out of the diamond's own Branch block, but the \
+             pred -> merge edge was silently dropped"
+        );
     }
 }
