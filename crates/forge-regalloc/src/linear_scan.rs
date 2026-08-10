@@ -1,6 +1,7 @@
 use crate::interval::{Interval, RegClass};
+use crate::liveness::reads_of;
 use forge_ir::Value;
-use forge_x64::PhysReg;
+use forge_x64::{PhysReg, SelectedFunction};
 use std::collections::{HashMap, HashSet};
 
 /// A virtual register's final storage location, once Phase 8 has assigned
@@ -430,6 +431,26 @@ impl<'a> LinearScan<'a> {
                 None => self.spill_at_interval(i),
             }
         }
+    }
+}
+
+/// spill_weight = (number of real reads) / (interval length), matching
+/// PROMPT.md's own formula ("uses / length -- spill the cheapest").
+/// Computed once, up front, for every interval -- NOT lazily inside
+/// spill_at_interval, since the heuristic needs to compare ALL currently
+/// active intervals' weights against each other, and re-deriving it
+/// per-comparison would risk the two computations silently drifting.
+pub fn populate_spill_weights(selected: &SelectedFunction, intervals: &mut [Interval]) {
+    let mut use_counts: HashMap<Value, u32> = HashMap::new();
+    for inst in &selected.insts {
+        for used in reads_of(inst) {
+            *use_counts.entry(used).or_insert(0) += 1;
+        }
+    }
+    for iv in intervals.iter_mut() {
+        let uses = use_counts.get(&iv.value).copied().unwrap_or(0);
+        let length = (iv.end - iv.start).max(1); // avoid a length-0 divide
+        iv.spill_weight = uses as f32 / length as f32;
     }
 }
 
@@ -1296,5 +1317,63 @@ mod tests {
         let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
             .unwrap_or_else(|e| panic!("type errors for {src:?}: {e:?}"));
         forge_ir::lower::lower(&typed)
+    }
+
+    fn selected_fn(insts: Vec<forge_x64::MachineInst>) -> forge_x64::SelectedFunction {
+        forge_x64::SelectedFunction {
+            insts,
+            synthetic_types: HashMap::new(),
+            coalescing_hints: HashMap::new(),
+            pool: forge_x64::ConstantPool::default(),
+            block_starts: vec![],
+        }
+    }
+
+    #[test]
+    fn populate_spill_weights_computes_uses_over_length() {
+        // Value(0) is read twice here (as lhs of one IntAdd, rhs of
+        // another) -- 2 uses over an interval of length 2 (start=0,
+        // end=2) should give weight 1.0.
+        let selected = selected_fn(vec![
+            forge_x64::MachineInst::IntAdd {
+                dst: Value(10),
+                lhs: Value(0),
+                rhs: Value(11),
+            },
+            forge_x64::MachineInst::IntAdd {
+                dst: Value(12),
+                lhs: Value(11),
+                rhs: Value(0),
+            },
+        ]);
+        let mut intervals = vec![iv(0, 0, 2, crate::interval::RegClass::Gpr)];
+
+        populate_spill_weights(&selected, &mut intervals);
+
+        assert_eq!(intervals[0].spill_weight, 1.0);
+    }
+
+    #[test]
+    fn populate_spill_weights_a_value_used_once_across_a_long_interval_scores_low() {
+        let selected = selected_fn(vec![forge_x64::MachineInst::IntAdd {
+            dst: Value(10),
+            lhs: Value(0),
+            rhs: Value(11),
+        }]);
+        let mut intervals = vec![iv(0, 0, 10, crate::interval::RegClass::Gpr)];
+
+        populate_spill_weights(&selected, &mut intervals);
+
+        assert_eq!(intervals[0].spill_weight, 0.1);
+    }
+
+    #[test]
+    fn populate_spill_weights_a_value_never_read_scores_zero() {
+        let selected = selected_fn(vec![]);
+        let mut intervals = vec![iv(0, 0, 10, crate::interval::RegClass::Gpr)];
+
+        populate_spill_weights(&selected, &mut intervals);
+
+        assert_eq!(intervals[0].spill_weight, 0.0);
     }
 }
