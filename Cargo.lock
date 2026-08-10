@@ -296,6 +296,7 @@ name = "forge-x64"
 version = "0.1.0"
 dependencies = [
  "forge-ir",
+ "forge-regalloc",
  "forge-syntax",
  "iced-x86",
  "smallvec",

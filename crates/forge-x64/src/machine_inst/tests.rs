@@ -2129,16 +2129,46 @@ fn select_fuses_an_eligible_diamond_and_skips_arm_blocks() {
         func.blocks[block.0 as usize].insts.push(v);
         v
     };
-    let a = push(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
-    let c = push(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
-    let cond = push(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
-    func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+    let a = push(
+        &mut func,
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::I64,
+        },
+        Ty::I64,
+    );
+    let c = push(
+        &mut func,
+        entry,
+        Inst::Param {
+            index: 1,
+            ty: Ty::I64,
+        },
+        Ty::I64,
+    );
+    let cond = push(
+        &mut func,
+        entry,
+        Inst::Param {
+            index: 2,
+            ty: Ty::Bool,
+        },
+        Ty::Bool,
+    );
+    func.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+        cond,
+        then_: t,
+        else_: e,
+    });
     func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
     func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
     let phi_dst = push(
         &mut func,
         m,
-        Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, c)] },
+        Inst::Phi {
+            incoming: smallvec::smallvec![(t, a), (e, c)],
+        },
         Ty::I64,
     );
     func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
@@ -2147,9 +2177,16 @@ fn select_fuses_an_eligible_diamond_and_skips_arm_blocks() {
 
     // Exactly one IntCmov, no MachineInst::Branch, no MachineInst::Jump
     // for the fused diamond's arms.
-    let cmovs: Vec<_> = selected.insts.iter().filter(|i| matches!(i, MachineInst::IntCmov { .. })).collect();
+    let cmovs: Vec<_> = selected
+        .insts
+        .iter()
+        .filter(|i| matches!(i, MachineInst::IntCmov { .. }))
+        .collect();
     assert_eq!(cmovs.len(), 1);
-    assert!(!selected.insts.iter().any(|i| matches!(i, MachineInst::Branch { .. })));
+    assert!(!selected
+        .insts
+        .iter()
+        .any(|i| matches!(i, MachineInst::Branch { .. })));
 
     // block_starts still has an entry for every block, including the
     // two now-empty arms (zero-length ranges).

@@ -38,7 +38,12 @@ pub(crate) fn reads_of(inst: &MachineInst) -> Vec<Value> {
         MachineInst::IntCmp { lhs, rhs, .. } | MachineInst::FloatCmp { lhs, rhs, .. } => {
             vec![*lhs, *rhs]
         }
-        MachineInst::IntCmov { cond, then_val, else_val, .. } => {
+        MachineInst::IntCmov {
+            cond,
+            then_val,
+            else_val,
+            ..
+        } => {
             vec![*cond, *then_val, *else_val]
         }
         MachineInst::CallLibm { args, .. } => args.iter().copied().collect(),
@@ -313,11 +318,17 @@ mod tests {
         // MachineInst::Branch survives selection) -- otherwise this test
         // would pass vacuously without ever exercising the bug.
         assert!(
-            !selected.insts.iter().any(|i| matches!(i, MachineInst::Branch { .. })),
+            !selected
+                .insts
+                .iter()
+                .any(|i| matches!(i, MachineInst::Branch { .. })),
             "expected select() to fuse this diamond away entirely"
         );
         assert!(
-            selected.insts.iter().any(|i| matches!(i, MachineInst::FloatMax { .. })),
+            selected
+                .insts
+                .iter()
+                .any(|i| matches!(i, MachineInst::FloatMax { .. })),
             "expected the diamond to fuse into a FloatMax"
         );
 

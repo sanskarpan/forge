@@ -680,7 +680,10 @@ pub enum DiamondFusion {
 /// (why empty arms specifically, why this can't just use `RegClass`).
 pub fn find_fusable_diamonds(
     func: &Function,
-) -> (HashMap<Block, DiamondFusion>, std::collections::HashSet<Block>) {
+) -> (
+    HashMap<Block, DiamondFusion>,
+    std::collections::HashSet<Block>,
+) {
     let mut fusions = HashMap::new();
     let mut skip = std::collections::HashSet::new();
 
@@ -714,7 +717,12 @@ pub fn find_fusable_diamonds(
 
     for (idx, block_data) in func.blocks.iter().enumerate() {
         let pred = Block(idx as u32);
-        let Some(Terminator::Branch { cond, then_: t, else_: e }) = &block_data.term else {
+        let Some(Terminator::Branch {
+            cond,
+            then_: t,
+            else_: e,
+        }) = &block_data.term
+        else {
             continue;
         };
         if t == e {
@@ -790,16 +798,36 @@ pub fn find_fusable_diamonds(
             if ty_of(*lhs) == Ty::F64 {
                 let rewrite = match op {
                     CmpOp::Lt if val_t == *lhs && val_e == *rhs => {
-                        Some(DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Min, lhs: *lhs, rhs: *rhs })
+                        Some(DiamondFusion::FloatMinMax {
+                            dst,
+                            op: MinMaxOp::Min,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                        })
                     }
                     CmpOp::Lt if val_t == *rhs && val_e == *lhs => {
-                        Some(DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Max, lhs: *rhs, rhs: *lhs })
+                        Some(DiamondFusion::FloatMinMax {
+                            dst,
+                            op: MinMaxOp::Max,
+                            lhs: *rhs,
+                            rhs: *lhs,
+                        })
                     }
                     CmpOp::Gt if val_t == *lhs && val_e == *rhs => {
-                        Some(DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Max, lhs: *lhs, rhs: *rhs })
+                        Some(DiamondFusion::FloatMinMax {
+                            dst,
+                            op: MinMaxOp::Max,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                        })
                     }
                     CmpOp::Gt if val_t == *rhs && val_e == *lhs => {
-                        Some(DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Min, lhs: *rhs, rhs: *lhs })
+                        Some(DiamondFusion::FloatMinMax {
+                            dst,
+                            op: MinMaxOp::Min,
+                            lhs: *rhs,
+                            rhs: *lhs,
+                        })
                     }
                     _ => None,
                 };
@@ -822,7 +850,12 @@ pub fn find_fusable_diamonds(
         if ty_of(dst) != Ty::F64 {
             fusions.insert(
                 pred,
-                DiamondFusion::IntCmov { dst, cond: *cond, then_val: val_t, else_val: val_e },
+                DiamondFusion::IntCmov {
+                    dst,
+                    cond: *cond,
+                    then_val: val_t,
+                    else_val: val_e,
+                },
             );
             skip.insert(*t);
             skip.insert(*e);
@@ -862,14 +895,34 @@ pub fn select(func: &Function) -> SelectedFunction {
             // This block's real Branch terminator is replaced by the
             // fused instruction -- no Jump/Branch emitted for it at all.
             match fusion {
-                DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Min, lhs, rhs } => {
+                DiamondFusion::FloatMinMax {
+                    dst,
+                    op: MinMaxOp::Min,
+                    lhs,
+                    rhs,
+                } => {
                     sel.insts.push(MachineInst::FloatMin { dst, lhs, rhs });
                 }
-                DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Max, lhs, rhs } => {
+                DiamondFusion::FloatMinMax {
+                    dst,
+                    op: MinMaxOp::Max,
+                    lhs,
+                    rhs,
+                } => {
                     sel.insts.push(MachineInst::FloatMax { dst, lhs, rhs });
                 }
-                DiamondFusion::IntCmov { dst, cond, then_val, else_val } => {
-                    sel.insts.push(MachineInst::IntCmov { dst, cond, then_val, else_val });
+                DiamondFusion::IntCmov {
+                    dst,
+                    cond,
+                    then_val,
+                    else_val,
+                } => {
+                    sel.insts.push(MachineInst::IntCmov {
+                        dst,
+                        cond,
+                        then_val,
+                        else_val,
+                    });
                 }
             }
             // The fused instruction falls through directly into the merge
@@ -882,7 +935,9 @@ pub fn select(func: &Function) -> SelectedFunction {
             // skip block, since it has real computation: the payload phi
             // is what made this a fusion in the first place), so it must
             // name m explicitly to mean anything.
-            let Terminator::Branch { then_: t, .. } = func.blocks[block.0 as usize].term.as_ref().unwrap() else {
+            let Terminator::Branch { then_: t, .. } =
+                func.blocks[block.0 as usize].term.as_ref().unwrap()
+            else {
                 unreachable!("a fusion key's block must have a Branch terminator")
             };
             let Some(Terminator::Jump(m)) = &func.blocks[t.0 as usize].term else {
@@ -1008,14 +1063,42 @@ mod diamond_fusion_tests {
         let mut func = empty_func(4);
         let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
 
-        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: val_ty }, val_ty);
-        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: val_ty }, val_ty);
+        let a = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: val_ty,
+            },
+            val_ty,
+        );
+        let c = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: val_ty,
+            },
+            val_ty,
+        );
         let cond = if let Some(op) = cmp {
             push_inst(&mut func, entry, Inst::Cmp { op, lhs: a, rhs: c }, Ty::Bool)
         } else {
-            push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool)
+            push_inst(
+                &mut func,
+                entry,
+                Inst::Param {
+                    index: 2,
+                    ty: Ty::Bool,
+                },
+                Ty::Bool,
+            )
         };
-        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+            cond,
+            then_: t,
+            else_: e,
+        });
         func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
         func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
 
@@ -1023,14 +1106,18 @@ mod diamond_fusion_tests {
         let phi_dst = push_inst(
             &mut func,
             m,
-            Inst::Phi { incoming: smallvec::smallvec![(t, val_t), (e, val_e)] },
+            Inst::Phi {
+                incoming: smallvec::smallvec![(t, val_t), (e, val_e)],
+            },
             val_ty,
         );
         if extra_trivial_phi {
             push_inst(
                 &mut func,
                 m,
-                Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, a)] },
+                Inst::Phi {
+                    incoming: smallvec::smallvec![(t, a), (e, a)],
+                },
                 val_ty,
             );
         }
@@ -1045,7 +1132,12 @@ mod diamond_fusion_tests {
         let (fusions, skip) = find_fusable_diamonds(&func);
         assert_eq!(fusions.len(), 1);
         match fusions.values().next().unwrap() {
-            DiamondFusion::IntCmov { dst, cond: c, then_val, else_val } => {
+            DiamondFusion::IntCmov {
+                dst,
+                cond: c,
+                then_val,
+                else_val,
+            } => {
                 assert_eq!(*dst, phi_dst);
                 assert_eq!(*c, cond);
                 assert_eq!(*then_val, val_t);
@@ -1060,10 +1152,38 @@ mod diamond_fusion_tests {
     fn non_empty_arm_is_rejected() {
         let mut func = empty_func(4);
         let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
-        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
-        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
-        let cond = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
-        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        let a = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+        );
+        let c = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+        );
+        let cond = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 2,
+                ty: Ty::Bool,
+            },
+            Ty::Bool,
+        );
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+            cond,
+            then_: t,
+            else_: e,
+        });
         // t computes a real division -- NOT empty. This is the
         // correctness-critical near-miss: fusing this would unconditionally
         // execute IntDiv, which traps on c==0 even when cond would have
@@ -1074,20 +1194,24 @@ mod diamond_fusion_tests {
         let phi_dst = push_inst(
             &mut func,
             m,
-            Inst::Phi { incoming: smallvec::smallvec![(t, divided), (e, c)] },
+            Inst::Phi {
+                incoming: smallvec::smallvec![(t, divided), (e, c)],
+            },
             Ty::I64,
         );
         func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
 
         let (fusions, skip) = find_fusable_diamonds(&func);
-        assert!(fusions.is_empty(), "a non-empty arm must never be fused -- IntDiv traps");
+        assert!(
+            fusions.is_empty(),
+            "a non-empty arm must never be fused -- IntDiv traps"
+        );
         assert!(skip.is_empty());
     }
 
     #[test]
     fn multiple_phis_at_merge_only_the_differing_one_is_the_payload() {
-        let (func, _cond, _val_t, _val_e, phi_dst) =
-            build_diamond(Ty::I64, None, false, true); // extra trivial phi
+        let (func, _cond, _val_t, _val_e, phi_dst) = build_diamond(Ty::I64, None, false, true); // extra trivial phi
         let (fusions, skip) = find_fusable_diamonds(&func);
         assert_eq!(fusions.len(), 1, "the trivial phi must not block fusion");
         match fusions.values().next().unwrap() {
@@ -1103,22 +1227,54 @@ mod diamond_fusion_tests {
         // single-value fusion cannot represent that; must not fuse.
         let mut func = empty_func(4);
         let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
-        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
-        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
-        let cond = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
-        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        let a = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+        );
+        let c = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+        );
+        let cond = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 2,
+                ty: Ty::Bool,
+            },
+            Ty::Bool,
+        );
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+            cond,
+            then_: t,
+            else_: e,
+        });
         func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
         func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
         let phi1 = push_inst(
             &mut func,
             m,
-            Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, c)] },
+            Inst::Phi {
+                incoming: smallvec::smallvec![(t, a), (e, c)],
+            },
             Ty::I64,
         );
         push_inst(
             &mut func,
             m,
-            Inst::Phi { incoming: smallvec::smallvec![(t, c), (e, a)] },
+            Inst::Phi {
+                incoming: smallvec::smallvec![(t, c), (e, a)],
+            },
             Ty::I64,
         );
         func.blocks[m.0 as usize].term = Some(Terminator::Return(phi1));
@@ -1132,10 +1288,38 @@ mod diamond_fusion_tests {
     fn third_predecessor_of_merge_is_rejected() {
         let mut func = empty_func(5);
         let (entry, t, e, other, m) = (Block(0), Block(1), Block(2), Block(3), Block(4));
-        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
-        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
-        let cond = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
-        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        let a = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+        );
+        let c = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+        );
+        let cond = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 2,
+                ty: Ty::Bool,
+            },
+            Ty::Bool,
+        );
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+            cond,
+            then_: t,
+            else_: e,
+        });
         func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
         func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
         // `other` is an unrelated block that ALSO jumps to `m` -- a genuine
@@ -1146,13 +1330,18 @@ mod diamond_fusion_tests {
         let phi_dst = push_inst(
             &mut func,
             m,
-            Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, c)] },
+            Inst::Phi {
+                incoming: smallvec::smallvec![(t, a), (e, c)],
+            },
             Ty::I64,
         );
         func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
 
         let (fusions, skip) = find_fusable_diamonds(&func);
-        assert!(fusions.is_empty(), "m has a 3rd predecessor (`other`) -- must not fuse");
+        assert!(
+            fusions.is_empty(),
+            "m has a 3rd predecessor (`other`) -- must not fuse"
+        );
         assert!(skip.is_empty());
     }
 
@@ -1162,7 +1351,9 @@ mod diamond_fusion_tests {
         let (fusions, _) = find_fusable_diamonds(&func);
         assert_eq!(fusions.len(), 1);
         match fusions.values().next().unwrap() {
-            DiamondFusion::FloatMinMax { op: MinMaxOp::Min, .. } => {}
+            DiamondFusion::FloatMinMax {
+                op: MinMaxOp::Min, ..
+            } => {}
             other => panic!("expected FloatMinMax::Min, got {other:?}"),
         }
     }
@@ -1173,7 +1364,12 @@ mod diamond_fusion_tests {
         let (fusions, _) = find_fusable_diamonds(&func);
         assert_eq!(fusions.len(), 1);
         match fusions.values().next().unwrap() {
-            DiamondFusion::FloatMinMax { op: MinMaxOp::Max, lhs, rhs, .. } => {
+            DiamondFusion::FloatMinMax {
+                op: MinMaxOp::Max,
+                lhs,
+                rhs,
+                ..
+            } => {
                 // The else-arm value (val_e) must be rhs; the then-arm
                 // value (val_t) must be lhs -- this is the exact defect
                 // execution-based design review found and fixed.
@@ -1189,7 +1385,9 @@ mod diamond_fusion_tests {
         let (func, ..) = build_diamond(Ty::F64, Some(CmpOp::Gt), false, false);
         let (fusions, _) = find_fusable_diamonds(&func);
         match fusions.values().next().unwrap() {
-            DiamondFusion::FloatMinMax { op: MinMaxOp::Max, .. } => {}
+            DiamondFusion::FloatMinMax {
+                op: MinMaxOp::Max, ..
+            } => {}
             other => panic!("expected FloatMinMax::Max, got {other:?}"),
         }
     }
@@ -1199,7 +1397,12 @@ mod diamond_fusion_tests {
         let (func, _, val_t, val_e, _) = build_diamond(Ty::F64, Some(CmpOp::Gt), true, false);
         let (fusions, _) = find_fusable_diamonds(&func);
         match fusions.values().next().unwrap() {
-            DiamondFusion::FloatMinMax { op: MinMaxOp::Min, lhs, rhs, .. } => {
+            DiamondFusion::FloatMinMax {
+                op: MinMaxOp::Min,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert_eq!(*lhs, val_t);
                 assert_eq!(*rhs, val_e);
             }
@@ -1211,12 +1414,18 @@ mod diamond_fusion_tests {
     fn float_le_ge_diamonds_produce_no_fusion_at_all() {
         let (func_le, ..) = build_diamond(Ty::F64, Some(CmpOp::Le), false, false);
         let (fusions_le, skip_le) = find_fusable_diamonds(&func_le);
-        assert!(fusions_le.is_empty(), "Le must not fuse -- no derived table for it");
+        assert!(
+            fusions_le.is_empty(),
+            "Le must not fuse -- no derived table for it"
+        );
         assert!(skip_le.is_empty());
 
         let (func_ge, ..) = build_diamond(Ty::F64, Some(CmpOp::Ge), false, false);
         let (fusions_ge, skip_ge) = find_fusable_diamonds(&func_ge);
-        assert!(fusions_ge.is_empty(), "Ge must not fuse -- no derived table for it");
+        assert!(
+            fusions_ge.is_empty(),
+            "Ge must not fuse -- no derived table for it"
+        );
         assert!(skip_ge.is_empty());
     }
 
@@ -1229,12 +1438,18 @@ mod diamond_fusion_tests {
         // one as FloatMinMax with nothing to catch it.
         let (func_eq, ..) = build_diamond(Ty::F64, Some(CmpOp::Eq), false, false);
         let (fusions_eq, skip_eq) = find_fusable_diamonds(&func_eq);
-        assert!(fusions_eq.is_empty(), "Eq must not fuse -- no derived table for it");
+        assert!(
+            fusions_eq.is_empty(),
+            "Eq must not fuse -- no derived table for it"
+        );
         assert!(skip_eq.is_empty());
 
         let (func_ne, ..) = build_diamond(Ty::F64, Some(CmpOp::Ne), false, false);
         let (fusions_ne, skip_ne) = find_fusable_diamonds(&func_ne);
-        assert!(fusions_ne.is_empty(), "Ne must not fuse -- no derived table for it");
+        assert!(
+            fusions_ne.is_empty(),
+            "Ne must not fuse -- no derived table for it"
+        );
         assert!(skip_ne.is_empty());
     }
 
@@ -1246,23 +1461,65 @@ mod diamond_fusion_tests {
         // this is the exact miscompile execution-based design review found).
         let mut func = empty_func(4);
         let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
-        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::F64 }, Ty::F64);
-        let bb = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::F64 }, Ty::F64);
-        let cc = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::F64 }, Ty::F64);
-        let cond = push_inst(&mut func, entry, Inst::Cmp { op: CmpOp::Gt, lhs: a, rhs: bb }, Ty::Bool);
-        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        let a = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+        );
+        let bb = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+        );
+        let cc = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 2,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+        );
+        let cond = push_inst(
+            &mut func,
+            entry,
+            Inst::Cmp {
+                op: CmpOp::Gt,
+                lhs: a,
+                rhs: bb,
+            },
+            Ty::Bool,
+        );
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+            cond,
+            then_: t,
+            else_: e,
+        });
         func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
         func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
         let phi_dst = push_inst(
             &mut func,
             m,
-            Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, cc)] },
+            Inst::Phi {
+                incoming: smallvec::smallvec![(t, a), (e, cc)],
+            },
             Ty::F64,
         );
         func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
 
         let (fusions, skip) = find_fusable_diamonds(&func);
-        assert!(fusions.is_empty(), "float third-value diamond must produce NO fusion, never IntCmov");
+        assert!(
+            fusions.is_empty(),
+            "float third-value diamond must produce NO fusion, never IntCmov"
+        );
         assert!(skip.is_empty());
     }
 
@@ -1298,23 +1555,56 @@ mod diamond_fusion_tests {
         // real Jump(t) target silently vanishes once t is skipped.
         let mut func = empty_func(5);
         let (entry, t, e, m, other) = (Block(0), Block(1), Block(2), Block(3), Block(4));
-        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
-        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
-        let cond = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
-        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        let a = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+        );
+        let c = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::I64,
+            },
+            Ty::I64,
+        );
+        let cond = push_inst(
+            &mut func,
+            entry,
+            Inst::Param {
+                index: 2,
+                ty: Ty::Bool,
+            },
+            Ty::Bool,
+        );
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch {
+            cond,
+            then_: t,
+            else_: e,
+        });
         func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
         func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
         func.blocks[other.0 as usize].term = Some(Terminator::Jump(t));
         let phi_dst = push_inst(
             &mut func,
             m,
-            Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, c)] },
+            Inst::Phi {
+                incoming: smallvec::smallvec![(t, a), (e, c)],
+            },
             Ty::I64,
         );
         func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
 
         let (fusions, skip) = find_fusable_diamonds(&func);
-        assert!(fusions.is_empty(), "arm `t` has a 2nd predecessor -- must not fuse");
+        assert!(
+            fusions.is_empty(),
+            "arm `t` has a 2nd predecessor -- must not fuse"
+        );
         assert!(skip.is_empty());
     }
 }
