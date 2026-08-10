@@ -879,6 +879,20 @@ impl LinearScan {
 ///    leaning on `spill()`'s own invariant is exactly the "shares a bug with
 ///    the thing it checks" failure the verifier exists to avoid.
 ///
+/// 4. **`verify_allocation` returning `Ok(())` is NOT a soundness proof**, and
+///    §14's invariant 5 ("No two values live at the same point are assigned the
+///    same register. Verified by an independent checker") should be read as the
+///    narrow claim it is. Nothing in this allocator models CALL CLOBBERS yet —
+///    `excluded_registers` covers only `IntDiv`/`IntRem`'s `Rax`/`Rdx` — and
+///    every XMM register is caller-saved under System V, so a float value
+///    living across a `CallLibm` is destroyed by it. Measured on this spec's
+///    own canonical example, `sin(x) + cos(y)`: `Value(1)` is live across the
+///    `CallLibm` at position 2 and is assigned `Xmm1`, which that call
+///    destroys, and the verifier returns `Ok(())` — correctly, by its own
+///    contract, because interval overlap is not the violated property.
+///    CHECKLIST bullet 22 (Phase 8e) is where the allocator learns to spill
+///    around calls; until then, a green verifier means overlap-clean, no more.
+///
 /// One consequence of item 1 that the pressure report makes visible, and that
 /// matters for the workbench panel: **peak register pressure is an UPPER BOUND
 /// on register demand, not equal to it.** `register_pressure` counts

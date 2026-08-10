@@ -27,6 +27,19 @@ use std::collections::HashMap;
 /// checked by `linear_scan.rs`'s own tests, and bullet 17's literal scope
 /// is the overlap property specifically. See this file's design doc for
 /// the full reasoning.
+///
+/// **`Ok(())` here means "no two overlapping intervals share a location",
+/// NOT "this allocation is correct."** The gap is currently real, not
+/// theoretical: nothing in this allocator models CALL CLOBBERS yet
+/// (`excluded_registers` covers only `IntDiv`/`IntRem`'s Rax/Rdx), and
+/// every XMM register is caller-saved under System V, so a float value
+/// living across a `CallLibm` is destroyed by it. Measured on
+/// `sin(x) + cos(y)`: `Value(1)` is live across the `CallLibm` at
+/// position 2 and is assigned `Xmm1`, which that call destroys -- and
+/// this function returns `Ok(())` on it, correctly by its own contract.
+/// That is CHECKLIST bullet 22's job (Phase 8e) to make the allocator
+/// handle and to test; recorded here so nobody reads a green
+/// `verify_allocation` as a soundness proof it does not claim to be.
 pub fn verify_allocation(
     intervals: &[Interval],
     assignment: &HashMap<Value, Location>,
