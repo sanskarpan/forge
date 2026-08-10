@@ -10,9 +10,10 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Location {
     Reg(PhysReg),
-    /// Stack slot index. Phase 8c's concern entirely -- this slice never
-    /// constructs this variant; it exists now only so `Location`'s shape
-    /// is settled before 8c needs to extend the same enum.
+    /// Index of a stack slot in the spill frame, 8 bytes per slot. Defined
+    /// (but never constructed) in Phase 8b so `Location`'s shape was
+    /// settled early; Phase 8c's `LinearScan::spill` is its first and only
+    /// producer, and `allocate` reports the frame size as slot count * 8.
     Spill(u32),
 }
 
@@ -182,7 +183,11 @@ impl<'a> LinearScan<'a> {
             }
             self.active.remove(0);
             // Only the Reg variant ever occupies a slot in free_regs --
-            // Spill never does (this slice never produces it anyway).
+            // Spill never does. Since Phase 8c, `Spill` is genuinely
+            // constructible, but `spill()` removes its interval from
+            // `active` itself, so a spilled interval cannot reach this
+            // loop; the pattern stays a filtering `if let` rather than an
+            // unwrap so that invariant is enforced, not assumed.
             if let Some(Location::Reg(r)) = self.location_of(j) {
                 self.free_regs.insert(r);
             }
@@ -265,8 +270,11 @@ impl<'a> LinearScan<'a> {
                  built unsoundly) -- Interval {:?} at {:?} would need to be evicted from \
                  {phys:?} to satisfy Interval {i} ({:?})'s fixed requirement, and no real \
                  Interval::fixed producer exists yet to force this path outside a hand-constructed \
-                 test, so there is no pressure to solve it correctly before Phase 8c exists to \
-                 inform the right approach (likely: treat it as a spill of the victim)",
+                 test, so there is no pressure to solve it correctly. Phase 8c built the spill \
+                 machinery that is the likely answer (treat the victim as a spill) and \
+                 deliberately did NOT wire it in here -- with Interval::fixed still having no \
+                 real producer, there is still nothing to correctness-test a reassignment \
+                 against, so this stays a loud panic rather than speculative generality",
                 victim,
                 self.intervals[victim].value,
                 self.intervals[i].value

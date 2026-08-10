@@ -74,7 +74,10 @@ pub struct Interval {
     /// a genuinely whole-lifetime hardware constraint may exist in some
     /// future `MachineInst` variant.
     pub fixed: Option<PhysReg>,
-    /// Always 0.0 in Phase 8a -- populated by Phase 8c's spill heuristic.
+    /// Always 0.0 as `build_intervals` (Phase 8a) constructs it. Really
+    /// populated by Phase 8c's `populate_spill_weights` (`uses / length`),
+    /// which `allocate` runs over the whole interval list once, up front,
+    /// before partitioning by register class.
     pub spill_weight: f32,
 }
 
