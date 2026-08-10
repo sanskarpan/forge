@@ -1376,4 +1376,25 @@ mod tests {
 
         assert_eq!(intervals[0].spill_weight, 0.0);
     }
+
+    #[test]
+    fn populate_spill_weights_a_zero_length_interval_does_not_divide_by_zero() {
+        // start == end is a legitimate shape (a value defined and read at
+        // the same instruction position) -- the .max(1) guard exists
+        // specifically so this doesn't produce a NaN/Inf spill_weight.
+        let selected = selected_fn(vec![forge_x64::MachineInst::IntAdd {
+            dst: Value(10),
+            lhs: Value(0),
+            rhs: Value(11),
+        }]);
+        let mut intervals = vec![iv(0, 5, 5, crate::interval::RegClass::Gpr)];
+
+        populate_spill_weights(&selected, &mut intervals);
+
+        assert!(
+            intervals[0].spill_weight.is_finite(),
+            "zero-length interval must not produce NaN/Inf"
+        );
+        assert_eq!(intervals[0].spill_weight, 1.0); // 1 use / max(0,1)=1 length
+    }
 }
