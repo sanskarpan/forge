@@ -1150,8 +1150,14 @@ mod tests {
 
     #[test]
     fn run_allocates_a_straight_line_chain_via_transfers() {
-        // a = x + 1; b = a + 1; c = b + 1 -- three successive two-address
-        // handoffs, all through the same register.
+        // x = param; one = 1; a = x + one; c = a + one -- two successive
+        // two-address handoffs (x -> a, a -> c), all through the same
+        // register. `one` (read twice, live across both adds) correctly
+        // gets a DIFFERENT register in the real allocator's output --
+        // this test doesn't separately assert that distinction, only that
+        // x/a/c share one register, which is the coalescing property
+        // CHECKLIST bullet 23 ("coalescing eliminates redundant mov for a
+        // two-address chain") is actually about.
         let mut b = forge_ir::builder::Builder::new();
         let entry = b.create_block();
         b.seal_block(entry);
