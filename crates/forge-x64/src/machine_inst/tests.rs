@@ -2103,3 +2103,55 @@ fn lea_synthesis_self_referential_add_never_suppresses() {
         .iter()
         .any(|i| matches!(i, MachineInst::IntMul { dst, .. } if *dst == mul)));
 }
+
+#[test]
+fn select_fuses_an_eligible_diamond_and_skips_arm_blocks() {
+    // Same direct-Function-construction style as
+    // diamond_fusion_tests::eligible_diamond_is_detected_as_int_cmov
+    // (Builder's phi insertion is private/algorithm-driven -- see that
+    // test module's own note), but runs the REAL select() end to end.
+    use forge_ir::{Block, BlockData, Function, Inst, Terminator, Ty, Value};
+
+    let mut func = Function {
+        insts: Vec::new(),
+        types: Vec::new(),
+        spans: Vec::new(),
+        blocks: vec![BlockData::default(); 4],
+        entry: Block(0),
+        params: Vec::new(),
+    };
+    let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
+    let push = |func: &mut Function, block: Block, inst: Inst, ty: Ty| -> Value {
+        let v = Value(func.insts.len() as u32);
+        func.insts.push(inst);
+        func.types.push(ty);
+        func.spans.push(forge_syntax::span::Span::new(0, 0));
+        func.blocks[block.0 as usize].insts.push(v);
+        v
+    };
+    let a = push(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
+    let c = push(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
+    let cond = push(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
+    func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+    func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
+    func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
+    let phi_dst = push(
+        &mut func,
+        m,
+        Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, c)] },
+        Ty::I64,
+    );
+    func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
+
+    let selected = select(&func);
+
+    // Exactly one IntCmov, no MachineInst::Branch, no MachineInst::Jump
+    // for the fused diamond's arms.
+    let cmovs: Vec<_> = selected.insts.iter().filter(|i| matches!(i, MachineInst::IntCmov { .. })).collect();
+    assert_eq!(cmovs.len(), 1);
+    assert!(!selected.insts.iter().any(|i| matches!(i, MachineInst::Branch { .. })));
+
+    // block_starts still has an entry for every block, including the
+    // two now-empty arms (zero-length ranges).
+    assert_eq!(selected.block_starts.len(), 4);
+}

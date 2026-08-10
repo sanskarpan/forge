@@ -323,6 +323,7 @@ struct Selector<'a> {
     next_value: u32,
     fully_fusable_scaled_indices: std::collections::HashSet<Value>,
     pool: ConstantPool,
+    diamond_fusions: HashMap<Block, DiamondFusion>,
 }
 
 impl<'a> Selector<'a> {
@@ -833,6 +834,7 @@ pub fn find_fusable_diamonds(
 
 pub fn select(func: &Function) -> SelectedFunction {
     let fully_fusable_scaled_indices = find_fully_fusable_scaled_indices(func);
+    let (diamond_fusions, diamond_skip_blocks) = find_fusable_diamonds(func);
     let mut sel = Selector {
         func,
         insts: Vec::new(),
@@ -840,15 +842,71 @@ pub fn select(func: &Function) -> SelectedFunction {
         next_value: func.insts.len() as u32,
         fully_fusable_scaled_indices,
         pool: ConstantPool::default(),
+        diamond_fusions,
     };
     let mut block_starts = Vec::new();
     for block in forge_ir::dominance::reverse_postorder(func) {
         block_starts.push((block, sel.insts.len()));
+        if diamond_skip_blocks.contains(&block) {
+            // An empty diamond arm -- contributes NOTHING to insts, same
+            // "two adjacent block_starts entries share one start" shape
+            // as a block that selects to zero MachineInsts elsewhere in
+            // this file (Phi, fully-suppressed Mul/Shl).
+            continue;
+        }
         for &v in &func.blocks[block.0 as usize].insts {
             let inst = &func.insts[v.0 as usize];
             sel.select_inst(v, inst);
         }
-        if let Some(term) = &func.blocks[block.0 as usize].term {
+        if let Some(fusion) = sel.diamond_fusions.get(&block).copied() {
+            // This block's real Branch terminator is replaced by the
+            // fused instruction -- no Jump/Branch emitted for it at all.
+            match fusion {
+                DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Min, lhs, rhs } => {
+                    sel.insts.push(MachineInst::FloatMin { dst, lhs, rhs });
+                }
+                DiamondFusion::FloatMinMax { dst, op: MinMaxOp::Max, lhs, rhs } => {
+                    sel.insts.push(MachineInst::FloatMax { dst, lhs, rhs });
+                }
+                DiamondFusion::IntCmov { dst, cond, then_val, else_val } => {
+                    sel.insts.push(MachineInst::IntCmov { dst, cond, then_val, else_val });
+                }
+            }
+            // The fused instruction falls through directly into the merge
+            // block `m` -- re-derived here from `t`'s own terminator (`t`
+            // is always Jump(m) by find_fusable_diamonds's own eligibility
+            // rules), NOT assumed. This debug_assert checks m's IDENTITY,
+            // not merely "something comes next" -- a check against only
+            // "is there a next block at all" would be trivially true for
+            // any fused diamond (m always exists and is never itself a
+            // skip block, since it has real computation: the payload phi
+            // is what made this a fusion in the first place), so it must
+            // name m explicitly to mean anything.
+            let Terminator::Branch { then_: t, .. } = func.blocks[block.0 as usize].term.as_ref().unwrap() else {
+                unreachable!("a fusion key's block must have a Branch terminator")
+            };
+            let Some(Terminator::Jump(m)) = &func.blocks[t.0 as usize].term else {
+                unreachable!("find_fusable_diamonds guarantees t's terminator is Jump(m)")
+            };
+            debug_assert!(
+                {
+                    let rpo = forge_ir::dominance::reverse_postorder(func);
+                    let this_pos = rpo.iter().position(|b| *b == block).unwrap();
+                    let next_real = rpo[this_pos + 1..]
+                        .iter()
+                        .find(|b| !diamond_skip_blocks.contains(b));
+                    // Confirmed true by execution across every real corpus
+                    // program and every hand-built fixture during plan
+                    // review, but this front-end's structured-CFG guarantee
+                    // is not something find_fusable_diamonds itself
+                    // enforces, so a violation must fail loudly here rather
+                    // than silently fall through into the wrong block with
+                    // no Jump to redirect it.
+                    next_real == Some(m)
+                },
+                "diamond fusion's merge block was not the next RPO-visited block"
+            );
+        } else if let Some(term) = &func.blocks[block.0 as usize].term {
             sel.select_term(term);
         }
     }
