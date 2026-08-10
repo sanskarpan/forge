@@ -490,7 +490,11 @@ pub fn allocate(
         // compile error (E0382) once `scan.assignment` has already been
         // partially moved out. Destructuring both fields in one statement
         // avoids ever having a whole-self method call after a partial move.
-        let LinearScan { assignment: class_assignment, slot_end: next_slot_end, .. } = scan;
+        let LinearScan {
+            assignment: class_assignment,
+            slot_end: next_slot_end,
+            ..
+        } = scan;
         assignment.extend(class_assignment);
         slot_end = next_slot_end;
     }
@@ -652,7 +656,12 @@ mod tests {
         // freed when processing the interval starting at 2.
         let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let b = iv(1, 2, 4, crate::interval::RegClass::Gpr);
-        let mut scan = LinearScan::new(vec![a.clone(), b], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![a.clone(), b],
+            &HashMap::new(),
+            ALLOCATABLE_GPR,
+            Vec::new(),
+        );
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         scan.free_regs.remove(&PhysReg::Rax); // a HOLDS Rax -- it is not free
@@ -671,7 +680,12 @@ mod tests {
     fn expire_old_intervals_frees_genuinely_disjoint_intervals() {
         let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let b = iv(1, 3, 4, crate::interval::RegClass::Gpr); // starts at 3, strictly after a.end=2
-        let mut scan = LinearScan::new(vec![a.clone(), b], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![a.clone(), b],
+            &HashMap::new(),
+            ALLOCATABLE_GPR,
+            Vec::new(),
+        );
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         scan.free_regs.remove(&PhysReg::Rax); // a HOLDS Rax -- it is not free
@@ -689,7 +703,12 @@ mod tests {
         let lhs = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let mut dst = iv(1, 2, 4, crate::interval::RegClass::Gpr);
         dst.hint = Some(Value(0));
-        let mut scan = LinearScan::new(vec![lhs.clone(), dst], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![lhs.clone(), dst],
+            &HashMap::new(),
+            ALLOCATABLE_GPR,
+            Vec::new(),
+        );
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         // lhs's register is NOT in free_regs (still "active") -- Case 2 must
@@ -746,7 +765,12 @@ mod tests {
         let target = iv(0, 0, 10, crate::interval::RegClass::Gpr);
         let mut dst = iv(1, 2, 4, crate::interval::RegClass::Gpr);
         dst.hint = Some(Value(0));
-        let mut scan = LinearScan::new(vec![target.clone(), dst], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![target.clone(), dst],
+            &HashMap::new(),
+            ALLOCATABLE_GPR,
+            Vec::new(),
+        );
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
         scan.free_regs.remove(&PhysReg::Rax); // target HOLDS Rax -- it is not free
@@ -831,7 +855,12 @@ mod tests {
         let target = iv(1, 1, 3, crate::interval::RegClass::Gpr);
         let mut dst = iv(2, 3, 5, crate::interval::RegClass::Gpr);
         dst.hint = Some(Value(1));
-        let mut scan = LinearScan::new(vec![other, target, dst], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![other, target, dst],
+            &HashMap::new(),
+            ALLOCATABLE_GPR,
+            Vec::new(),
+        );
         scan.assign(0, Location::Reg(PhysReg::Rbx));
         scan.assign(1, Location::Reg(PhysReg::Rcx));
         scan.free_regs.remove(&PhysReg::Rbx);
@@ -861,7 +890,8 @@ mod tests {
             v.fixed = Some(PhysReg::Rax);
             v
         };
-        let mut scan = LinearScan::new(vec![fixed_iv], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
+        let mut scan =
+            LinearScan::new(vec![fixed_iv], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
 
         scan.evict_and_assign(0, PhysReg::Rax);
 
@@ -882,7 +912,12 @@ mod tests {
             v.fixed = Some(PhysReg::Rax);
             v
         };
-        let mut scan = LinearScan::new(vec![occupant, fixed_iv], &HashMap::new(), ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![occupant, fixed_iv],
+            &HashMap::new(),
+            ALLOCATABLE_GPR,
+            Vec::new(),
+        );
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
 
@@ -944,7 +979,11 @@ mod tests {
             matches!(scan.assignment[&Value(1)], Location::Spill(_)),
             "i must be spilled instead"
         );
-        assert_eq!(scan.active, vec![0], "victim remains the only active interval");
+        assert_eq!(
+            scan.active,
+            vec![0],
+            "victim remains the only active interval"
+        );
     }
 
     #[test]
@@ -985,7 +1024,12 @@ mod tests {
     #[should_panic(expected = "no active interval to spill")]
     fn spill_at_interval_panics_when_active_is_empty_for_the_class() {
         let a = iv(0, 0, 5, crate::interval::RegClass::Gpr);
-        let mut scan = LinearScan::new(vec![a], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![a],
+            &HashMap::new(),
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            Vec::new(),
+        );
         // active is empty -- spill_at_interval has nothing to pick a
         // victim from, which should never happen in practice (an empty
         // active list means pick_register should have found a free
@@ -997,7 +1041,12 @@ mod tests {
     fn spill_reuses_a_slot_for_genuinely_disjoint_intervals() {
         let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let b = iv(1, 3, 5, crate::interval::RegClass::Gpr); // disjoint: starts after a.end
-        let mut scan = LinearScan::new(vec![a, b], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![a, b],
+            &HashMap::new(),
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            Vec::new(),
+        );
 
         scan.spill(0);
         scan.spill(1);
@@ -1017,7 +1066,12 @@ mod tests {
         // register boundary exactly), so they must NOT share a slot.
         let a = iv(0, 0, 2, crate::interval::RegClass::Gpr);
         let b = iv(1, 2, 4, crate::interval::RegClass::Gpr);
-        let mut scan = LinearScan::new(vec![a, b], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![a, b],
+            &HashMap::new(),
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            Vec::new(),
+        );
 
         scan.spill(0);
         scan.spill(1);
@@ -1039,7 +1093,12 @@ mod tests {
         // X's slot, regardless of scan order.
         let x = iv(0, 0, 6, crate::interval::RegClass::Gpr);
         let g = iv(1, 5, 300, crate::interval::RegClass::Gpr);
-        let mut scan = LinearScan::new(vec![x, g], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![x, g],
+            &HashMap::new(),
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            Vec::new(),
+        );
 
         scan.spill(0); // X -> some slot, slot_end for it becomes 6
         scan.spill(1); // G, start=5 -- 6 is NOT < 5, so no reuse
@@ -1066,7 +1125,12 @@ mod tests {
     #[test]
     fn spill_removes_the_interval_from_active_if_present() {
         let a = iv(0, 0, 10, crate::interval::RegClass::Gpr);
-        let mut scan = LinearScan::new(vec![a], &HashMap::new(), SPILL_AWARE_ALLOCATABLE_GPR, Vec::new());
+        let mut scan = LinearScan::new(
+            vec![a],
+            &HashMap::new(),
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            Vec::new(),
+        );
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
 
@@ -1398,6 +1462,118 @@ mod tests {
         populate_spill_weights(&selected, &mut intervals);
 
         assert_eq!(intervals[0].spill_weight, 0.0);
+    }
+
+    #[test]
+    fn allocate_threads_slot_end_across_the_class_boundary_and_avoids_cross_class_collisions() {
+        // B5 regression: an earlier draft threaded a `free_slots` stack
+        // (not just a counter) between the GPR and XMM passes, which let
+        // a slot freed relative to the GPR pass's cursor get reused by
+        // the XMM pass restarting its own cursor at 0 -- two genuinely
+        // overlapping values, one per class, landed on the same slot.
+        //
+        // 13 GPR intervals all sharing the exact range [0,100] -- the
+        // SPILL_AWARE_ALLOCATABLE_GPR pool has only 12 registers, so
+        // exactly the 13th (last-processed, tie-broken by Value order)
+        // must spill.
+        let mut intervals: Vec<Interval> = (0..13)
+            .map(|n| iv(n, 0, 100, crate::interval::RegClass::Gpr))
+            .collect();
+        // 15 XMM intervals, same range [0,100] -- genuinely overlaps the
+        // GPR spill above. SPILL_AWARE_ALLOCATABLE_XMM has only 14
+        // registers, so exactly one of these must also spill.
+        intervals.extend((100..115).map(|n| iv(n, 0, 100, crate::interval::RegClass::Xmm)));
+
+        let selected = selected_fn(vec![]);
+        let (assignment, bytes) = allocate(intervals.clone(), &HashMap::new(), &selected);
+
+        let gpr_spill_slot = intervals
+            .iter()
+            .filter(|iv| iv.reg_class == crate::interval::RegClass::Gpr)
+            .find_map(|iv| match assignment[&iv.value] {
+                Location::Spill(s) => Some(s),
+                Location::Reg(_) => None,
+            })
+            .expect("13 GPR intervals into a 12-register pool must produce exactly one spill");
+        let xmm_spill_slot = intervals
+            .iter()
+            .filter(|iv| iv.reg_class == crate::interval::RegClass::Xmm)
+            .find_map(|iv| match assignment[&iv.value] {
+                Location::Spill(s) => Some(s),
+                Location::Reg(_) => None,
+            })
+            .expect("15 XMM intervals into a 14-register pool must produce exactly one spill");
+
+        assert_ne!(
+            gpr_spill_slot, xmm_spill_slot,
+            "B5: a GPR spill and an XMM spill with genuinely overlapping ranges must not share a slot"
+        );
+        assert!(bytes >= 2 * 8 && bytes % 8 == 0);
+    }
+
+    #[test]
+    fn allocate_spills_under_pressure_with_a_valid_frame_size_and_no_overlapping_slot_reuse() {
+        // 20 GPR intervals, all sharing the exact range [0,50] --
+        // SPILL_AWARE_ALLOCATABLE_GPR has 12 registers, so exactly 8 must
+        // spill. Because every spilled interval shares the SAME range,
+        // NONE can reuse another's slot (slot_end[s] < start never holds
+        // when start=0 and slot_end is always >= 0) -- so this exercises
+        // the "no possible reuse" edge and gives an exact, not just a
+        // lower-bound, expected byte count.
+        let intervals: Vec<Interval> = (0..20)
+            .map(|n| iv(n, 0, 50, crate::interval::RegClass::Gpr))
+            .collect();
+        let selected = selected_fn(vec![]);
+
+        let (assignment, bytes) = allocate(intervals.clone(), &HashMap::new(), &selected);
+
+        let spilled: Vec<u32> = intervals
+            .iter()
+            .filter_map(|iv| match assignment[&iv.value] {
+                Location::Spill(s) => Some(s),
+                Location::Reg(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            spilled.len(),
+            8,
+            "20 intervals into a 12-register pool must spill exactly 8"
+        );
+        assert!(
+            bytes >= spilled.len() as u32 * 8,
+            "frame must be at least large enough for every spill"
+        );
+        assert_eq!(
+            bytes % 8,
+            0,
+            "frame size must be a whole number of 8-byte slots"
+        );
+
+        // Extended no-overlap property, covering Location::Spill: unlike
+        // registers (which have a zero-cost same-instruction handoff
+        // exemption via pick_register's Case 2), a spill slot has no such
+        // mechanism -- spill()'s `slot_end[s] < start` check is a STRICT
+        // inequality, so two values sharing a slot must be genuinely,
+        // strictly disjoint; touching at one point is never permitted.
+        for i in 0..intervals.len() {
+            for j in (i + 1)..intervals.len() {
+                let (a, b) = (&intervals[i], &intervals[j]);
+                let (Location::Spill(sa), Location::Spill(sb)) =
+                    (assignment[&a.value], assignment[&b.value])
+                else {
+                    continue;
+                };
+                if sa != sb {
+                    continue;
+                }
+                assert!(
+                    a.end < b.start || b.end < a.start,
+                    "{:?} and {:?} share spill slot {sa} but are not strictly disjoint",
+                    a.value,
+                    b.value
+                );
+            }
+        }
     }
 
     #[test]
