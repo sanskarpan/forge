@@ -59,6 +59,46 @@ pub const ALLOCATABLE_XMM: &[PhysReg] = &[
     PhysReg::Xmm15,
 ];
 
+/// Registers reserved exclusively for spill reload/store traffic -- NEVER
+/// handed out by pick_register to an ordinary interval. Removed from the
+/// pool LinearScan scans over (SPILL_AWARE_ALLOCATABLE_* below), not from
+/// ALLOCATABLE_GPR/ALLOCATABLE_XMM themselves, which stay exactly as 8b
+/// shipped them (still the authoritative "which PhysRegs exist and are
+/// encodable" answer). R10/R11 (not R14/R15) for GPR: R14/R15 are both
+/// members of prologue::SYSV_CALLEE_SAVED, so reserving them would force
+/// every spilling function's prologue/epilogue to push/pop a pair of
+/// registers used only transiently; R10/R11 are caller-saved, no such
+/// cost. For XMM, Xmm14/Xmm15: ALL XMM registers are caller-saved under
+/// System V, so there is no equivalent cost differential to correct for.
+pub const SCRATCH_GPR: [PhysReg; 2] = [PhysReg::R10, PhysReg::R11];
+pub const SCRATCH_XMM: [PhysReg; 2] = [PhysReg::Xmm14, PhysReg::Xmm15];
+
+// R10/R11 sit at indices 8-9 of ALLOCATABLE_GPR's declared order (Rax,
+// Rcx, Rdx, Rbx, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15), NOT the
+// last two entries -- `.split_at(12).0` would keep R10/R11 IN the pool
+// while also claiming they're scratch-reserved, a direct contradiction.
+// An explicit literal is the only construction that's correct regardless
+// of which two registers scratch picks.
+pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
+    PhysReg::Rax,
+    PhysReg::Rcx,
+    PhysReg::Rdx,
+    PhysReg::Rbx,
+    PhysReg::Rsi,
+    PhysReg::Rdi,
+    PhysReg::R8,
+    PhysReg::R9,
+    PhysReg::R12,
+    PhysReg::R13,
+    PhysReg::R14,
+    PhysReg::R15,
+]; // 14 - 2 reserved (R10, R11 excluded)
+
+// Xmm14/Xmm15 ARE the last two entries of ALLOCATABLE_XMM, so split_at is
+// correct here (unlike the GPR case above, where the excluded pair isn't
+// at the end).
+pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = ALLOCATABLE_XMM.split_at(14).0; // 16 - 2 reserved
+
 /// Excludes a `Value`'s specific registers at SPECIFIC instruction
 /// positions (8a's `excluded_registers`, keyed per position for IntDiv/
 /// IntRem's rhs), aggregated to whole-`Interval` scope: this allocator
@@ -345,6 +385,53 @@ mod tests {
             assert!(
                 r.encoding() < 16,
                 "{r:?} has encoding >= 16, unencodable without EVEX"
+            );
+        }
+    }
+
+    #[test]
+    fn scratch_and_spill_aware_pools_are_disjoint_and_union_complete_gpr() {
+        let scratch: HashSet<PhysReg> = SCRATCH_GPR.iter().copied().collect();
+        let spill_aware: HashSet<PhysReg> = SPILL_AWARE_ALLOCATABLE_GPR.iter().copied().collect();
+        let original: HashSet<PhysReg> = ALLOCATABLE_GPR.iter().copied().collect();
+
+        assert_eq!(scratch.len(), 2);
+        assert_eq!(spill_aware.len(), 12);
+        assert!(
+            scratch.is_disjoint(&spill_aware),
+            "a register can't be both scratch-reserved and ordinarily allocatable"
+        );
+        let union: HashSet<PhysReg> = scratch.union(&spill_aware).copied().collect();
+        assert_eq!(
+            union, original,
+            "scratch + spill-aware must reconstruct ALLOCATABLE_GPR exactly"
+        );
+    }
+
+    #[test]
+    fn scratch_and_spill_aware_pools_are_disjoint_and_union_complete_xmm() {
+        let scratch: HashSet<PhysReg> = SCRATCH_XMM.iter().copied().collect();
+        let spill_aware: HashSet<PhysReg> = SPILL_AWARE_ALLOCATABLE_XMM.iter().copied().collect();
+        let original: HashSet<PhysReg> = ALLOCATABLE_XMM.iter().copied().collect();
+
+        assert_eq!(scratch.len(), 2);
+        assert_eq!(spill_aware.len(), 14);
+        assert!(scratch.is_disjoint(&spill_aware));
+        let union: HashSet<PhysReg> = scratch.union(&spill_aware).copied().collect();
+        assert_eq!(union, original);
+    }
+
+    #[test]
+    fn scratch_gpr_is_caller_saved_not_callee_saved() {
+        // R10/R11, not R14/R15 -- R14/R15 are members of
+        // prologue::SYSV_CALLEE_SAVED, which would force every spilling
+        // function's prologue/epilogue to push/pop a pair of registers
+        // used only transiently. R10/R11 have no such cost.
+        assert_eq!(SCRATCH_GPR, [PhysReg::R10, PhysReg::R11]);
+        for r in SCRATCH_GPR {
+            assert!(
+                !forge_x64::SYSV_CALLEE_SAVED.contains(&r),
+                "{r:?} must be caller-saved to avoid an unnecessary push/pop pair"
             );
         }
     }
