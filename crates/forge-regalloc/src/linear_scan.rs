@@ -342,6 +342,14 @@ impl<'a> LinearScan<'a> {
                     let iv = &self.intervals[k];
                     iv.end as f32 / iv.spill_weight.max(0.01)
                 };
+                // `.unwrap()` is safe: `iv.end as f32` is always finite
+                // (u32::MAX is far under f32::MAX), and `.max(0.01)`
+                // sanitizes a NaN `spill_weight` away (`f32::max` returns
+                // the non-NaN operand when exactly one side is NaN), so
+                // the division is always finite and `partial_cmp` can
+                // never return `None`. Reordering `.max()`'s operands
+                // (`0.01f32.max(iv.spill_weight)`) would silently lose
+                // this guarantee and reintroduce a panic risk.
                 score(a).partial_cmp(&score(b)).unwrap()
             })
             .expect(
@@ -351,6 +359,11 @@ impl<'a> LinearScan<'a> {
                  help when there's nothing active to spill, and i itself has nowhere to go either)",
             );
 
+        // Strict `>`: if victim and `i` end at exactly the same position,
+        // fall to the `else` branch and spill `i` instead. There's no
+        // benefit to disturbing the victim (evicting it, reassigning its
+        // register, re-sorting `active`) when it dies at the same time
+        // `i` would anyway -- a tie is not a reason to prefer the victim.
         if self.intervals[victim].end > self.intervals[i].end {
             let reg = self
                 .location_of(victim)
@@ -363,6 +376,11 @@ impl<'a> LinearScan<'a> {
                 self.spill(i);
             } else {
                 self.spill(victim);
+                // Redundant with spill()'s own internal `active.retain`
+                // (it already removes `victim` from `active`) -- kept as
+                // a harmless, deliberate no-op double-retain, not a bug.
+                // Do not "simplify" this away under the assumption it was
+                // missed; it was left in on purpose.
                 self.active.retain(|&j| j != victim);
                 self.assign(i, Location::Reg(reg));
                 self.active.push(i);
