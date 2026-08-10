@@ -1539,14 +1539,14 @@ mod tests {
             8,
             "20 intervals into a 12-register pool must spill exactly 8"
         );
-        assert!(
-            bytes >= spilled.len() as u32 * 8,
-            "frame must be at least large enough for every spill"
-        );
+        // Exact, not just a lower bound: every spilled interval shares the
+        // SAME [0,50] range, so slot_end[s] < start (0 < 0) never holds --
+        // no spilled interval can EVER reuse another's slot here, so the 8
+        // spills deterministically occupy 8 distinct slots, i.e. exactly
+        // 8 * 8 = 64 bytes.
         assert_eq!(
-            bytes % 8,
-            0,
-            "frame size must be a whole number of 8-byte slots"
+            bytes, 64,
+            "8 spills that can never reuse a slot must need exactly 64 bytes"
         );
 
         // Extended no-overlap property, covering Location::Spill: unlike
@@ -1574,6 +1574,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn spill_at_interval_prefers_the_lower_weight_victim_when_ends_are_equal() {
+        // The spill_weight component of the scoring formula (end /
+        // spill_weight.max(0.01)) has no test anywhere else that actually
+        // differentiates by weight rather than by end -- every other test
+        // either uses iv()'s hardcoded 0.0 weight or an empty
+        // SelectedFunction, both of which floor every weight to the same
+        // 0.01 and collapse the comparison to "just compare end."
+        let mut heavy_use = iv(0, 0, 100, crate::interval::RegClass::Gpr);
+        heavy_use.spill_weight = 5.0; // used often -- expensive to spill
+        let mut light_use = iv(1, 0, 100, crate::interval::RegClass::Gpr);
+        light_use.spill_weight = 0.1; // rarely used -- cheap to spill
+        let current = iv(2, 50, 60, crate::interval::RegClass::Gpr);
+
+        let mut scan = LinearScan::new(
+            vec![heavy_use, light_use, current],
+            &HashMap::new(),
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            Vec::new(),
+        );
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.assign(1, Location::Reg(PhysReg::Rbx));
+        scan.active = vec![0, 1];
+
+        scan.spill_at_interval(2);
+
+        assert!(
+            matches!(scan.assignment[&Value(1)], Location::Spill(_)),
+            "the LOWER-weight interval (light_use) must be chosen as victim"
+        );
+        assert_eq!(
+            scan.assignment[&Value(0)],
+            Location::Reg(PhysReg::Rax),
+            "the higher-weight interval must be left untouched"
+        );
     }
 
     #[test]
