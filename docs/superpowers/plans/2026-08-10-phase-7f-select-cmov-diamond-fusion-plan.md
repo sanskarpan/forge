@@ -334,6 +334,36 @@ mod diamond_fusion_tests {
         assert!(fusions.is_empty(), "F64 dst must never become an IntCmov");
         assert!(skip.is_empty());
     }
+
+    #[test]
+    fn arm_with_an_extra_predecessor_is_rejected() {
+        // Found by mutation testing during plan review: deleting the
+        // `pred_count[t] == 1 && pred_count[e] == 1` guard left the whole
+        // test suite green -- nothing else exercises "an arm block has a
+        // second, unrelated predecessor." Without the guard, `t` still
+        // looks empty (rule 2 only checks t/e's own insts), so `other`'s
+        // real Jump(t) target silently vanishes once t is skipped.
+        let mut func = empty_func(5);
+        let (entry, t, e, m, other) = (Block(0), Block(1), Block(2), Block(3), Block(4));
+        let a = push_inst(&mut func, entry, Inst::Param { index: 0, ty: Ty::I64 }, Ty::I64);
+        let c = push_inst(&mut func, entry, Inst::Param { index: 1, ty: Ty::I64 }, Ty::I64);
+        let cond = push_inst(&mut func, entry, Inst::Param { index: 2, ty: Ty::Bool }, Ty::Bool);
+        func.blocks[entry.0 as usize].term = Some(Terminator::Branch { cond, then_: t, else_: e });
+        func.blocks[t.0 as usize].term = Some(Terminator::Jump(m));
+        func.blocks[e.0 as usize].term = Some(Terminator::Jump(m));
+        func.blocks[other.0 as usize].term = Some(Terminator::Jump(t));
+        let phi_dst = push_inst(
+            &mut func,
+            m,
+            Inst::Phi { incoming: smallvec::smallvec![(t, a), (e, c)] },
+            Ty::I64,
+        );
+        func.blocks[m.0 as usize].term = Some(Terminator::Return(phi_dst));
+
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert!(fusions.is_empty(), "arm `t` has a 2nd predecessor -- must not fuse");
+        assert!(skip.is_empty());
+    }
 }
 ```
 
@@ -540,7 +570,7 @@ pub fn find_fusable_diamonds(
 - [ ] **Step 4: Run to verify all tests pass**
 
 Run: `cargo test -p forge-x64 diamond_fusion_tests`
-Expected: PASS (12 tests). Two `FloatMinMax` pattern matches (rows 2 and 4) must destructure with a trailing `, ..` — `DiamondFusion::FloatMinMax` has a 4th field (`dst`) those two tests don't otherwise reference, and Rust's non-exhaustive-pattern check (`E0027`) will reject the match without it.
+Expected: PASS (13 tests). Two `FloatMinMax` pattern matches (rows 2 and 4) must destructure with a trailing `, ..` — `DiamondFusion::FloatMinMax` has a 4th field (`dst`) those two tests don't otherwise reference, and Rust's non-exhaustive-pattern check (`E0027`) will reject the match without it.
 
 - [ ] **Step 5: Commit**
 
@@ -610,7 +640,7 @@ Find `def_of`'s match and add:
 
 - [ ] **Step 4: Add the `compute_coalescing_hints` arm — the silent gap that would NOT be caught by the compiler**
 
-In `crates/forge-x64/src/machine_inst/mod.rs`'s `compute_coalescing_hints`, add `IntCmov` to the FIRST match arm group (the `hints.insert(*dst, *lhs)` group `IntAdd`/`IntSub`/etc. already belong to) — using `then_val` in the position that group's shared body reads as `lhs`:
+In `crates/forge-x64/src/machine_inst/mod.rs`'s `compute_coalescing_hints`, conceptually `IntCmov` belongs with the FIRST match arm group (the `hints.insert(*dst, *lhs)` group `IntAdd`/`IntSub`/etc. already belong to — same "hint dst toward the operand it destructively reuses" idea, `then_val` playing `lhs`'s role). It cannot actually JOIN that `|`-chain, though: the chain requires every variant to bind the exact same field name (`lhs`), and `IntCmov`'s corresponding field is named `then_val`. Add it as its own separate arm instead, immediately after that chain closes:
 
 ```rust
             MachineInst::IntAdd { dst, lhs, .. }
@@ -632,7 +662,7 @@ In `crates/forge-x64/src/machine_inst/mod.rs`'s `compute_coalescing_hints`, add 
             }
 ```
 
-`IntCmov`'s field is named `then_val`, not `lhs`, so it CANNOT join that `|`-chain directly (the chain requires every variant to bind the exact same field name `lhs`). Add it as its own arm instead, right after that chain closes:
+The new arm:
 
 ```rust
             MachineInst::IntCmov { dst, then_val, .. } => {
