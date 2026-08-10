@@ -238,7 +238,7 @@ mod diamond_fusion_tests {
         let (fusions, _) = find_fusable_diamonds(&func);
         assert_eq!(fusions.len(), 1);
         match fusions.values().next().unwrap() {
-            DiamondFusion::FloatMinMax { op: MinMaxOp::Max, lhs, rhs } => {
+            DiamondFusion::FloatMinMax { op: MinMaxOp::Max, lhs, rhs, .. } => {
                 // The else-arm value (val_e) must be rhs; the then-arm
                 // value (val_t) must be lhs -- this is the exact defect
                 // execution-based design review found and fixed.
@@ -264,7 +264,7 @@ mod diamond_fusion_tests {
         let (func, _, val_t, val_e, _) = build_diamond(Ty::F64, Some(CmpOp::Gt), true, false);
         let (fusions, _) = find_fusable_diamonds(&func);
         match fusions.values().next().unwrap() {
-            DiamondFusion::FloatMinMax { op: MinMaxOp::Min, lhs, rhs } => {
+            DiamondFusion::FloatMinMax { op: MinMaxOp::Min, lhs, rhs, .. } => {
                 assert_eq!(*lhs, val_t);
                 assert_eq!(*rhs, val_e);
             }
@@ -310,6 +310,28 @@ mod diamond_fusion_tests {
 
         let (fusions, skip) = find_fusable_diamonds(&func);
         assert!(fusions.is_empty(), "float third-value diamond must produce NO fusion, never IntCmov");
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn f64_diamond_with_a_non_cmp_cond_is_gated_off_the_int_cmov_path() {
+        // Closes a real coverage gap execution-based plan review found by
+        // mutation testing: float_third_value_diamond_produces_no_fusion
+        // above never actually reaches the `ty_of(dst) != Ty::F64` hard
+        // gate, because its `cond` is an Inst::Cmp over F64 operands,
+        // which the EARLIER min/max-table branch already rejects (`continue`)
+        // before the general IntCmov path is ever considered. Deleting the
+        // hard gate entirely left every existing test passing -- this
+        // fixture uses a non-Cmp cond (an ordinary bool value, matching
+        // `cmp: None` in build_diamond) with F64-typed arm values, which
+        // is the ONLY shape that actually exercises the gate: nothing
+        // about `cond` routes it through the min/max branch at all, so
+        // without the hard gate this would silently become an IntCmov
+        // over Xmm-classed values -- the exact miscompile this design's
+        // whole "general cmov path" section exists to prevent.
+        let (func, ..) = build_diamond(Ty::F64, None, false, false);
+        let (fusions, skip) = find_fusable_diamonds(&func);
+        assert!(fusions.is_empty(), "F64 dst must never become an IntCmov");
         assert!(skip.is_empty());
     }
 }
@@ -418,6 +440,20 @@ pub fn find_fusable_diamonds(
         if pred_count.get(&m).copied().unwrap_or(0) != 2 {
             continue;
         }
+        // Both arms must ALSO have exactly one predecessor each (the
+        // Branch block itself) -- found by mutation testing during plan
+        // review: without this check, a third, unrelated block that also
+        // jumps INTO an otherwise-eligible arm block still gets skipped by
+        // select() (both arms are still "empty," matching rule 2), so that
+        // third block's real Jump target vanishes with nothing to redirect
+        // it -- unreachable from this front-end's structured if/else
+        // lowering today, but not something find_fusable_diamonds's other
+        // checks happen to rule out on their own, so it's checked directly.
+        if pred_count.get(t).copied().unwrap_or(0) != 1
+            || pred_count.get(e).copied().unwrap_or(0) != 1
+        {
+            continue;
+        }
 
         let m_data = &func.blocks[m.0 as usize];
         let mut payload: Option<(Value, Value, Value)> = None; // (phi_dst, val_t, val_e)
@@ -504,7 +540,7 @@ pub fn find_fusable_diamonds(
 - [ ] **Step 4: Run to verify all tests pass**
 
 Run: `cargo test -p forge-x64 diamond_fusion_tests`
-Expected: PASS (10 tests). Fix any `Builder` API mismatches found in Step 2/3 by reading the real `crates/forge-ir/src/builder.rs` — do not guess a second time, read the file.
+Expected: PASS (12 tests). Two `FloatMinMax` pattern matches (rows 2 and 4) must destructure with a trailing `, ..` — `DiamondFusion::FloatMinMax` has a 4th field (`dst`) those two tests don't otherwise reference, and Rust's non-exhaustive-pattern check (`E0027`) will reject the match without it.
 
 - [ ] **Step 5: Commit**
 
@@ -666,7 +702,7 @@ Add to `crates/forge-x64/src/machine_inst/mod.rs`'s test module:
             params: Vec::new(),
         };
         let (entry, t, e, m) = (Block(0), Block(1), Block(2), Block(3));
-        let mut push = |func: &mut Function, block: Block, inst: Inst, ty: Ty| -> Value {
+        let push = |func: &mut Function, block: Block, inst: Inst, ty: Ty| -> Value {
             let v = Value(func.insts.len() as u32);
             func.insts.push(inst);
             func.types.push(ty);
@@ -770,6 +806,22 @@ pub fn select(func: &Function) -> SelectedFunction {
                     sel.insts.push(MachineInst::IntCmov { dst, cond, then_val, else_val });
                 }
             }
+            // The fused instruction falls through directly into the merge
+            // block `m` -- re-derived here from `t`'s own terminator (`t`
+            // is always Jump(m) by find_fusable_diamonds's own eligibility
+            // rules), NOT assumed. This debug_assert checks m's IDENTITY,
+            // not merely "something comes next" -- a check against only
+            // "is there a next block at all" would be trivially true for
+            // any fused diamond (m always exists and is never itself a
+            // skip block, since it has real computation: the payload phi
+            // is what made this a fusion in the first place), so it must
+            // name m explicitly to mean anything.
+            let Terminator::Branch { then_: t, .. } = func.blocks[block.0 as usize].term.as_ref().unwrap() else {
+                unreachable!("a fusion key's block must have a Branch terminator")
+            };
+            let Some(Terminator::Jump(m)) = &func.blocks[t.0 as usize].term else {
+                unreachable!("find_fusable_diamonds guarantees t's terminator is Jump(m)")
+            };
             debug_assert!(
                 {
                     let rpo = forge_ir::dominance::reverse_postorder(func);
@@ -777,16 +829,14 @@ pub fn select(func: &Function) -> SelectedFunction {
                     let next_real = rpo[this_pos + 1..]
                         .iter()
                         .find(|b| !diamond_skip_blocks.contains(b));
-                    // The merge block must be exactly the next non-skipped
-                    // block RPO visits -- confirmed true by execution
-                    // across every real corpus program and every hand-built
-                    // fixture during design review, but this front-end's
-                    // structured-CFG guarantee is not something
-                    // find_fusable_diamonds itself enforces, so a violation
-                    // must fail loudly here rather than silently fall
-                    // through into the wrong block with no Jump to redirect
-                    // it.
-                    next_real.is_some()
+                    // Confirmed true by execution across every real corpus
+                    // program and every hand-built fixture during plan
+                    // review, but this front-end's structured-CFG guarantee
+                    // is not something find_fusable_diamonds itself
+                    // enforces, so a violation must fail loudly here rather
+                    // than silently fall through into the wrong block with
+                    // no Jump to redirect it.
+                    next_real == Some(m)
                 },
                 "diamond fusion's merge block was not the next RPO-visited block"
             );
@@ -827,73 +877,81 @@ git commit -m "feat(forge-x64): wire diamond fusion into select()'s RPO walk"
 ### Task 4: Corpus-wide regression, CHECKLIST annotation, final verification
 
 **Files:**
-- Modify: `crates/forge-x64/src/machine_inst/mod.rs` (or a new test file, implementer's judgment)
+- Create: `crates/forge-x64/tests/diamond_fusion_corpus.rs`
+- Modify: `crates/forge-x64/src/lib.rs`
+- Modify: `crates/forge-x64/Cargo.toml`
 - Modify: `CHECKLIST.md`
 
-- [ ] **Step 1: Write the corpus-wide `verify_allocation` regression test**
+- [ ] **Step 1: Write the corpus-wide `verify_allocation` regression test — as an EXTERNAL integration test, not a `src/` unit test**
 
-Add to `crates/forge-x64/src/machine_inst/mod.rs`'s test module (this needs `forge-regalloc` as a dev-dependency of `forge-x64` — check `crates/forge-x64/Cargo.toml`'s `[dev-dependencies]` first; add `forge-regalloc = { path = "../forge-regalloc" }` there if not already present, and confirm this doesn't create a circular dependency — `forge-regalloc` depends on `forge-x64`, so a `forge-x64` DEV-dependency on `forge-regalloc` for tests only is fine, Cargo allows dev-dependency cycles that don't affect the real build graph, but VERIFY this compiles before assuming it, since dev-dependency cycles are occasionally still rejected depending on the exact shape):
+**This MUST be an integration test in `crates/forge-x64/tests/`, not a unit test inside `src/machine_inst/mod.rs` — confirmed by execution during plan review, not a hypothetical concern.** A `forge-x64` DEV-dependency on `forge-regalloc` (needed since `forge-regalloc` depends on `forge-x64` in the real build graph) makes Cargo build TWO separate instances of `forge-x64`: the `--cfg test` lib-test instance (where a `src/`-internal `#[test]` would run) and the plain lib instance that `forge-regalloc` itself links against. These are DISTINCT crate instances to the type system — `SelectedFunction` constructed by the in-crate `select()` and the `SelectedFunction` `forge_regalloc::build_intervals` expects would be two different types, producing a real `E0308` mismatch, not a hypothetical one. Integration tests in `tests/*.rs` don't have this problem — they link against the real, single lib instance, the same one `forge-regalloc` sees.
+
+Add `forge-regalloc = { path = "../forge-regalloc" }` to `crates/forge-x64/Cargo.toml`'s `[dev-dependencies]` (this dev-dependency cycle is fine for an integration test specifically, per the reasoning above).
+
+Add `find_fusable_diamonds`, `DiamondFusion`, `MinMaxOp` to `crates/forge-x64/src/lib.rs`'s existing `pub use machine_inst::{...}` line (currently `select, ConstantPool, MachineInst, PoolIndex, SelectedFunction`) — the integration test needs these as public API, since `mod machine_inst;` itself is private.
+
+Create `crates/forge-x64/tests/diamond_fusion_corpus.rs`:
 
 ```rust
-    #[test]
-    fn fused_output_across_the_whole_corpus_still_produces_valid_allocations() {
-        let corpus = [
-            "3.14159 * r * r",
-            "sin(x) + cos(y)",
-            "(n * 2654435761) >> 16",
-            "x / y",
-            "x + 1",
-            "fma(a, b, c)",
-            "base + i * 8",
-            "let t = a - b in if t > 0.0 then t else -t",
-            "if a > b then (if a > c then a else c) else b",
-            "(if a > b then a else b) + a",
-            "sqrt(x * x + y * y)",
-            "abs(x) + floor(y) + ceil(z)",
-            "(n >> 1) % 7 + (n >> 1) / 7",
-            "if a > b then (a * c) + (b * c) else a - b",
-            "if a > b then (a - b) - (a + b) else c - a",
-            "if a > b then fma(a, b, c) else a * c",
-            "if x > y then (x * y) + (x - y) else x / y",
-            "if x > y then fma(x, y, z) * x else fma(y, x, z) - y",
-        ];
-        let mut fused_any = 0;
-        for src in corpus {
-            let (tokens, diags) = forge_syntax::lexer::lex(src);
-            assert!(diags.is_empty(), "lex errors for {src:?}: {diags:?}");
-            let (ast, diags) = forge_syntax::parser::parse(&tokens);
-            assert!(diags.is_empty(), "parse errors for {src:?}: {diags:?}");
-            let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
-                .unwrap_or_else(|e| panic!("type errors for {src:?}: {e:?}"));
-            let func = forge_ir::lower::lower(&typed);
+#[test]
+fn fused_output_across_the_whole_corpus_still_produces_valid_allocations() {
+    let corpus = [
+        "3.14159 * r * r",
+        "sin(x) + cos(y)",
+        "(n * 2654435761) >> 16",
+        "x / y",
+        "x + 1",
+        "fma(a, b, c)",
+        "base + i * 8",
+        "let t = a - b in if t > 0.0 then t else -t",
+        "if a > b then (if a > c then a else c) else b",
+        "(if a > b then a else b) + a",
+        "sqrt(x * x + y * y)",
+        "abs(x) + floor(y) + ceil(z)",
+        "(n >> 1) % 7 + (n >> 1) / 7",
+        "if a > b then (a * c) + (b * c) else a - b",
+        "if a > b then (a - b) - (a + b) else c - a",
+        "if a > b then fma(a, b, c) else a * c",
+        "if x > y then (x * y) + (x - y) else x / y",
+        "if x > y then fma(x, y, z) * x else fma(y, x, z) - y",
+    ];
+    let mut fused_any = 0;
+    for src in corpus {
+        let (tokens, diags) = forge_syntax::lexer::lex(src);
+        assert!(diags.is_empty(), "lex errors for {src:?}: {diags:?}");
+        let (ast, diags) = forge_syntax::parser::parse(&tokens);
+        assert!(diags.is_empty(), "parse errors for {src:?}: {diags:?}");
+        let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
+            .unwrap_or_else(|e| panic!("type errors for {src:?}: {e:?}"));
+        let func = forge_ir::lower::lower(&typed);
 
-            let (fusions, _) = find_fusable_diamonds(&func);
-            if !fusions.is_empty() {
-                fused_any += 1;
-            }
-
-            let selected = select(&func);
-            let intervals = forge_regalloc::build_intervals(&func, &selected);
-            let excluded = forge_regalloc::excluded_registers(&func, &selected);
-            let (assignment, _bytes) = forge_regalloc::allocate(intervals.clone(), &excluded, &selected);
-
-            assert!(
-                forge_regalloc::verify_allocation(&intervals, &assignment).is_ok(),
-                "{src:?}: fused output must still produce a valid, independently-verified allocation"
-            );
+        let (fusions, _) = forge_x64::find_fusable_diamonds(&func);
+        if !fusions.is_empty() {
+            fused_any += 1;
         }
+
+        let selected = forge_x64::select(&func);
+        let intervals = forge_regalloc::build_intervals(&func, &selected);
+        let excluded = forge_regalloc::excluded_registers(&func, &selected);
+        let (assignment, _bytes) = forge_regalloc::allocate(intervals.clone(), &excluded, &selected);
+
         assert!(
-            fused_any > 0,
-            "corpus must contain at least one fusable diamond, or this test is vacuous -- \
-             confirmed by design review that \"(if a > b then a else b) + a\" and the inner \
-             diamond of \"if a > b then (if a > c then a else c) else b\" both fuse"
+            forge_regalloc::verify_allocation(&intervals, &assignment).is_ok(),
+            "{src:?}: fused output must still produce a valid, independently-verified allocation"
         );
     }
+    assert!(
+        fused_any > 0,
+        "corpus must contain at least one fusable diamond, or this test is vacuous -- \
+         confirmed by design review that \"(if a > b then a else b) + a\" and the inner \
+         diamond of \"if a > b then (if a > c then a else c) else b\" both fuse"
+    );
+}
 ```
 
 - [ ] **Step 2: Run to verify it passes**
 
-Run: `cargo test -p forge-x64 fused_output_across_the_whole_corpus`
+Run: `cargo test -p forge-x64 --test diamond_fusion_corpus`
 Expected: PASS, and confirm (e.g. via a temporary `eprintln!` you remove afterward, or by reasoning from the design doc's own execution-confirmed count) that `fused_any == 2` — the design doc's review confirmed exactly 2 of these 18 programs contain a fusable diamond. If your count differs, investigate why before proceeding (either a real behavior difference from what was verified, or a corpus/test transcription error).
 
 - [ ] **Step 3: Run the full workspace verification**
@@ -914,7 +972,7 @@ Find the bullet: `Select → cmov (integer) or vblendvpd / minsd+maxsd idioms (f
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/forge-x64/src/machine_inst/mod.rs crates/forge-x64/Cargo.toml CHECKLIST.md
+git add crates/forge-x64/tests/diamond_fusion_corpus.rs crates/forge-x64/src/lib.rs crates/forge-x64/Cargo.toml CHECKLIST.md
 git commit -m "test(forge-x64): corpus-wide fusion regression + CHECKLIST annotation"
 ```
 
