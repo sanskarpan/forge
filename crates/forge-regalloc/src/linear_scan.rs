@@ -73,12 +73,12 @@ pub const ALLOCATABLE_XMM: &[PhysReg] = &[
 pub const SCRATCH_GPR: [PhysReg; 2] = [PhysReg::R10, PhysReg::R11];
 pub const SCRATCH_XMM: [PhysReg; 2] = [PhysReg::Xmm14, PhysReg::Xmm15];
 
-// R10/R11 sit at indices 8-9 of ALLOCATABLE_GPR's declared order (Rax,
-// Rcx, Rdx, Rbx, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15), NOT the
-// last two entries -- `.split_at(12).0` would keep R10/R11 IN the pool
-// while also claiming they're scratch-reserved, a direct contradiction.
-// An explicit literal is the only construction that's correct regardless
-// of which two registers scratch picks.
+/// R10/R11 sit at indices 8-9 of ALLOCATABLE_GPR's declared order (Rax,
+/// Rcx, Rdx, Rbx, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15), NOT the
+/// last two entries -- `.split_at(12).0` would keep R10/R11 IN the pool
+/// while also claiming they're scratch-reserved, a direct contradiction.
+/// An explicit literal is the only construction that's correct regardless
+/// of which two registers scratch picks.
 pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
     PhysReg::Rax,
     PhysReg::Rcx,
@@ -94,9 +94,9 @@ pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
     PhysReg::R15,
 ]; // 14 - 2 reserved (R10, R11 excluded)
 
-// Xmm14/Xmm15 ARE the last two entries of ALLOCATABLE_XMM, so split_at is
-// correct here (unlike the GPR case above, where the excluded pair isn't
-// at the end).
+/// Xmm14/Xmm15 ARE the last two entries of ALLOCATABLE_XMM, so split_at is
+/// correct here (unlike the GPR case above, where the excluded pair isn't
+/// at the end).
 pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = ALLOCATABLE_XMM.split_at(14).0; // 16 - 2 reserved
 
 /// Excludes a `Value`'s specific registers at SPECIFIC instruction
@@ -405,6 +405,31 @@ mod tests {
         assert_eq!(
             union, original,
             "scratch + spill-aware must reconstruct ALLOCATABLE_GPR exactly"
+        );
+
+        // Set-membership checks above don't pin ORDER, but pool order
+        // matters: pick_register's fallback scans `allocatable` in its
+        // declared order (see pick_register_falls_back_to_free_register_
+        // when_hint_unusable, which pins ALLOCATABLE_GPR[1] specifically),
+        // so a mutation reordering these same 12 registers would silently
+        // change tie-breaking preference while still passing every
+        // assertion above.
+        assert_eq!(
+            SPILL_AWARE_ALLOCATABLE_GPR,
+            &[
+                PhysReg::Rax,
+                PhysReg::Rcx,
+                PhysReg::Rdx,
+                PhysReg::Rbx,
+                PhysReg::Rsi,
+                PhysReg::Rdi,
+                PhysReg::R8,
+                PhysReg::R9,
+                PhysReg::R12,
+                PhysReg::R13,
+                PhysReg::R14,
+                PhysReg::R15,
+            ]
         );
     }
 
