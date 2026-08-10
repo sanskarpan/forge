@@ -906,6 +906,11 @@ mod tests {
             "sqrt(x * x + y * y)",
             "abs(x) + floor(y) + ceil(z)",
             "(n >> 1) % 7 + (n >> 1) / 7",
+            "if a > b then (a * c) + (b * c) else a - b",
+            "if a > b then (a - b) - (a + b) else c - a",
+            "if a > b then fma(a, b, c) else a * c",
+            "if x > y then (x * y) + (x - y) else x / y",
+            "if x > y then fma(x, y, z) * x else fma(y, x, z) - y",
         ] {
             let func = front_end(src);
             let selected = select(&func);
