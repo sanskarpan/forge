@@ -171,8 +171,31 @@ pub fn translate_inst(
         MachineInst::IntToFloat { dst, src } => asm.cvtsi2sd(loc(*dst), loc(*src)),
         MachineInst::FloatToInt { dst, src } => asm.cvttsd2si(loc(*dst), loc(*src)),
 
-        MachineInst::IntCmp { .. } | MachineInst::FloatCmp { .. } | MachineInst::IntCmov { .. } => {
-            unimplemented!("filled in by Task 5: {inst:?}")
+        MachineInst::IntCmp { op, dst, lhs, rhs } => {
+            let (dst_r, lhs_r, rhs_r) = (loc(*dst), loc(*lhs), loc(*rhs));
+            asm.alu_reg_reg(AluOp::Cmp, lhs_r, rhs_r);
+            asm.mov_reg_imm(dst_r, 0);
+            asm.setcc(int_condition_code(*op), dst_r);
+        }
+        MachineInst::FloatCmp { op, dst, lhs, rhs } => {
+            let (dst_r, lhs_r, rhs_r) = (loc(*dst), loc(*lhs), loc(*rhs));
+            asm.ucomisd_reg_reg(lhs_r, rhs_r);
+            asm.mov_reg_imm(dst_r, 0);
+            asm.setcc(float_condition_code(*op), dst_r);
+        }
+        MachineInst::IntCmov {
+            dst,
+            cond,
+            then_val,
+            else_val,
+        } => {
+            let (dst_r, cond_r, then_r, else_r) =
+                (loc(*dst), loc(*cond), loc(*then_val), loc(*else_val));
+            if dst_r != then_r {
+                asm.mov_reg_reg(dst_r, then_r);
+            }
+            asm.test_reg_reg(cond_r, cond_r);
+            asm.cmovcc(forge_x64::ConditionCode::Equal, dst_r, else_r);
         }
 
         MachineInst::Param { .. } => {
@@ -203,6 +226,32 @@ fn assert_div_rhs_not_rax_rdx(rhs_r: PhysReg) {
         "forge-emit (Phase 9a): IntDiv/IntRem divisor must not be Rax/Rdx — the real allocator's \
          excluded_registers() prevents this; this input is malformed"
     );
+}
+
+fn int_condition_code(op: forge_ir::CmpOp) -> forge_x64::ConditionCode {
+    use forge_ir::CmpOp;
+    use forge_x64::ConditionCode;
+    match op {
+        CmpOp::Eq => ConditionCode::Equal,
+        CmpOp::Ne => ConditionCode::NotEqual,
+        CmpOp::Lt => ConditionCode::Less,
+        CmpOp::Le => ConditionCode::LessOrEqual,
+        CmpOp::Gt => ConditionCode::Greater,
+        CmpOp::Ge => ConditionCode::GreaterOrEqual,
+    }
+}
+
+fn float_condition_code(op: forge_ir::CmpOp) -> forge_x64::ConditionCode {
+    use forge_ir::CmpOp;
+    use forge_x64::ConditionCode;
+    match op {
+        CmpOp::Eq => ConditionCode::Equal,
+        CmpOp::Ne => ConditionCode::NotEqual,
+        CmpOp::Lt => ConditionCode::Below,
+        CmpOp::Le => ConditionCode::BelowOrEqual,
+        CmpOp::Gt => ConditionCode::Above,
+        CmpOp::Ge => ConditionCode::AboveOrEqual,
+    }
 }
 
 fn shift_op(
