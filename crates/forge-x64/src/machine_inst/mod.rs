@@ -7,6 +7,13 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PoolIndex(usize);
 
+impl PoolIndex {
+    /// The pool-entry position this index refers to (0-based, insertion order).
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// Deduplicating storage for the 8-byte constants (f64 literals, sign
 /// masks) instruction selection needs a real memory location for.
 /// Actual byte layout / RIP-relative addressing happens later, once a

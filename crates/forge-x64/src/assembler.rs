@@ -1047,6 +1047,14 @@ impl Assembler {
     }
 }
 
+impl Assembler {
+    /// Appends 8 raw little-endian bytes with no instruction encoding around them.
+    /// Used to place constant-pool data (not code) after the function body.
+    pub fn emit_u64(&mut self, bits: u64) {
+        self.code.extend_from_slice(&bits.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,5 +1133,15 @@ mod tests {
         let mut a = Assembler::new();
         a.modrm_reg(0, 0); // reg==rm, e.g. the "rax,rax" case
         assert_eq!(a.code(), &[0xC0]);
+    }
+
+    #[test]
+    fn emit_u64_appends_raw_little_endian_bytes() {
+        let mut asm = Assembler::new();
+        asm.mov_reg_imm(PhysReg::Rax, 0); // sentinel, so emit_u64 isn't operating on an empty buffer
+        let before_len = asm.code().len();
+        asm.emit_u64(0x0102030405060708u64);
+        let tail = &asm.code()[before_len..];
+        assert_eq!(tail, &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
     }
 }

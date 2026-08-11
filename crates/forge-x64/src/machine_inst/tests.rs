@@ -2192,3 +2192,12 @@ fn select_fuses_an_eligible_diamond_and_skips_arm_blocks() {
     // two now-empty arms (zero-length ranges).
     assert_eq!(selected.block_starts.len(), 4);
 }
+
+#[test]
+fn pool_index_round_trips_through_intern_in_insertion_order() {
+    let mut pool = ConstantPool::default();
+    let first = pool.intern(0x3ff0000000000000u64); // 1.0f64
+    let second = pool.intern(0x4000000000000000u64); // 2.0f64
+    assert_eq!(first.index(), 0);
+    assert_eq!(second.index(), 1);
+}
