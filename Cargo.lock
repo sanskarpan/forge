@@ -228,6 +228,19 @@ name = "forge-cli"
 version = "0.1.0"
 
 [[package]]
+name = "forge-emit"
+version = "0.1.0"
+dependencies = [
+ "forge-ir",
+ "forge-mem",
+ "forge-regalloc",
+ "forge-syntax",
+ "forge-x64",
+ "iced-x86",
+ "smallvec",
+]
+
+[[package]]
 name = "forge-ir"
 version = "0.1.0"
 dependencies = [

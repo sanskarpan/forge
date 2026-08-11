@@ -1,0 +1,15 @@
+[package]
+name = "forge-emit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+forge-ir = { path = "../forge-ir" }
+forge-x64 = { path = "../forge-x64" }
+forge-regalloc = { path = "../forge-regalloc" }
+
+[dev-dependencies]
+forge-mem = { path = "../forge-mem" }
+forge-syntax = { path = "../forge-syntax" }
+iced-x86.workspace = true
+smallvec.workspace = true

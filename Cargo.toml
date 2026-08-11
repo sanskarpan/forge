@@ -13,6 +13,7 @@ members = [
     "crates/forge-simd",
     "crates/forge-bench",
     "crates/forge-cli",
+    "crates/forge-emit",
     "crates/forge-wasm-api",
 ]
 
