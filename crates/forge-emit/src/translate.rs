@@ -226,11 +226,28 @@ fn shift_op(
     asm.shift_reg_cl(op, dst_r);
 }
 
+/// Which bitwise sign-mask operation `float_mask_op` should apply: `Abs`
+/// clears the sign bit (`andpd`), `Neg` flips it (`xorpd`). See
+/// `float_mask_op`'s doc comment for why both share one helper.
 enum MaskOp {
     Abs,
     Neg,
 }
 
+/// Shared lowering for `FloatAbs`/`FloatNeg`: both are "load a 128-bit sign
+/// mask from the constant pool, then `andpd`/`xorpd` it into `dst`" and
+/// differ only in which bitwise op is used, so `op` picks that.
+///
+/// The mask is loaded into `PhysReg::Xmm14` — hardcoded, not resolved via
+/// `loc`. This is not an arbitrary choice: `Xmm14` is
+/// `forge_regalloc::linear_scan::SCRATCH_XMM[0]`
+/// (`SCRATCH_XMM = [PhysReg::Xmm14, PhysReg::Xmm15]`), the register the real
+/// allocator reserves as scratch and never assigns to a live `Value` across
+/// a `FloatAbs`/`FloatNeg` instruction. That invariant is what makes it safe
+/// to clobber `Xmm14` here without going through `loc`/consulting
+/// liveness — if `forge-regalloc` ever reorders or changes `SCRATCH_XMM`,
+/// this hardcoded literal would silently stop matching the allocator's
+/// reserved register and this function could clobber a live value.
 fn float_mask_op(
     asm: &mut Assembler,
     loc: &dyn Fn(Value) -> PhysReg,
@@ -244,6 +261,8 @@ fn float_mask_op(
     if dst_r != src_r {
         asm.movsd_reg_reg(dst_r, src_r);
     }
+    // Xmm14 == forge_regalloc::linear_scan::SCRATCH_XMM[0]; see doc comment
+    // above for the invariant this depends on.
     asm.movsd_reg_riprel(PhysReg::Xmm14, pool_labels[mask_pool.index()]);
     match op {
         MaskOp::Abs => asm.andpd_reg_reg(dst_r, PhysReg::Xmm14),
