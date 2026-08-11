@@ -164,8 +164,12 @@ forge-regalloc = { path = "../forge-regalloc" }
 
 [dev-dependencies]
 forge-mem = { path = "../forge-mem" }
+forge-syntax = { path = "../forge-syntax" }
 iced-x86.workspace = true
+smallvec.workspace = true
 ```
+
+(`forge-syntax` is needed because Task 6/7's tests build `forge_syntax::span::Span` values directly, matching `forge-x64`/`forge-regalloc`'s own dev-dependency lists. `smallvec` is needed by Task 4's `CallLibm` test.)
 
 - [ ] **Step 3: Create `crates/forge-emit/src/lib.rs`**
 
@@ -666,19 +670,14 @@ fn call_libm_panics_in_this_slice() {
 }
 ```
 
-Add `smallvec.workspace = true` and `forge-x64 = { path = "../forge-x64" }` (already present) plus `forge-ir` (already present) to `crates/forge-emit/Cargo.toml`'s `[dev-dependencies]` since the `CallLibm` test above needs `smallvec::smallvec!`:
-
-```toml
-[dev-dependencies]
-forge-mem = { path = "../forge-mem" }
-iced-x86.workspace = true
-smallvec.workspace = true
-```
+(`smallvec` is already in `[dev-dependencies]` from Task 2 — the `CallLibm` test above needs `smallvec::smallvec!`.)
 
 - [ ] **Step 3: Run tests to verify they fail**
 
 Run: `cargo test -p forge-emit --test translate_mechanical`
 Expected: FAIL — `translate_inst` currently just calls `unimplemented!()` for every input.
+
+**Caveat on this task's literal disassembly strings**: iced-x86's `NasmFormatter` default settings format immediates/displacements in a specific way (e.g. hex with an `h` suffix for larger values, decimal for small ones, sign/spacing conventions for memory operands) that this plan's literal strings (`"lea rax,[rcx+rdx*4+8]"`, `"mov rax,7"` in Task 6, etc.) are a best-effort guess at, not independently confirmed against a running formatter. Treat every literal expected-string assertion in this task and Task 5-7 the same way Task 6 Step 4 already instructs for jump-target addresses: run the test, and if it fails only on the literal string (not on instruction count/mnemonic/operand-register correctness), print the actual `disassemble()` output (`cargo test -p forge-emit -- --nocapture` plus a temporary `eprintln!`), confirm by inspection that the actual output is semantically correct, then update the test's literal string to match reality — never adjust the implementation to satisfy a guessed string.
 
 - [ ] **Step 4: Implement `translate_inst`'s mechanical arms**
 
@@ -768,6 +767,7 @@ pub fn translate_inst(
                 asm.mov_reg_reg(PhysReg::Rax, lhs_r);
             }
             asm.cqo();
+            assert_div_rhs_not_rax_rdx(rhs_r);
             asm.idiv_reg(rhs_r);
             if dst_r != PhysReg::Rax {
                 asm.mov_reg_reg(dst_r, PhysReg::Rax);
@@ -779,6 +779,7 @@ pub fn translate_inst(
                 asm.mov_reg_reg(PhysReg::Rax, lhs_r);
             }
             asm.cqo();
+            assert_div_rhs_not_rax_rdx(rhs_r);
             asm.idiv_reg(rhs_r);
             if dst_r != PhysReg::Rdx {
                 asm.mov_reg_reg(dst_r, PhysReg::Rdx);
@@ -870,6 +871,20 @@ pub fn translate_inst(
             )
         }
     }
+}
+
+/// `idiv_reg`'s divisor operand must not itself be Rax/Rdx: `cqo` has already
+/// overwritten Rdx as the sign-extension of Rax by this point, so a divisor
+/// aliasing either would read corrupted/wrong-purpose data. The real
+/// allocator's `excluded_registers()` keeps this from happening in practice;
+/// this assert exists so a malformed hand-built test (or a future caller)
+/// fails loudly instead of silently computing garbage.
+fn assert_div_rhs_not_rax_rdx(rhs_r: PhysReg) {
+    assert!(
+        rhs_r != PhysReg::Rax && rhs_r != PhysReg::Rdx,
+        "forge-emit (Phase 9a): IntDiv/IntRem divisor must not be Rax/Rdx — the real allocator's \
+         excluded_registers() prevents this; this input is malformed"
+    );
 }
 
 fn shift_op(
@@ -1499,6 +1514,7 @@ fn int_cmp_and_cmov_diamond_selects_correct_branch() {
     // bb), so this mints a real Inst::Phi at merge per read_variable_recursive's
     // documented behavior.
     let result = b.read_variable("result", merge, Ty::I64);
+    b.f.blocks[merge.0 as usize].term = Some(Terminator::Return(result));
 
     let selected = forge_x64::select(&b.f);
     let mut assignment: HashMap<Value, Location> = HashMap::new();
@@ -1518,8 +1534,11 @@ fn int_cmp_and_cmov_diamond_selects_correct_branch() {
     let lines = disassemble(&code);
     assert!(lines.iter().any(|l| l.starts_with("cmove") || l.starts_with("test")));
 
-    #[cfg(target_arch = "x86_64")]
-    assert_eq!(run_f64(&code) as i64, 5);
+    // No execution assertion here: `result` is `Ty::I64`, returned in `rax`,
+    // but `forge-mem`'s `CompiledExpr` only exposes f64-typed call paths
+    // (`call1`/`call2`/`call_n` all read `xmm0`) — an int-typed top-level
+    // return has no call path until Phase 9f adds one. The disassembly
+    // assertion above is this test's real bar for now.
 }
 
 #[test]
