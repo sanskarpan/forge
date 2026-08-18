@@ -77,6 +77,23 @@ pub fn emit_body(
     asm.code().to_vec()
 }
 
+/// Resolves `v`'s `Ty`, checking `selected.synthetic_types` first and
+/// falling back to `func.types[v.0 as usize]`.
+///
+/// This order is deliberate, not incidental: `func.types` is only valid to
+/// index with `Value`s that came from the original IR, but a selector-minted
+/// temp (e.g. Fma's `mul_tmp`) has no entry there and would either panic or
+/// (worse) silently index some unrelated IR value's slot. Checking the
+/// `HashMap` first short-circuits before that indexing ever happens, so a
+/// synthetic `Value` is resolved correctly and an IR `Value` still falls
+/// through to the array as before. This mirrors the same lookup shape
+/// `Selector::ty_of` uses in `forge-x64/src/machine_inst/mod.rs` for
+/// resolving a `Value`'s type during instruction selection.
+///
+/// At `emit_body`'s only call site (the `Return` arm), `v` always comes
+/// directly from the IR terminator, so the `synthetic_types` branch is
+/// currently unreachable in practice -- it's forward-looking/defensive
+/// should a future caller ever pass a selector-minted `Value` through here.
 fn value_ty(func: &Function, selected: &SelectedFunction, v: Value) -> Ty {
     selected
         .synthetic_types

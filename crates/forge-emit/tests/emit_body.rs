@@ -87,6 +87,39 @@ fn jump_only_multi_block_function_resolves_labels() {
 }
 
 #[test]
+fn constant_pool_is_placed_after_every_block_not_just_the_first() {
+    // A genuinely multi-block function (entry jumps to a second block, same
+    // Builder shape as `jump_only_multi_block_function_resolves_labels`)
+    // where the F64 constant lives in the NON-entry block. A single-block
+    // function can't distinguish "pool placed after all block code" from
+    // "pool placed after block 1" -- with two blocks, if `place_pool` were
+    // ever called before the loop finishes (or between blocks), the pool's
+    // bytes would land before `next`'s code instead of after it.
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    let next = b.create_block();
+    b.seal_block(entry);
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Jump(next));
+    b.add_pred(next, entry);
+    b.seal_block(next);
+    let bits = 2.5f64.to_bits();
+    let c = b.emit(next, Inst::ConstF64(bits), Ty::F64, dummy_span());
+    b.f.blocks[next.0 as usize].term = Some(Terminator::Return(c));
+
+    let selected = forge_x64::select(&b.f);
+    let assignment: HashMap<Value, Location> =
+        [(c, Location::Reg(PhysReg::Xmm0))].into_iter().collect();
+
+    let code = forge_emit::emit_body(&b.f, &selected, &assignment);
+    // The constant pool holds exactly this one f64's raw bits, written by
+    // `place_pool` via `emit_u64` (little-endian). If the pool is genuinely
+    // placed after ALL block code (not just after block 1, or spliced
+    // between blocks), those 8 bytes must be the very last bytes of `code`.
+    let pool_bytes = bits.to_le_bytes();
+    assert_eq!(&code[code.len() - 8..], &pool_bytes);
+}
+
+#[test]
 fn branch_diamond_emits_test_jcc_jmp() {
     let mut b = Builder::new();
     let entry = b.create_block();
