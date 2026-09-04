@@ -6,10 +6,13 @@
 //! created.
 
 pub use forge_ir::interp::RtValue;
+mod tiered;
+
 use forge_ir::{Function, Value};
 use forge_mem::{CompiledExpr, ExecutableBuffer};
 use forge_syntax::Diagnostic;
 use std::collections::HashMap;
+pub use tiered::{ExecutionTier, TieredExpr, BASELINE_THRESHOLD, OPTIMIZED_THRESHOLD};
 
 #[derive(Debug)]
 pub enum CompileError {
@@ -168,6 +171,19 @@ impl CompiledFunction {
 /// Runs optimization, selection, allocation, independent allocation
 /// verification, and x86-64 emission, then seals the result as executable.
 pub fn compile(source: &str) -> Result<CompiledFunction, CompileError> {
+    compile_with_optimization(source, true)
+}
+
+/// Compiles the scalar entry point without running the optimizer. This is
+/// the baseline tier used by [`TieredExpr`].
+pub fn compile_baseline(source: &str) -> Result<CompiledFunction, CompileError> {
+    compile_with_optimization(source, false)
+}
+
+fn compile_with_optimization(
+    source: &str,
+    optimize: bool,
+) -> Result<CompiledFunction, CompileError> {
     if !cfg!(target_arch = "x86_64") {
         return Err(CompileError::UnsupportedTarget(
             "the active backend emits x86-64 machine code",
@@ -187,7 +203,9 @@ pub fn compile(source: &str) -> Result<CompiledFunction, CompileError> {
             "the scalar JIT entry point currently accepts and returns only f64",
         ));
     }
-    forge_opt::optimize(&mut function);
+    if optimize {
+        forge_opt::optimize(&mut function);
+    }
     forge_ir::verify::verify(&function).map_err(CompileError::Ir)?;
     let selected = forge_x64::select(&function);
     let intervals = forge_regalloc::build_intervals(&function, &selected);
