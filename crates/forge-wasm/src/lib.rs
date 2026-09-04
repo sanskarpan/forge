@@ -186,27 +186,35 @@ fn emit_expr(
                 }
             });
         }
-        Expr::Call { callee, args } => {
-            if args.len() != 1 {
-                return Err(format!(
-                    "WASM backend does not emit multi-argument call {callee}"
-                ));
+        Expr::Call { callee, args } => match (callee.as_str(), args.as_slice()) {
+            ("min", [lhs, rhs]) | ("max", [lhs, rhs]) => {
+                emit_expr(ast, *lhs, params, lets, out)?;
+                emit_expr(ast, *rhs, params, lets, out)?;
+                out.push(if callee == "min" { 0xa4 } else { 0xa5 });
             }
-            emit_expr(ast, args[0], params, lets, out)?;
-            out.push(match callee.as_str() {
-                "sqrt" => 0x9f,
-                "abs" => 0x99,
-                "floor" => 0x9c,
-                "ceil" => 0x9b,
-                "round" => 0x9e,
-                "trunc" => 0x9d,
-                _ => {
-                    return Err(format!(
-                        "WASM backend has no inline implementation for {callee}"
-                    ))
-                }
-            });
-        }
+            (name, [operand]) => {
+                emit_expr(ast, *operand, params, lets, out)?;
+                out.push(match name {
+                    "sqrt" => 0x9f,
+                    "abs" => 0x99,
+                    "floor" => 0x9c,
+                    "ceil" => 0x9b,
+                    "round" => 0x9e,
+                    "trunc" => 0x9d,
+                    _ => {
+                        return Err(format!(
+                            "WASM backend has no inline implementation for {name}"
+                        ))
+                    }
+                });
+            }
+            (_, _) => {
+                return Err(format!(
+                    "WASM backend does not emit call {callee} with {} argument(s)",
+                    args.len()
+                ))
+            }
+        },
         Expr::If { cond, then_, else_ } => {
             emit_expr(ast, *cond, params, lets, out)?;
             out.extend([0x04, 0x7c]);
@@ -262,6 +270,14 @@ mod tests {
     #[test]
     fn portable_evaluation_matches_the_ir_interpreter() {
         assert_eq!(evaluate("let t = x * x in sqrt(t)", &[3.0]).unwrap(), 3.0);
+    }
+
+    #[test]
+    fn emits_binary_min_and_max_calls() {
+        let min = compile("min(x, y)").unwrap();
+        let max = compile("max(x, y)").unwrap();
+        assert!(min.contains(&0xa4));
+        assert!(max.contains(&0xa5));
     }
 
     #[test]
