@@ -1,4 +1,9 @@
-.PHONY: test test-differential test-encoding bench qemu-aarch64 wasm workbench codesign spike
+.PHONY: test test-differential test-encoding bench qemu-aarch64 wasm workbench codesign spike \
+	container-images container-test-x86 container-test-arm64 container-test-wasm container-test-workbench
+
+CONTAINER_ENGINE ?= podman
+CONTAINER_RUST_IMAGE ?= forge-rust-ci:1.87
+CONTAINER_WORKBENCH_IMAGE ?= forge-workbench-ci:22
 
 spike:
 	cargo build --example spike -p forge-mem
@@ -36,3 +41,23 @@ workbench:
 	@test -f workbench/package.json || \
 		{ echo "workbench is not present in this repository"; exit 2; }
 	npm test --prefix workbench
+
+container-images:
+	$(CONTAINER_ENGINE) build -f containers/Dockerfile.rust-ci -t $(CONTAINER_RUST_IMAGE) .
+	$(CONTAINER_ENGINE) build -f containers/Dockerfile.workbench -t $(CONTAINER_WORKBENCH_IMAGE) .
+
+container-test-x86:
+	$(CONTAINER_ENGINE) build --platform linux/amd64 -f containers/Dockerfile.rust-ci -t $(CONTAINER_RUST_IMAGE)-amd64 .
+	$(CONTAINER_ENGINE) run --rm --platform linux/amd64 -v "$(CURDIR):/workspace" -w /workspace $(CONTAINER_RUST_IMAGE)-amd64 cargo test --workspace --locked
+
+container-test-arm64:
+	$(CONTAINER_ENGINE) build --platform linux/arm64 -f containers/Dockerfile.rust-ci -t $(CONTAINER_RUST_IMAGE)-arm64 .
+	$(CONTAINER_ENGINE) run --rm --platform linux/arm64 -v "$(CURDIR):/workspace" -w /workspace $(CONTAINER_RUST_IMAGE)-arm64 cargo test --workspace --locked
+
+container-test-wasm:
+	$(CONTAINER_ENGINE) build -f containers/Dockerfile.rust-ci -t $(CONTAINER_RUST_IMAGE) .
+	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR):/workspace" -w /workspace $(CONTAINER_RUST_IMAGE) sh -lc 'rustup target add wasm32-unknown-unknown && cargo check -p forge-wasm-api --target wasm32-unknown-unknown --locked'
+
+container-test-workbench:
+	$(CONTAINER_ENGINE) build -f containers/Dockerfile.workbench -t $(CONTAINER_WORKBENCH_IMAGE) .
+	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR):/workspace" -w /workspace $(CONTAINER_WORKBENCH_IMAGE)
