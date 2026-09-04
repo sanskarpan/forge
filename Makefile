@@ -3,6 +3,7 @@
 
 CONTAINER_ENGINE ?= podman
 CONTAINER_RUST_IMAGE ?= forge-rust-ci:1.87
+CONTAINER_WASM_IMAGE ?= forge-wasm-ci:1.87
 CONTAINER_WORKBENCH_IMAGE ?= forge-workbench-ci:22
 
 spike:
@@ -55,8 +56,8 @@ container-test-arm64:
 	$(CONTAINER_ENGINE) run --rm --platform linux/arm64 -v "$(CURDIR):/workspace" -w /workspace $(CONTAINER_RUST_IMAGE)-arm64 cargo test --workspace --locked
 
 container-test-wasm:
-	$(CONTAINER_ENGINE) build -f containers/Dockerfile.rust-ci -t $(CONTAINER_RUST_IMAGE) .
-	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR):/workspace" -w /workspace $(CONTAINER_RUST_IMAGE) sh -lc 'rustup target add wasm32-unknown-unknown && cargo check -p forge-wasm-api --target wasm32-unknown-unknown --locked'
+	$(CONTAINER_ENGINE) build -f containers/Dockerfile.wasm-ci -t $(CONTAINER_WASM_IMAGE) .
+	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR):/workspace" -w /workspace $(CONTAINER_WASM_IMAGE) cargo check -p forge-wasm-api --target wasm32-unknown-unknown --locked
 
 container-test-workbench:
 	$(CONTAINER_ENGINE) build -f containers/Dockerfile.workbench -t $(CONTAINER_WORKBENCH_IMAGE) .
