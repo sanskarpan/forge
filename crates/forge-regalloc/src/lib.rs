@@ -11,6 +11,6 @@ pub use linear_scan::{
     allocate, Location, ALLOCATABLE_GPR, ALLOCATABLE_XMM, SCRATCH_GPR, SCRATCH_XMM,
     SPILL_AWARE_ALLOCATABLE_GPR, SPILL_AWARE_ALLOCATABLE_XMM,
 };
-pub use liveness::{compute_liveness, Liveness};
+pub use liveness::{compute_liveness, def_of, reads_of, Liveness};
 pub use pressure::{register_pressure, PressurePoint};
 pub use verify::verify_allocation;
