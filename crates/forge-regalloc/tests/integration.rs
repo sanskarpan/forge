@@ -5,7 +5,7 @@ use forge_syntax::span::Span;
 /// CHECKLIST Phase 8 bullet 19: "Test: 3 values, 16 registers, no
 /// spills". "16 registers" is stale CHECKLIST wording from before Phase
 /// 8c introduced SCRATCH_GPR/XMM reservation -- the real pool this test
-/// runs against is SPILL_AWARE_ALLOCATABLE_GPR (12), via the real
+/// runs against is SPILL_AWARE_ALLOCATABLE_GPR (11), via the real
 /// allocate() the crate actually ships. A real 3-VARIABLE source program
 /// cannot produce exactly 3 values (3 Params plus at least 1 combining op
 /// is always at least 4 values, and untyped surface arithmetic lowers to
@@ -119,12 +119,12 @@ fn bullet_20_forty_live_values_forces_spilling_and_stays_valid() {
         .filter(|iv| matches!(assignment.get(&iv.value), Some(Location::Spill(_))))
         .count();
     assert_eq!(
-        spilled, 28,
-        "40 intervals into a 12-register pool must spill exactly 28"
+        spilled, 29,
+        "40 intervals into an 11-register pool must spill exactly 29"
     );
     assert_eq!(
-        bytes, 224,
-        "28 spills that can never reuse a slot must need exactly 224 bytes"
+        bytes, 232,
+        "29 spills that can never reuse a slot must need exactly 232 bytes"
     );
     assert_eq!(
         assignment.len(),
