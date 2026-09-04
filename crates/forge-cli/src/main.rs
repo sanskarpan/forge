@@ -152,7 +152,8 @@ fn compile_command(args: &[String]) -> Result<(), String> {
         }
         "x86_64" => {
             let artifacts =
-                forge_runtime::compile_artifacts(expression).map_err(|e| e.to_string())?;
+                forge_runtime::compile_artifacts_with_optimization(expression, opt != "0")
+                    .map_err(|e| e.to_string())?;
             println!(
                 "target: x86_64\noptimization: {opt}\nbytes: {}\nhex: {}",
                 artifacts.bytes.len(),
