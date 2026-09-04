@@ -4,69 +4,135 @@
 //! inspection commands print stable sections, while errors go to stderr and
 //! use a non-zero exit status.
 
+use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
-fn usage() {
-    eprintln!(
-        "usage: forge-cli <command> ...\n\
-         commands:\n\
-           eval EXPR [ARGS...] [--name VALUE]\n\
-           compile EXPR --arch x86_64|aarch64|wasm [--opt 0|1|2] [--features LIST]\n\
-           asm EXPR\n\
-           ir EXPR [--after opt]\n\
-           cfg EXPR [--dot]\n\
-           regalloc EXPR\n\
-           bench EXPR [--sizes LIST]\n\
-           verify EXPR [--iters N]\n\
-           cpuinfo\n\
-           repl"
-    );
+#[derive(Debug, Parser)]
+#[command(
+    name = "forge-cli",
+    version,
+    about = "Inspect and run Forge expressions"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Evaluate an expression. Positional values follow parameter order;
+    /// named values use --name VALUE or --name=VALUE.
+    Eval(EvalArgs),
+    /// Compile an expression for an inspection target.
+    Compile(CompileArgs),
+    /// Print selected instructions and encoded bytes.
+    Asm(SourceArgs),
+    /// Print textual SSA IR.
+    Ir(IrArgs),
+    /// Print the control-flow graph.
+    Cfg(CfgArgs),
+    /// Print live intervals and physical assignments.
+    Regalloc(SourceArgs),
+    /// Benchmark repeated expression evaluation.
+    Bench(BenchArgs),
+    /// Compare the interpreter and compiled evaluator.
+    Verify(VerifyArgs),
+    /// Print detected host features.
+    Cpuinfo,
+    /// Start the interactive evaluator.
+    Repl,
+}
+
+#[derive(Debug, Args)]
+struct SourceArgs {
+    expression: String,
+}
+
+#[derive(Debug, Args)]
+struct EvalArgs {
+    expression: String,
+    /// Numeric positional values and dynamic --name VALUE bindings.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    values: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct CompileArgs {
+    expression: String,
+    #[arg(long, default_value = "x86_64")]
+    arch: String,
+    #[arg(long, default_value = "2")]
+    opt: String,
+    #[arg(long)]
+    features: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct IrArgs {
+    expression: String,
+    #[arg(long)]
+    after: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CfgArgs {
+    expression: String,
+    #[arg(long)]
+    dot: bool,
+}
+
+#[derive(Debug, Args)]
+struct BenchArgs {
+    expression: String,
+    #[arg(long, default_value = "1,10,100,1K")]
+    sizes: String,
+}
+
+#[derive(Debug, Args)]
+struct VerifyArgs {
+    expression: String,
+    #[arg(long, default_value_t = 1000)]
+    iters: usize,
 }
 
 fn main() {
-    let mut args = env::args().skip(1);
-    let Some(command) = args.next() else {
-        usage();
-        std::process::exit(2);
-    };
-    let rest = args.collect::<Vec<_>>();
-
-    let result = match command.as_str() {
-        "eval" => eval_command(&rest),
-        "compile" => compile_command(&rest),
-        "asm" => inspect_command(&rest, Inspection::Assembly),
-        "ir" => ir_command(&rest),
-        "cfg" => inspect_command(&rest, Inspection::Cfg),
-        "regalloc" => inspect_command(&rest, Inspection::Regalloc),
-        "bench" => bench_command(&rest),
-        "verify" => verify_command(&rest),
-        "cpuinfo" => cpuinfo_command(&rest),
-        "repl" => repl_command(),
-        _ => {
-            usage();
-            Err(format!("unknown command: {command}"))
-        }
+    let cli = Cli::parse();
+    let result = match &cli.command {
+        Command::Eval(args) => eval_command(&args.expression, &args.values),
+        Command::Compile(args) => compile_command(
+            &args.expression,
+            &args.arch,
+            &args.opt,
+            args.features.as_deref(),
+        ),
+        Command::Asm(args) => inspect_command(&args.expression, Inspection::Assembly),
+        Command::Ir(args) => ir_command(&args.expression, args.after.as_deref()),
+        Command::Cfg(args) => inspect_command_with_dot(&args.expression, args.dot),
+        Command::Regalloc(args) => inspect_command(&args.expression, Inspection::Regalloc),
+        Command::Bench(args) => bench_command(&args.expression, &args.sizes),
+        Command::Verify(args) => verify_command(&args.expression, args.iters),
+        Command::Cpuinfo => cpuinfo_command(&[]),
+        Command::Repl => repl_command(),
     };
 
     if let Err(error) = result {
         eprintln!("forge-cli: {error}");
-        std::process::exit(1);
+        std::process::exit(
+            if matches!(cli.command, Command::Verify(_)) && error.starts_with("mismatch") {
+                3
+            } else {
+                1
+            },
+        );
     }
 }
 
-fn source(args: &[String]) -> Result<&str, String> {
-    args.first()
-        .map(String::as_str)
-        .ok_or_else(|| "an expression is required".to_string())
-}
-
-fn eval_command(args: &[String]) -> Result<(), String> {
-    let expression = source(args)?;
+fn eval_command(expression: &str, args: &[String]) -> Result<(), String> {
     let function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
-    let values = parse_values(&args[1..], &function.params)?;
+    let values = parse_values(args, &function.params)?;
     let result = forge_runtime::evaluate(expression, &values).map_err(|e| e.to_string())?;
     println!("{result}");
     Ok(())
@@ -134,14 +200,16 @@ fn parse_values(args: &[String], params: &[(String, forge_ir::Ty)]) -> Result<Ve
     Ok(values)
 }
 
-fn compile_command(args: &[String]) -> Result<(), String> {
-    let expression = source(args)?;
-    let arch = option(args, "arch").unwrap_or("x86_64");
-    let opt = option(args, "opt").unwrap_or("2");
+fn compile_command(
+    expression: &str,
+    arch: &str,
+    opt: &str,
+    features: Option<&str>,
+) -> Result<(), String> {
     if !matches!(opt, "0" | "1" | "2") {
         return Err(format!("--opt must be 0, 1, or 2, got {opt:?}"));
     }
-    if let Some(features) = option(args, "features") {
+    if let Some(features) = features {
         println!("features: {features}");
     }
 
@@ -173,25 +241,27 @@ fn compile_command(args: &[String]) -> Result<(), String> {
 
 enum Inspection {
     Assembly,
-    Cfg,
     Regalloc,
 }
 
-fn inspect_command(args: &[String], inspection: Inspection) -> Result<(), String> {
-    let expression = source(args)?;
+fn inspect_command(expression: &str, inspection: Inspection) -> Result<(), String> {
     let artifacts = forge_runtime::compile_artifacts(expression).map_err(|e| e.to_string())?;
     match inspection {
         Inspection::Assembly => print_assembly(&artifacts),
-        Inspection::Cfg => print_cfg(&artifacts.function, args.iter().any(|arg| arg == "--dot")),
         Inspection::Regalloc => print_regalloc(&artifacts),
     }
     Ok(())
 }
 
-fn ir_command(args: &[String]) -> Result<(), String> {
-    let expression = source(args)?;
+fn inspect_command_with_dot(expression: &str, dot: bool) -> Result<(), String> {
+    let artifacts = forge_runtime::compile_artifacts(expression).map_err(|e| e.to_string())?;
+    print_cfg(&artifacts.function, dot);
+    Ok(())
+}
+
+fn ir_command(expression: &str, after: Option<&str>) -> Result<(), String> {
     let mut function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
-    if option(args, "after").is_some_and(|pass| pass != "none" && pass != "lower") {
+    if after.is_some_and(|pass| pass != "none" && pass != "lower") {
         forge_opt::optimize(&mut function);
     }
     print!("{}", forge_ir::print::print_function(&function));
@@ -265,9 +335,7 @@ fn print_regalloc(artifacts: &forge_runtime::CompilationArtifacts) {
     println!("spills: {spills}");
 }
 
-fn bench_command(args: &[String]) -> Result<(), String> {
-    let expression = source(args)?;
-    let sizes = option(args, "sizes").unwrap_or("1,10,100,1K");
+fn bench_command(expression: &str, sizes: &str) -> Result<(), String> {
     let function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
     if function
         .params
@@ -299,12 +367,7 @@ fn bench_command(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_command(args: &[String]) -> Result<(), String> {
-    let expression = source(args)?;
-    let iterations = option(args, "iters")
-        .unwrap_or("1000")
-        .parse::<usize>()
-        .map_err(|e| format!("invalid --iters: {e}"))?;
+fn verify_command(expression: &str, iterations: usize) -> Result<(), String> {
     let function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
     if function
         .params
@@ -392,19 +455,6 @@ fn repl_command() -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn option<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    let flag = format!("--{name}");
-    args.iter().enumerate().find_map(|(index, argument)| {
-        if let Some(value) = argument.strip_prefix(&format!("{flag}=")) {
-            Some(value)
-        } else if argument == &flag {
-            args.get(index + 1).map(String::as_str)
-        } else {
-            None
-        }
-    })
 }
 
 fn parse_size(value: &str) -> Result<usize, String> {
