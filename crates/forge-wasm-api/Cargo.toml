@@ -4,3 +4,4 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+forge-wasm = { path = "../forge-wasm" }
