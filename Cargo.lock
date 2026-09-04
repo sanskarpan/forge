@@ -312,6 +312,9 @@ dependencies = [
 [[package]]
 name = "forge-simd"
 version = "0.1.0"
+dependencies = [
+ "forge-ir",
+]
 
 [[package]]
 name = "forge-syntax"
