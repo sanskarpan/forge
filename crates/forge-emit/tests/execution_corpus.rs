@@ -41,7 +41,7 @@ fn float_neg_flips_sign_bit() {
 
     let code = forge_emit::emit_body(&b.f, &selected, &assignment);
     let lines = disassemble(&code);
-    assert!(lines.iter().any(|l| l == "xorpd xmm0,xmm14"));
+    assert!(lines.iter().any(|l| l == "xorpd xmm0,xmm13"));
 
     #[cfg(target_arch = "x86_64")]
     assert_eq!(run_f64(&code), -3.0);
@@ -126,8 +126,7 @@ fn int_cmp_and_cmov_diamond_selects_correct_branch() {
 }
 
 #[test]
-#[should_panic(expected = "spilled operand not yet supported")]
-fn spilled_operand_panics() {
+fn spilled_operand_is_reloaded_and_stored_in_a_frame() {
     let mut b = Builder::new();
     let entry = b.create_block();
     b.seal_block(entry);
@@ -137,5 +136,8 @@ fn spilled_operand_panics() {
     let selected = forge_x64::select(&b.f);
     let assignment: HashMap<Value, Location> = [(c, Location::Spill(0))].into_iter().collect();
 
-    forge_emit::emit_body(&b.f, &selected, &assignment);
+    let code = forge_emit::emit_body(&b.f, &selected, &assignment);
+    let lines = disassemble(&code);
+    assert!(lines.iter().any(|line| line.starts_with("push rbp")));
+    assert!(lines.iter().any(|line| line.starts_with("mov [rbp-8]")));
 }
