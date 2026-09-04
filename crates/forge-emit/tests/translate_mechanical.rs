@@ -276,8 +276,7 @@ fn shl_with_amount_already_in_rcx_emits_shift_cl() {
 }
 
 #[test]
-#[should_panic(expected = "shift amount not in RCX")]
-fn shl_with_amount_not_in_rcx_panics() {
+fn shl_moves_amount_into_rcx_before_shifting() {
     let dst = Value(0);
     let lhs = Value(1);
     let rhs = Value(2);
@@ -293,6 +292,7 @@ fn shl_with_amount_not_in_rcx_panics() {
         &loc_of(&assignment),
         &[],
     );
+    assert_eq!(disassemble(asm.code()), vec!["mov rcx,rdx", "shl rax,cl"]);
 }
 
 #[test]
@@ -492,8 +492,8 @@ fn float_abs_clears_sign_bit_via_pool_mask() {
 
     let lines = disassemble(asm.code());
     assert_eq!(lines[0], "movsd xmm0,xmm1");
-    assert!(lines[1].starts_with("movsd xmm14,"), "got: {}", lines[1]);
-    assert_eq!(lines[2], "andpd xmm0,xmm14");
+    assert!(lines[1].starts_with("movsd xmm13,"), "got: {}", lines[1]);
+    assert_eq!(lines[2], "andpd xmm0,xmm13");
 }
 
 #[test]
@@ -523,10 +523,10 @@ fn float_neg_flips_sign_bit_via_pool_mask() {
 
     let lines = disassemble(asm.code());
     assert_eq!(lines[0], "movsd xmm0,xmm1");
-    assert!(lines[1].starts_with("movsd xmm14,"), "got: {}", lines[1]);
+    assert!(lines[1].starts_with("movsd xmm13,"), "got: {}", lines[1]);
     // FloatNeg must use xorpd (flip the sign bit), not andpd (FloatAbs's
     // mnemonic) -- this is the bit that distinguishes it from FloatAbs.
-    assert_eq!(lines[2], "xorpd xmm0,xmm14");
+    assert_eq!(lines[2], "xorpd xmm0,xmm13");
 }
 
 #[test]
@@ -550,11 +550,12 @@ fn float_round_passes_mode_through_to_roundsd() {
     );
 
     let lines = disassemble(asm.code());
-    assert_eq!(lines.len(), 1);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0] == "movsd xmm0,xmm1", "got: {}", lines[0]);
     assert!(
-        lines[0].starts_with("roundsd xmm0,xmm1,"),
+        lines[1].starts_with("roundsd xmm0,xmm0,"),
         "got: {}",
-        lines[0]
+        lines[1]
     );
 }
 
@@ -613,8 +614,7 @@ fn load_imm_i64_moves_the_immediate_into_dst() {
 }
 
 #[test]
-#[should_panic(expected = "Param placement not yet implemented")]
-fn param_panics_in_this_slice() {
+fn param_is_copied_from_the_integer_abi_register() {
     let dst = Value(0);
     let assignment: HashMap<Value, Location> =
         [(dst, Location::Reg(PhysReg::Rax))].into_iter().collect();
@@ -625,11 +625,11 @@ fn param_panics_in_this_slice() {
         &loc_of(&assignment),
         &[],
     );
+    assert_eq!(disassemble(asm.code()), vec!["mov rax,rdi"]);
 }
 
 #[test]
-#[should_panic(expected = "CallLibm sequence not yet implemented")]
-fn call_libm_panics_in_this_slice() {
+fn call_libm_emits_aligned_indirect_call() {
     let dst = Value(0);
     let assignment: HashMap<Value, Location> =
         [(dst, Location::Reg(PhysReg::Xmm0))].into_iter().collect();
@@ -644,4 +644,8 @@ fn call_libm_panics_in_this_slice() {
         &loc_of(&assignment),
         &[],
     );
+    let lines = disassemble(asm.code());
+    assert!(lines.iter().any(|line| line == "sub rsp,8"));
+    assert!(lines.iter().any(|line| line.starts_with("call ")));
+    assert!(lines.iter().any(|line| line == "add rsp,8"));
 }
