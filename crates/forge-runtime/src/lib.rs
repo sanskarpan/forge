@@ -6,9 +6,10 @@
 //! created.
 
 pub use forge_ir::interp::RtValue;
-use forge_ir::Function;
+use forge_ir::{Function, Value};
 use forge_mem::{CompiledExpr, ExecutableBuffer};
 use forge_syntax::Diagnostic;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub enum CompileError {
@@ -36,6 +37,20 @@ impl std::fmt::Display for CompileError {
 }
 
 impl std::error::Error for CompileError {}
+
+/// The inspectable output of the scalar compilation pipeline.
+///
+/// This is intentionally separate from [`CompiledFunction`]: inspection is
+/// useful on hosts that cannot execute x86-64 code (including the project's
+/// AArch64 development host), while `CompiledFunction` owns executable memory
+/// and is only available when the active target can call the emitted ABI.
+pub struct CompilationArtifacts {
+    pub function: Function,
+    pub selected: forge_x64::SelectedFunction,
+    pub intervals: Vec<forge_regalloc::Interval>,
+    pub assignment: HashMap<Value, forge_regalloc::Location>,
+    pub bytes: Vec<u8>,
+}
 
 impl From<std::io::Error> for CompileError {
     fn from(error: std::io::Error) -> Self {
@@ -103,6 +118,40 @@ pub struct CompiledFunction {
     arity: usize,
 }
 
+/// Runs the complete scalar x86 pipeline without requiring the active host
+/// to be x86-64. The result powers the CLI and workbench inspection surfaces.
+pub fn compile_artifacts(source: &str) -> Result<CompilationArtifacts, CompileError> {
+    compile_artifacts_with_optimization(source, true)
+}
+
+/// Like [`compile_artifacts`], but allows inspection tools to request the
+/// unoptimized baseline. `false` means that only frontend lowering and IR
+/// verification run; `true` runs the complete current scalar optimization
+/// pipeline.
+pub fn compile_artifacts_with_optimization(
+    source: &str,
+    optimize: bool,
+) -> Result<CompilationArtifacts, CompileError> {
+    let mut function = lower_source(source)?;
+    if optimize {
+        forge_opt::optimize(&mut function);
+    }
+    forge_ir::verify::verify(&function).map_err(CompileError::Ir)?;
+    let selected = forge_x64::select(&function);
+    let intervals = forge_regalloc::build_intervals(&function, &selected);
+    let excluded = forge_regalloc::excluded_registers(&function, &selected);
+    let (assignment, _) = forge_regalloc::allocate(intervals.clone(), &excluded, &selected);
+    forge_regalloc::verify_allocation(&intervals, &assignment).map_err(CompileError::Allocation)?;
+    let bytes = forge_emit::emit_body(&function, &selected, &assignment);
+    Ok(CompilationArtifacts {
+        function,
+        selected,
+        intervals,
+        assignment,
+        bytes,
+    })
+}
+
 impl CompiledFunction {
     pub fn arity(&self) -> usize {
         self.arity
@@ -168,6 +217,20 @@ mod tests {
     #[test]
     fn evaluate_runs_on_the_active_execution_path() {
         assert_eq!(evaluate("x * x + 1", &[3.0]).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn artifact_pipeline_can_preserve_unoptimized_ir() {
+        let baseline = compile_artifacts_with_optimization("x * 1.0", false).unwrap();
+        let optimized = compile_artifacts_with_optimization("x * 1.0", true).unwrap();
+        let live_count = |function: &Function| {
+            function
+                .blocks
+                .iter()
+                .map(|block| block.insts.len())
+                .sum::<usize>()
+        };
+        assert!(live_count(&optimized.function) < live_count(&baseline.function));
     }
 
     #[cfg(target_arch = "x86_64")]

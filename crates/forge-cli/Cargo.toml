@@ -5,4 +5,10 @@ edition.workspace = true
 
 [dependencies]
 forge-ir = { path = "../forge-ir" }
+forge-opt = { path = "../forge-opt" }
+forge-emit = { path = "../forge-emit" }
+forge-regalloc = { path = "../forge-regalloc" }
 forge-runtime = { path = "../forge-runtime" }
+forge-simd = { path = "../forge-simd" }
+forge-wasm = { path = "../forge-wasm" }
+forge-x64 = { path = "../forge-x64" }
