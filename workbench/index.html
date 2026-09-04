@@ -17,7 +17,8 @@
   <body>
     <h1>Forge workbench</h1>
     <p>Source and argument runner. Load a <code>forge-wasm-api</code> bundle as
-      <code>window.forgeWasm</code> to enable execution.</p>
+      <code>window.forgeWasm</code> to enable execution. The emitted WASM
+      module is instantiated in the browser when available.</p>
     <label for="source">Expression</label>
     <textarea id="source">sqrt(x * x + y * y)</textarea>
     <div class="row">
@@ -30,11 +31,27 @@
       document.querySelector('#run').addEventListener('click', async () => {
         const source = document.querySelector('#source').value;
         const args = document.querySelector('#args').value.split(',').filter(Boolean).map(Number);
-        if (!globalThis.forgeWasm?.run) {
+        const api = globalThis.forgeWasm;
+        if (!api) {
           output.textContent = 'No forge-wasm-api bundle loaded.';
           return;
         }
-        try { output.textContent = String(await globalThis.forgeWasm.run(source, args)); }
+        try {
+          const compile = api.compile_wasm ?? api.compile;
+          const run = api.run_wasm ?? api.run;
+          if (compile) {
+            const bytes = compile(source);
+            const { instance } = await WebAssembly.instantiate(bytes, {});
+            if (typeof instance.exports.eval !== 'function') {
+              throw new Error('compiled module does not export eval');
+            }
+            output.textContent = `WASM: ${instance.exports.eval(...args)}`;
+          } else if (run) {
+            output.textContent = `Interpreter: ${await run(source, args)}`;
+          } else {
+            throw new Error('forge-wasm-api exposes neither compile nor run');
+          }
+        }
         catch (error) { output.textContent = String(error); }
       });
     </script>
