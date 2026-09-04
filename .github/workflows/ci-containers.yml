@@ -19,7 +19,7 @@ jobs:
       - name: Test, lint, and format
         run: >-
           docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
-          forge-rust-ci:amd64 sh -lc
+          forge-rust-ci:amd64 sh -c
           'cargo test --workspace --locked &&
           cargo clippy --workspace --all-targets -- -D warnings &&
           cargo fmt --all -- --check'
@@ -45,14 +45,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build pinned Rust image
-        run: docker build --platform linux/amd64 -f containers/Dockerfile.rust-ci -t forge-rust-ci:wasm .
+      - name: Build pinned WASM Rust image
+        run: docker build --platform linux/amd64 -f containers/Dockerfile.wasm-ci -t forge-rust-ci:wasm .
       - name: Check wasm-bindgen API for wasm32
         run: >-
           docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
-          forge-rust-ci:wasm sh -lc
-          'rustup target add wasm32-unknown-unknown &&
-          cargo check -p forge-wasm-api --target wasm32-unknown-unknown --locked'
+          forge-rust-ci:wasm cargo check -p forge-wasm-api
+          --target wasm32-unknown-unknown --locked
 
   workbench:
     name: Workbench container
