@@ -9,7 +9,7 @@ RUN apt-get update \
 # reproducible container rather than depending on the host runner.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal --default-toolchain 1.87.0 \
-    && /root/.cargo/bin/rustup target add wasm32-unknown-unknown \
+    && rustup target add wasm32-unknown-unknown \
     && rm -rf /root/.rustup/downloads /root/.rustup/tmp
 
 ENV PATH="/root/.cargo/bin:/usr/local/cargo/bin:${PATH}"
