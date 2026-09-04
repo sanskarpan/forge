@@ -476,6 +476,83 @@ impl CompiledExpr {
         unsafe { f(x, y) }
     }
 
+    /// Calls a compiled function using the platform C ABI's scalar f64
+    /// argument registers. This is distinct from [`Self::call_n`], whose
+    /// pointer argument is useful for array-style entry points but is not the
+    /// ABI emitted for ordinary scalar parameters by `forge-emit`.
+    pub fn call_args(&self, args: &[f64]) -> f64 {
+        assert_eq!(
+            args.len(),
+            self.arity,
+            "arity mismatch: compiled for {} argument(s), called with {}",
+            self.arity,
+            args.len()
+        );
+        assert!(
+            args.len() <= 8,
+            "scalar f64 calls support at most 8 ABI register arguments"
+        );
+        assert_eq!(
+            self.buf.state(),
+            ProtState::Executable,
+            "cannot call a CompiledExpr whose buffer was never made executable"
+        );
+
+        // SAFETY: the arity and executable state are checked above, and each
+        // function-pointer type below exactly matches the platform C ABI used
+        // by the scalar emitter for that argument count. `args` has already
+        // been checked to contain every argument passed to the callee.
+        unsafe {
+            match args {
+                [] => {
+                    let f: unsafe extern "C" fn() -> f64 = std::mem::transmute(self.buf.as_ptr());
+                    f()
+                }
+                [a] => {
+                    let f: unsafe extern "C" fn(f64) -> f64 =
+                        std::mem::transmute(self.buf.as_ptr());
+                    f(*a)
+                }
+                [a, b] => {
+                    let f: unsafe extern "C" fn(f64, f64) -> f64 =
+                        std::mem::transmute(self.buf.as_ptr());
+                    f(*a, *b)
+                }
+                [a, b, c] => {
+                    let f: unsafe extern "C" fn(f64, f64, f64) -> f64 =
+                        std::mem::transmute(self.buf.as_ptr());
+                    f(*a, *b, *c)
+                }
+                [a, b, c, d] => {
+                    let f: unsafe extern "C" fn(f64, f64, f64, f64) -> f64 =
+                        std::mem::transmute(self.buf.as_ptr());
+                    f(*a, *b, *c, *d)
+                }
+                [a, b, c, d, e] => {
+                    let f: unsafe extern "C" fn(f64, f64, f64, f64, f64) -> f64 =
+                        std::mem::transmute(self.buf.as_ptr());
+                    f(*a, *b, *c, *d, *e)
+                }
+                [a, b, c, d, e, g] => {
+                    let f: unsafe extern "C" fn(f64, f64, f64, f64, f64, f64) -> f64 =
+                        std::mem::transmute(self.buf.as_ptr());
+                    f(*a, *b, *c, *d, *e, *g)
+                }
+                [a, b, c, d, e, g, h] => {
+                    let f: unsafe extern "C" fn(f64, f64, f64, f64, f64, f64, f64) -> f64 =
+                        std::mem::transmute(self.buf.as_ptr());
+                    f(*a, *b, *c, *d, *e, *g, *h)
+                }
+                [a, b, c, d, e, g, h, i] => {
+                    let f: unsafe extern "C" fn(f64, f64, f64, f64, f64, f64, f64, f64) -> f64 =
+                        std::mem::transmute(self.buf.as_ptr());
+                    f(*a, *b, *c, *d, *e, *g, *h, *i)
+                }
+                _ => unreachable!("argument count was limited to eight above"),
+            }
+        }
+    }
+
     pub fn call_n(&self, args: &[f64]) -> f64 {
         // >= rather than == : the compiled function is only guaranteed to
         // read the first `arity` elements through the raw pointer below, so
@@ -653,7 +730,7 @@ mod tests {
         });
         buf.make_executable().unwrap();
         let compiled = CompiledExpr::from_buffer(buf, 1);
-        assert_eq!(compiled.call1(3.5), 3.5);
+        assert_eq!(compiled.call_args(&[3.5]), 3.5);
     }
 
     #[test]
@@ -673,7 +750,7 @@ mod tests {
         });
         buf.make_executable().unwrap();
         let compiled = CompiledExpr::from_buffer(buf, 2);
-        assert_eq!(compiled.call2(2.0, 3.0), 5.0);
+        assert_eq!(compiled.call_args(&[2.0, 3.0]), 5.0);
     }
 
     #[test]
