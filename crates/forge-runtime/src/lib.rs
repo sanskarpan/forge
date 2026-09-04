@@ -121,8 +121,21 @@ pub struct CompiledFunction {
 /// Runs the complete scalar x86 pipeline without requiring the active host
 /// to be x86-64. The result powers the CLI and workbench inspection surfaces.
 pub fn compile_artifacts(source: &str) -> Result<CompilationArtifacts, CompileError> {
+    compile_artifacts_with_optimization(source, true)
+}
+
+/// Like [`compile_artifacts`], but allows inspection tools to request the
+/// unoptimized baseline. `false` means that only frontend lowering and IR
+/// verification run; `true` runs the complete current scalar optimization
+/// pipeline.
+pub fn compile_artifacts_with_optimization(
+    source: &str,
+    optimize: bool,
+) -> Result<CompilationArtifacts, CompileError> {
     let mut function = lower_source(source)?;
-    forge_opt::optimize(&mut function);
+    if optimize {
+        forge_opt::optimize(&mut function);
+    }
     forge_ir::verify::verify(&function).map_err(CompileError::Ir)?;
     let selected = forge_x64::select(&function);
     let intervals = forge_regalloc::build_intervals(&function, &selected);
@@ -204,6 +217,20 @@ mod tests {
     #[test]
     fn evaluate_runs_on_the_active_execution_path() {
         assert_eq!(evaluate("x * x + 1", &[3.0]).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn artifact_pipeline_can_preserve_unoptimized_ir() {
+        let baseline = compile_artifacts_with_optimization("x * 1.0", false).unwrap();
+        let optimized = compile_artifacts_with_optimization("x * 1.0", true).unwrap();
+        let live_count = |function: &Function| {
+            function
+                .blocks
+                .iter()
+                .map(|block| block.insts.len())
+                .sum::<usize>()
+        };
+        assert!(live_count(&optimized.function) < live_count(&baseline.function));
     }
 
     #[cfg(target_arch = "x86_64")]
