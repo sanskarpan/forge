@@ -1,32 +1,51 @@
 use forge_ir::{Block, Function, Ty, Value};
-use forge_regalloc::Location;
-use forge_x64::{Assembler, ConditionCode, MachineInst, PhysReg, SelectedFunction};
-use std::collections::HashMap;
+use forge_regalloc::{build_intervals, def_of, reads_of, Location, RegClass};
+use forge_x64::{AluOp, Assembler, ConditionCode, MachineInst, PhysReg, SelectedFunction};
+use std::collections::{HashMap, HashSet};
 
 use crate::const_pool::{alloc_pool_labels, place_pool};
 use crate::translate::translate_inst;
 
-/// Lowers `selected` (register-only operands — every `Value` in `assignment`
-/// must be `Location::Reg`) into a runnable, self-contained x86-64 byte
-/// sequence: real control flow, constant pool placed after the code, and a
-/// bare `ret` after each `Return`'s value-placement move (Phase 9a owns its
-/// own `ret` emission; splicing a real prologue/epilogue around this is
-/// Phase 9f's job).
+struct EmitContext<'a> {
+    intervals: &'a HashMap<Value, (u32, u32)>,
+    assignment: &'a HashMap<Value, Location>,
+    framed: bool,
+}
+
+/// Lowers a selected function into a self-contained x86-64 code sequence.
+/// Spilled values are reloaded into allocator-reserved scratch registers and
+/// written back after their defining instruction. A frame is emitted only
+/// when the allocation contains spills.
 pub fn emit_body(
     func: &Function,
     selected: &SelectedFunction,
     assignment: &HashMap<Value, Location>,
 ) -> Vec<u8> {
     let mut asm = Assembler::new();
-    let loc = |v: Value| match assignment[&v] {
-        Location::Reg(r) => r,
-        Location::Spill(_) => {
-            panic!("forge-emit (Phase 9a): spilled operand not yet supported — Phase 9c")
-        }
-    };
+    let intervals = build_intervals(func, selected)
+        .into_iter()
+        .map(|iv| (iv.value, (iv.start, iv.end)))
+        .collect::<HashMap<_, _>>();
+    let framed = assignment.values().any(|l| matches!(l, Location::Spill(_)));
+    let spill_bytes = assignment
+        .values()
+        .filter_map(|l| match l {
+            Location::Spill(slot) => Some(slot.saturating_add(1)),
+            Location::Reg(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_mul(8);
+    let callee_saved: Vec<PhysReg> = forge_x64::SYSV_CALLEE_SAVED
+        .iter()
+        .copied()
+        .filter(|r| assignment.values().any(|l| *l == Location::Reg(*r)))
+        .collect();
+    if framed {
+        forge_x64::emit_prologue(&mut asm, &callee_saved, spill_bytes);
+    }
 
     let pool_labels = alloc_pool_labels(&mut asm, &selected.pool);
-
     let block_labels: HashMap<Block, forge_x64::Label> = selected
         .block_starts
         .iter()
@@ -39,11 +58,71 @@ pub fn emit_body(
             .get(i + 1)
             .map(|&(_, s)| s)
             .unwrap_or(selected.insts.len());
-
         asm.bind(block_labels[&block]);
 
-        for inst in &selected.insts[start..end] {
+        for (offset, inst) in selected.insts[start..end].iter().enumerate() {
+            let position = start + offset;
+            let scratch = assign_spill_scratch(func, selected, assignment, inst);
+            let loc = |v: Value| match assignment[&v] {
+                Location::Reg(r) => r,
+                Location::Spill(_) => scratch[&v],
+            };
+
+            let mut loaded = HashSet::new();
+            for value in reads_of(inst) {
+                if loaded.insert(value) {
+                    if let Location::Spill(slot) = assignment[&value] {
+                        let reg = scratch[&value];
+                        if value_ty(func, selected, value) == Ty::F64 {
+                            asm.movsd_reg_mem(reg, PhysReg::Rbp, spill_offset(slot));
+                        } else {
+                            asm.mov_reg_mem(reg, PhysReg::Rbp, spill_offset(slot));
+                        }
+                    }
+                }
+            }
+
             match inst {
+                MachineInst::Param { dst, index } => {
+                    emit_param(func, *index, loc(*dst), &mut asm);
+                }
+                MachineInst::CallLibm {
+                    dst,
+                    func: libm,
+                    args,
+                } => {
+                    emit_libm_call(
+                        &mut asm,
+                        *libm,
+                        args,
+                        &loc,
+                        loc(*dst),
+                        position,
+                        &EmitContext {
+                            intervals: &intervals,
+                            assignment,
+                            framed,
+                        },
+                    );
+                }
+                MachineInst::IntDiv { .. } | MachineInst::IntRem { .. } => {
+                    let saved = live_gpr_registers(
+                        position,
+                        &intervals,
+                        assignment,
+                        &[PhysReg::Rax, PhysReg::Rdx],
+                    );
+                    with_saved_gprs(&mut asm, &saved, framed, |asm| {
+                        translate_inst(asm, inst, &loc, &pool_labels);
+                    });
+                }
+                MachineInst::Shl { .. } | MachineInst::Shr { .. } | MachineInst::Sar { .. } => {
+                    let saved =
+                        live_gpr_registers(position, &intervals, assignment, &[PhysReg::Rcx]);
+                    with_saved_gprs(&mut asm, &saved, framed, |asm| {
+                        translate_inst(asm, inst, &loc, &pool_labels);
+                    });
+                }
                 MachineInst::Jump { target } => asm.jmp(block_labels[target]),
                 MachineInst::Branch { cond, then_, else_ } => {
                     let cond_r = loc(*cond);
@@ -53,47 +132,292 @@ pub fn emit_body(
                 }
                 MachineInst::Return { value } => {
                     let value_r = loc(*value);
-                    let ret_r = if value_ty(func, selected, *value) == Ty::F64 {
+                    let value_ty = value_ty(func, selected, *value);
+                    let ret_r = if value_ty == Ty::F64 {
                         PhysReg::Xmm0
                     } else {
                         PhysReg::Rax
                     };
                     if value_r != ret_r {
-                        if ret_r == PhysReg::Xmm0 {
+                        if value_ty == Ty::F64 {
                             asm.movsd_reg_reg(ret_r, value_r);
                         } else {
                             asm.mov_reg_reg(ret_r, value_r);
                         }
                     }
-                    asm.ret();
+                    if framed {
+                        forge_x64::emit_epilogue(&mut asm, &callee_saved, spill_bytes);
+                    } else {
+                        asm.ret();
+                    }
                 }
                 other => translate_inst(&mut asm, other, &loc, &pool_labels),
+            }
+
+            if let Some(dst) = def_of(inst) {
+                if let Location::Spill(slot) = assignment[&dst] {
+                    let reg = scratch[&dst];
+                    if value_ty(func, selected, dst) == Ty::F64 {
+                        asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(slot), reg);
+                    } else {
+                        asm.mov_mem_reg(PhysReg::Rbp, spill_offset(slot), reg);
+                    }
+                }
             }
         }
     }
 
     place_pool(&mut asm, &selected.pool, &pool_labels);
-
     asm.code().to_vec()
 }
 
-/// Resolves `v`'s `Ty`, checking `selected.synthetic_types` first and
-/// falling back to `func.types[v.0 as usize]`.
-///
-/// This order is deliberate, not incidental: `func.types` is only valid to
-/// index with `Value`s that came from the original IR, but a selector-minted
-/// temp (e.g. Fma's `mul_tmp`) has no entry there and would either panic or
-/// (worse) silently index some unrelated IR value's slot. Checking the
-/// `HashMap` first short-circuits before that indexing ever happens, so a
-/// synthetic `Value` is resolved correctly and an IR `Value` still falls
-/// through to the array as before. This mirrors the same lookup shape
-/// `Selector::ty_of` uses in `forge-x64/src/machine_inst/mod.rs` for
-/// resolving a `Value`'s type during instruction selection.
-///
-/// At `emit_body`'s only call site (the `Return` arm), `v` always comes
-/// directly from the IR terminator, so the `synthetic_types` branch is
-/// currently unreachable in practice -- it's forward-looking/defensive
-/// should a future caller ever pass a selector-minted `Value` through here.
+fn spill_offset(slot: u32) -> i32 {
+    let bytes = slot
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(8))
+        .expect("spill frame is too large for an x86 displacement");
+    -(i32::try_from(bytes).expect("spill frame is too large for an x86 displacement"))
+}
+
+fn assign_spill_scratch(
+    func: &Function,
+    selected: &SelectedFunction,
+    assignment: &HashMap<Value, Location>,
+    inst: &MachineInst,
+) -> HashMap<Value, PhysReg> {
+    let mut out = HashMap::new();
+    let mut next = [0usize, 0usize];
+    let spill_dst_alias = match inst {
+        // IntCmov reads all three inputs before it writes its destination.
+        // Reusing the then-value's scratch register keeps this four-value
+        // machine instruction within the three-register scratch budget.
+        MachineInst::IntCmov { dst, then_val, .. }
+            if matches!(assignment[dst], Location::Spill(_))
+                && matches!(assignment[then_val], Location::Spill(_)) =>
+        {
+            Some((*dst, *then_val))
+        }
+        _ => None,
+    };
+    let mut values = reads_of(inst);
+    if let Some(dst) = def_of(inst) {
+        values.push(dst);
+    }
+    for value in values {
+        let Location::Spill(_) = assignment[&value] else {
+            continue;
+        };
+        if out.contains_key(&value) {
+            continue;
+        }
+        if let Some((dst, source)) = spill_dst_alias {
+            if value == dst {
+                let reg = *out
+                    .get(&source)
+                    .expect("IntCmov then-value scratch must be assigned before its destination");
+                out.insert(value, reg);
+                continue;
+            }
+        }
+        let class = if value_ty(func, selected, value) == Ty::F64 {
+            1
+        } else {
+            0
+        };
+        let scratch = if class == 0 {
+            forge_regalloc::SCRATCH_GPR
+        } else {
+            forge_regalloc::SCRATCH_XMM
+        };
+        let slot = next[class];
+        assert!(
+            slot < scratch.len(),
+            "instruction needs more spilled {} operands than available scratch registers",
+            if class == 0 { "GPR" } else { "XMM" }
+        );
+        out.insert(value, scratch[slot]);
+        next[class] += 1;
+    }
+    out
+}
+
+fn emit_param(func: &Function, index: u32, dst: PhysReg, asm: &mut Assembler) {
+    let ty = func.params[index as usize].1;
+    let ordinal = func.params[..index as usize]
+        .iter()
+        .filter(|(_, prior_ty)| RegClass::of(*prior_ty) == RegClass::of(ty))
+        .count();
+    let src = match RegClass::of(ty) {
+        RegClass::Gpr => forge_regalloc::SYSV_INT_ARGS[ordinal],
+        RegClass::Xmm => forge_regalloc::SYSV_FLOAT_ARGS[ordinal],
+    };
+    if dst != src {
+        if ty == Ty::F64 {
+            asm.movsd_reg_reg(dst, src);
+        } else {
+            asm.mov_reg_reg(dst, src);
+        }
+    }
+}
+
+fn live_gpr_registers(
+    position: usize,
+    intervals: &HashMap<Value, (u32, u32)>,
+    assignment: &HashMap<Value, Location>,
+    candidates: &[PhysReg],
+) -> Vec<(PhysReg, Value)> {
+    let mut out = Vec::new();
+    for (&value, &(start, end)) in intervals {
+        if start < position as u32 && end > position as u32 {
+            if let Location::Reg(reg) = assignment[&value] {
+                if candidates.contains(&reg) && !out.iter().any(|(r, _)| *r == reg) {
+                    out.push((reg, value));
+                }
+            }
+        }
+    }
+    out.sort_by_key(|(reg, _)| reg.encoding());
+    out
+}
+
+fn with_saved_gprs(
+    asm: &mut Assembler,
+    saved: &[(PhysReg, Value)],
+    framed: bool,
+    body: impl FnOnce(&mut Assembler),
+) {
+    if saved.is_empty() {
+        body(asm);
+        return;
+    }
+    let bytes = aligned_temporary_bytes(saved.len(), framed);
+    asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, bytes as i32);
+    for (i, (reg, _)) in saved.iter().enumerate() {
+        asm.mov_mem_reg(PhysReg::Rsp, (i * 8) as i32, *reg);
+    }
+    body(asm);
+    for (i, (reg, _)) in saved.iter().enumerate().rev() {
+        asm.mov_reg_mem(*reg, PhysReg::Rsp, (i * 8) as i32);
+    }
+    asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, bytes as i32);
+}
+
+fn aligned_temporary_bytes(slots: usize, framed: bool) -> usize {
+    let raw = slots * 8;
+    let desired = if framed { 0 } else { 8 };
+    raw + (desired + 16 - raw % 16) % 16
+}
+
+fn emit_libm_call(
+    asm: &mut Assembler,
+    func: forge_ir::LibFunc,
+    args: &[Value],
+    loc: &dyn Fn(Value) -> PhysReg,
+    dst: PhysReg,
+    position: usize,
+    context: &EmitContext<'_>,
+) {
+    let caller_saved = [
+        PhysReg::Rax,
+        PhysReg::Rcx,
+        PhysReg::Rdx,
+        PhysReg::Rsi,
+        PhysReg::Rdi,
+        PhysReg::R8,
+        PhysReg::R9,
+        PhysReg::R10,
+        PhysReg::R11,
+    ];
+    let mut saved = Vec::new();
+    for (&value, &(start, end)) in context.intervals {
+        if start < position as u32 && end > position as u32 {
+            if let Location::Reg(reg) = context.assignment[&value] {
+                if (caller_saved.contains(&reg) || is_xmm_reg(reg))
+                    && !saved.iter().any(|(r, _)| *r == reg)
+                {
+                    saved.push((reg, value));
+                }
+            }
+        }
+    }
+    saved.sort_by_key(|(reg, _)| (is_xmm_reg(*reg), reg.encoding()));
+    let bytes = aligned_temporary_bytes(saved.len(), context.framed);
+    asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, bytes as i32);
+    for (i, (reg, _)) in saved.iter().enumerate() {
+        if is_xmm_reg(*reg) {
+            asm.movsd_mem_reg(PhysReg::Rsp, (i * 8) as i32, *reg);
+        } else {
+            asm.mov_mem_reg(PhysReg::Rsp, (i * 8) as i32, *reg);
+        }
+    }
+
+    let sources: Vec<PhysReg> = args.iter().map(|v| loc(*v)).collect();
+    if sources.len() == 2 && sources[0] == PhysReg::Xmm1 && sources[1] == PhysReg::Xmm0 {
+        asm.movsd_reg_reg(PhysReg::Xmm15, PhysReg::Xmm0);
+        asm.movsd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
+        asm.movsd_reg_reg(PhysReg::Xmm1, PhysReg::Xmm15);
+    } else {
+        for (i, source) in sources.iter().enumerate() {
+            let target = [PhysReg::Xmm0, PhysReg::Xmm1][i];
+            if *source != target {
+                asm.movsd_reg_reg(target, *source);
+            }
+        }
+    }
+    asm.mov_reg_imm(PhysReg::R11, forge_x64::libm_address(func));
+    asm.call_reg(PhysReg::R11);
+    asm.movsd_reg_reg(PhysReg::Xmm15, PhysReg::Xmm0);
+    for (i, (reg, _)) in saved.iter().enumerate().rev() {
+        if is_xmm_reg(*reg) {
+            asm.movsd_reg_mem(*reg, PhysReg::Rsp, (i * 8) as i32);
+        } else {
+            asm.mov_reg_mem(*reg, PhysReg::Rsp, (i * 8) as i32);
+        }
+    }
+    if dst != PhysReg::Xmm15 {
+        asm.movsd_reg_reg(dst, PhysReg::Xmm15);
+    }
+    asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, bytes as i32);
+}
+
+fn is_xmm_reg(reg: PhysReg) -> bool {
+    matches!(
+        reg,
+        PhysReg::Xmm0
+            | PhysReg::Xmm1
+            | PhysReg::Xmm2
+            | PhysReg::Xmm3
+            | PhysReg::Xmm4
+            | PhysReg::Xmm5
+            | PhysReg::Xmm6
+            | PhysReg::Xmm7
+            | PhysReg::Xmm8
+            | PhysReg::Xmm9
+            | PhysReg::Xmm10
+            | PhysReg::Xmm11
+            | PhysReg::Xmm12
+            | PhysReg::Xmm13
+            | PhysReg::Xmm14
+            | PhysReg::Xmm15
+            | PhysReg::Xmm16
+            | PhysReg::Xmm17
+            | PhysReg::Xmm18
+            | PhysReg::Xmm19
+            | PhysReg::Xmm20
+            | PhysReg::Xmm21
+            | PhysReg::Xmm22
+            | PhysReg::Xmm23
+            | PhysReg::Xmm24
+            | PhysReg::Xmm25
+            | PhysReg::Xmm26
+            | PhysReg::Xmm27
+            | PhysReg::Xmm28
+            | PhysReg::Xmm29
+            | PhysReg::Xmm30
+            | PhysReg::Xmm31
+    )
+}
+
 fn value_ty(func: &Function, selected: &SelectedFunction, v: Value) -> Ty {
     selected
         .synthetic_types

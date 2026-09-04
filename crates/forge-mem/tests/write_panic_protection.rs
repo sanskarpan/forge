@@ -1,5 +1,7 @@
 // crates/forge-mem/tests/write_panic_protection.rs
 
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
 use forge_mem::ExecutableBuffer;
 
 /// Regression test for a panic-safety bug in `write()`: if the caller's
@@ -44,6 +46,7 @@ use forge_mem::ExecutableBuffer;
 /// binary means fork() only ever has to account for this one thread's
 /// state, exactly like `wx_enforcement.rs`'s use of the same technique.
 #[test]
+#[ignore = "requires a properly signed process with com.apple.security.cs.allow-jit; run explicitly on an entitled Apple Silicon binary"]
 fn a_panicking_write_leaves_the_thread_write_protected() {
     let mut buf = ExecutableBuffer::new(64).expect("allocation should succeed");
     let ptr = buf.as_ptr() as *mut u8;

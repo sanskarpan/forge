@@ -1,0 +1,18 @@
+# Pinned toolchain image for Linux and WASM checks. Build with an explicit
+# platform (`linux/amd64` or `linux/arm64`) when validating that target.
+FROM rust:1.87-bookworm
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates curl make \
+    && rm -rf /var/lib/apt/lists/*
+
+# The versioned Rust image contains rustc/cargo but does not install the
+# optional lint and formatting components. Reuse its bundled 1.87 toolchain
+# through rustup so CI and local container validation run the same checks.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain 1.87.0 \
+    && rustup component add clippy rustfmt
+
+WORKDIR /workspace
+
+CMD ["cargo", "test", "--workspace", "--locked"]

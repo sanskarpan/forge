@@ -15,6 +15,12 @@ jobs:
           components: clippy, rustfmt
       - name: cargo build
         run: cargo build --workspace
+      - name: build test executables
+        run: cargo test --workspace --no-run
+      - name: codesign test executables
+        run: |
+          find target/debug/deps -type f -perm -111 \
+            -exec codesign --force --entitlements entitlements.plist -s - {} \;
       - name: cargo test
         run: cargo test --workspace
       - name: cargo clippy

@@ -168,3 +168,40 @@ fn branch_diamond_emits_test_jcc_jmp() {
     assert_eq!(lines[6], "mov rax,1"); // then_blk (jne target)
     assert_eq!(lines[7], "ret");
 }
+
+#[test]
+fn three_spilled_operands_use_the_reserved_scratch_set() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    let lhs = b.emit(entry, Inst::ConstI64(7), Ty::I64, dummy_span());
+    let rhs = b.emit(entry, Inst::ConstI64(7), Ty::I64, dummy_span());
+    let cmp = b.emit(
+        entry,
+        Inst::Cmp {
+            op: forge_ir::CmpOp::Eq,
+            lhs,
+            rhs,
+        },
+        Ty::Bool,
+        dummy_span(),
+    );
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(cmp));
+
+    let selected = forge_x64::select(&b.f);
+    let assignment: HashMap<Value, Location> = [
+        (lhs, Location::Spill(0)),
+        (rhs, Location::Spill(1)),
+        (cmp, Location::Spill(2)),
+    ]
+    .into_iter()
+    .collect();
+
+    let code = forge_emit::emit_body(&b.f, &selected, &assignment);
+    let lines = disassemble(&code);
+    assert!(lines.iter().any(|line| line == "cmp r9,r10"));
+    assert!(
+        lines.iter().any(|line| line == "sete r11b"),
+        "expected third scratch register in {lines:?}"
+    );
+}

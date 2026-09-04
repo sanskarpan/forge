@@ -406,8 +406,8 @@ impl<'a> Selector<'a> {
             },
             Inst::Rem(a, b) => match self.ty_of(*a) {
                 Ty::I64 => self.insts.push(MachineInst::IntRem { dst, lhs: *a, rhs: *b }),
-                Ty::F64 => unimplemented!(
-                    "float remainder (fmod) has no native x86 instruction and isn't wired to a libm call yet"
+                Ty::F64 => panic!(
+                    "forge-x64: float remainder is unsupported: x86 has no scalar f64 remainder instruction; use a future fmod/libm lowering"
                 ),
                 Ty::Bool => unreachable!("Rem never applies to Bool"),
             },

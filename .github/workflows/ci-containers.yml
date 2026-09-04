@@ -1,0 +1,66 @@
+name: Container validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86:
+    name: Linux x86-64 container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned Rust image
+        run: docker build --platform linux/amd64 -f containers/Dockerfile.rust-ci -t forge-rust-ci:amd64 .
+      - name: Test, lint, and format
+        run: >-
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
+          forge-rust-ci:amd64 sh -c
+          'cargo test --workspace --locked &&
+          cargo clippy --workspace --all-targets -- -D warnings &&
+          cargo fmt --all -- --check'
+
+  linux-arm64:
+    name: Linux ARM64 container (emulated)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Build ARM64 Rust image
+        run: docker build --platform linux/arm64 -f containers/Dockerfile.rust-ci -t forge-rust-ci:arm64 .
+      - name: Run ARM64 correctness tests
+        run: >-
+          docker run --rm --platform linux/arm64
+          -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
+          forge-rust-ci:arm64 cargo test --workspace --locked
+
+  wasm:
+    name: WASM container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned WASM Rust image
+        run: docker build --platform linux/amd64 -f containers/Dockerfile.wasm-ci -t forge-rust-ci:wasm .
+      - name: Check wasm-bindgen API for wasm32
+        run: >-
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
+          forge-rust-ci:wasm cargo check -p forge-wasm-api
+          --target wasm32-unknown-unknown --locked
+
+  workbench:
+    name: Workbench container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Node image
+        run: docker build --platform linux/amd64 -f containers/Dockerfile.workbench -t forge-workbench-ci:22 .
+      - name: Run workbench smoke test
+        run: >-
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
+          forge-workbench-ci:22

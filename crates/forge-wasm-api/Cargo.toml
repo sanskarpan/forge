@@ -4,3 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+forge-wasm = { path = "../forge-wasm" }
+wasm-bindgen = "0.2"

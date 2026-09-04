@@ -424,9 +424,13 @@ fn validate_param_abi_capacity(func: &Function) {
 }
 
 /// Per-(instruction position, Value) register exclusions -- currently
-/// only populated for IntDiv/IntRem's rhs (divisor), which must never be
-/// assigned Rax or Rdx (cqo/idiv would destroy it before idiv ever reads
-/// it -- see the design doc's idiv-clobber resolution, sub-problem 2).
+/// populated for IntDiv/IntRem's rhs (divisor), which must never be assigned
+/// Rax or Rdx (cqo/idiv would destroy it before idiv ever reads it), and for
+/// variable shifts. x86 variable shifts read their count from CL, so a shift
+/// count is constrained to Rcx while the value and destination are excluded
+/// from Rcx. These are whole-interval exclusions because this allocator does
+/// not split intervals; emission can then use the real hardware constraint
+/// without silently displacing an unrelated live value.
 /// 8b's design doc consumes this as an extra candidate-set filter in
 /// pick_register, on top of ordinary availability.
 ///
@@ -446,6 +450,18 @@ pub fn excluded_registers(
                     (i, *rhs),
                     vec![forge_x64::PhysReg::Rax, forge_x64::PhysReg::Rdx],
                 );
+            }
+            forge_x64::MachineInst::Shl { dst, lhs, rhs }
+            | forge_x64::MachineInst::Shr { dst, lhs, rhs }
+            | forge_x64::MachineInst::Sar { dst, lhs, rhs } => {
+                let count_excluded = crate::linear_scan::ALLOCATABLE_GPR
+                    .iter()
+                    .copied()
+                    .filter(|&r| r != forge_x64::PhysReg::Rcx)
+                    .collect();
+                excluded.insert((i, *rhs), count_excluded);
+                excluded.insert((i, *dst), vec![forge_x64::PhysReg::Rcx]);
+                excluded.insert((i, *lhs), vec![forge_x64::PhysReg::Rcx]);
             }
             _ => {}
         }

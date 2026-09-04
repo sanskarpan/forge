@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 /// Exhaustive over every current MachineInst variant, no wildcard --
 /// mirrors select_inst's own discipline: a newly-added MachineInst
 /// variant must get a real arm here, or this fails to compile.
-pub(crate) fn reads_of(inst: &MachineInst) -> Vec<Value> {
+pub fn reads_of(inst: &MachineInst) -> Vec<Value> {
     match inst {
         MachineInst::LoadImmI64 { .. } | MachineInst::LoadImmF64 { .. } => vec![],
         MachineInst::IntAdd { lhs, rhs, .. }
@@ -58,7 +58,7 @@ pub(crate) fn reads_of(inst: &MachineInst) -> Vec<Value> {
 /// terminator variants (Jump/Branch/Return) define nothing -- everything
 /// else, `Param` included, has a real `dst`. Same no-wildcard
 /// exhaustiveness discipline as `reads_of` above.
-pub(crate) fn def_of(inst: &MachineInst) -> Option<Value> {
+pub fn def_of(inst: &MachineInst) -> Option<Value> {
     match inst {
         MachineInst::Jump { .. } | MachineInst::Branch { .. } | MachineInst::Return { .. } => None,
         MachineInst::LoadImmI64 { dst, .. }

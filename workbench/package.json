@@ -1,0 +1,9 @@
+{
+  "name": "forge-workbench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs",
+    "dev": "python3 -m http.server 4173"
+  }
+}
