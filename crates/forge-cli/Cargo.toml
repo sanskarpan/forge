@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+clap = { version = "4.6", features = ["derive"] }
 forge-ir = { path = "../forge-ir" }
 forge-opt = { path = "../forge-opt" }
 forge-emit = { path = "../forge-emit" }

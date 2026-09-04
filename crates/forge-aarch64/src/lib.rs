@@ -339,7 +339,7 @@ pub fn scvtf(dst: Gpr, src: Gpr) -> u32 {
 }
 
 pub fn ldr(dst: Gpr, base: Gpr, offset_bytes: u16) -> u32 {
-    assert!(offset_bytes % 8 == 0 && offset_bytes / 8 < 4096);
+    assert!(offset_bytes.is_multiple_of(8) && offset_bytes / 8 < 4096);
     0xf940_0000
         | (u32::from(offset_bytes / 8) << 10)
         | (u32::from(base.index()) << 5)
@@ -347,7 +347,7 @@ pub fn ldr(dst: Gpr, base: Gpr, offset_bytes: u16) -> u32 {
 }
 
 pub fn str_(src: Gpr, base: Gpr, offset_bytes: u16) -> u32 {
-    assert!(offset_bytes % 8 == 0 && offset_bytes / 8 < 4096);
+    assert!(offset_bytes.is_multiple_of(8) && offset_bytes / 8 < 4096);
     0xf900_0000
         | (u32::from(offset_bytes / 8) << 10)
         | (u32::from(base.index()) << 5)
@@ -355,12 +355,12 @@ pub fn str_(src: Gpr, base: Gpr, offset_bytes: u16) -> u32 {
 }
 
 pub fn movz(dst: Gpr, imm: u16, shift: u8) -> u32 {
-    assert!(shift % 16 == 0 && shift <= 48);
+    assert!(shift.is_multiple_of(16) && shift <= 48);
     0xd280_0000 | (u32::from(shift / 16) << 21) | (u32::from(imm) << 5) | u32::from(dst.index())
 }
 
 pub fn movk(dst: Gpr, imm: u16, shift: u8) -> u32 {
-    assert!(shift % 16 == 0 && shift <= 48);
+    assert!(shift.is_multiple_of(16) && shift <= 48);
     0xf280_0000 | (u32::from(shift / 16) << 21) | (u32::from(imm) << 5) | u32::from(dst.index())
 }
 
