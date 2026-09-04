@@ -347,8 +347,19 @@ fn cpuinfo_command(args: &[String]) -> Result<(), String> {
     }
     println!("target: {}", env::consts::ARCH);
     println!("os: {}", env::consts::OS);
+    let features = forge_simd::CpuFeatures::detect();
     println!("simd_width: {:?}", forge_simd::best_width());
     println!("simd_available: {}", forge_simd::host_supports_simd());
+    println!("sse2: {}", features.sse2);
+    println!("sse41: {}", features.sse41);
+    println!("avx: {}", features.avx);
+    println!("avx2: {}", features.avx2);
+    println!("fma: {}", features.fma);
+    println!("avx512f: {}", features.avx512f);
+    println!("avx512dq: {}", features.avx512dq);
+    println!("bmi2: {}", features.bmi2);
+    println!("neon: {}", features.neon);
+    println!("sve: {}", features.sve);
     Ok(())
 }
 
