@@ -218,14 +218,24 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 [[package]]
 name = "forge-aarch64"
 version = "0.1.0"
+dependencies = [
+ "forge-ir",
+]
 
 [[package]]
 name = "forge-bench"
 version = "0.1.0"
+dependencies = [
+ "forge-runtime",
+]
 
 [[package]]
 name = "forge-cli"
 version = "0.1.0"
+dependencies = [
+ "forge-ir",
+ "forge-runtime",
+]
 
 [[package]]
 name = "forge-emit"
@@ -283,6 +293,15 @@ dependencies = [
 [[package]]
 name = "forge-runtime"
 version = "0.1.0"
+dependencies = [
+ "forge-emit",
+ "forge-ir",
+ "forge-mem",
+ "forge-opt",
+ "forge-regalloc",
+ "forge-syntax",
+ "forge-x64",
+]
 
 [[package]]
 name = "forge-simd"
@@ -299,10 +318,17 @@ dependencies = [
 [[package]]
 name = "forge-wasm"
 version = "0.1.0"
+dependencies = [
+ "forge-ir",
+ "forge-syntax",
+]
 
 [[package]]
 name = "forge-wasm-api"
 version = "0.1.0"
+dependencies = [
+ "forge-wasm",
+]
 
 [[package]]
 name = "forge-x64"
