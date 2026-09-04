@@ -68,6 +68,9 @@ struct CompileArgs {
     opt: String,
     #[arg(long)]
     features: Option<String>,
+    /// Include the generated machine/module bytes in the report.
+    #[arg(long)]
+    emit: bool,
 }
 
 #[derive(Debug, Args)]
@@ -107,6 +110,7 @@ fn main() {
             &args.arch,
             &args.opt,
             args.features.as_deref(),
+            args.emit,
         ),
         Command::Asm(args) => inspect_command(&args.expression, Inspection::Assembly),
         Command::Ir(args) => ir_command(&args.expression, args.after.as_deref()),
@@ -228,6 +232,7 @@ fn compile_command(
     arch: &str,
     opt: &str,
     features: Option<&str>,
+    emit: bool,
 ) -> Result<(), String> {
     if !matches!(opt, "0" | "1" | "2") {
         return Err(format!("--opt must be 0, 1, or 2, got {opt:?}"));
@@ -239,17 +244,22 @@ fn compile_command(
     match arch {
         "wasm" => {
             let bytes = forge_wasm::compile(expression)?;
-            println!("target: wasm\nbytes: {}\nhex: {}", bytes.len(), hex(&bytes));
+            println!("target: wasm\nbytes: {}", bytes.len());
+            if emit {
+                println!("hex: {}", hex(&bytes));
+            }
         }
         "x86_64" => {
             let artifacts =
                 forge_runtime::compile_artifacts_with_optimization(expression, opt != "0")
                     .map_err(|e| e.to_string())?;
             println!(
-                "target: x86_64\noptimization: {opt}\nbytes: {}\nhex: {}",
-                artifacts.bytes.len(),
-                hex(&artifacts.bytes)
+                "target: x86_64\noptimization: {opt}\nbytes: {}",
+                artifacts.bytes.len()
             );
+            if emit {
+                println!("hex: {}", hex(&artifacts.bytes));
+            }
         }
         "aarch64" => {
             return Err(
