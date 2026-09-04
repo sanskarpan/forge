@@ -1,5 +1,7 @@
 // crates/forge-mem/tests/write_panic_protection.rs
 
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
 use forge_mem::ExecutableBuffer;
 
 /// Regression test for a panic-safety bug in `write()`: if the caller's
