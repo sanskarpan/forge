@@ -1,0 +1,11 @@
+# Pinned toolchain image for Linux and WASM checks. Build with an explicit
+# platform (`linux/amd64` or `linux/arm64`) when validating that target.
+FROM rust:1.87-bookworm
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+CMD ["cargo", "test", "--workspace", "--locked"]
