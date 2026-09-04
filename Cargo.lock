@@ -233,8 +233,13 @@ dependencies = [
 name = "forge-cli"
 version = "0.1.0"
 dependencies = [
+ "forge-emit",
  "forge-ir",
+ "forge-regalloc",
  "forge-runtime",
+ "forge-simd",
+ "forge-wasm",
+ "forge-x64",
 ]
 
 [[package]]
