@@ -67,21 +67,21 @@ pub const ALLOCATABLE_XMM: &[PhysReg] = &[
 /// pool LinearScan scans over (SPILL_AWARE_ALLOCATABLE_* below), not from
 /// ALLOCATABLE_GPR/ALLOCATABLE_XMM themselves, which stay exactly as 8b
 /// shipped them (still the authoritative "which PhysRegs exist and are
-/// encodable" answer). R10/R11 (not R14/R15) for GPR: R14/R15 are both
+/// encodable" answer). R9/R10/R11 (not R14/R15) for GPR: R14/R15 are both
 /// members of prologue::SYSV_CALLEE_SAVED, so reserving them would force
 /// every spilling function's prologue/epilogue to push/pop a pair of
-/// registers used only transiently; R10/R11 are caller-saved, no such
-/// cost. For XMM, Xmm14/Xmm15: ALL XMM registers are caller-saved under
+/// registers used only transiently; R9/R10/R11 are caller-saved, no such
+/// cost. For XMM, Xmm13/Xmm14/Xmm15: ALL XMM registers are caller-saved under
 /// System V, so there is no equivalent cost differential to correct for.
-pub const SCRATCH_GPR: [PhysReg; 2] = [PhysReg::R10, PhysReg::R11];
-pub const SCRATCH_XMM: [PhysReg; 2] = [PhysReg::Xmm14, PhysReg::Xmm15];
+/// Three registers are reserved because a selected instruction can have two
+/// reads plus a distinct spilled destination (for example a compare).
+pub const SCRATCH_GPR: [PhysReg; 3] = [PhysReg::R9, PhysReg::R10, PhysReg::R11];
+pub const SCRATCH_XMM: [PhysReg; 3] = [PhysReg::Xmm13, PhysReg::Xmm14, PhysReg::Xmm15];
 
-/// R10/R11 sit at indices 8-9 of ALLOCATABLE_GPR's declared order (Rax,
+/// R9/R10/R11 sit at indices 7-9 of ALLOCATABLE_GPR's declared order (Rax,
 /// Rcx, Rdx, Rbx, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15), NOT the
-/// last two entries -- `.split_at(12).0` would keep R10/R11 IN the pool
-/// while also claiming they're scratch-reserved, a direct contradiction.
-/// An explicit literal is the only construction that's correct regardless
-/// of which two registers scratch picks.
+/// last three entries. An explicit literal is the only construction that's
+/// correct regardless of which registers scratch picks.
 pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
     PhysReg::Rax,
     PhysReg::Rcx,
@@ -90,17 +90,15 @@ pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
     PhysReg::Rsi,
     PhysReg::Rdi,
     PhysReg::R8,
-    PhysReg::R9,
     PhysReg::R12,
     PhysReg::R13,
     PhysReg::R14,
     PhysReg::R15,
-]; // 14 - 2 reserved (R10, R11 excluded)
+]; // 14 - 3 reserved (R9, R10, R11 excluded)
 
-/// Xmm14/Xmm15 ARE the last two entries of ALLOCATABLE_XMM, so split_at is
-/// correct here (unlike the GPR case above, where the excluded pair isn't
-/// at the end).
-pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = ALLOCATABLE_XMM.split_at(14).0; // 16 - 2 reserved
+/// Xmm13/Xmm14/Xmm15 ARE the last three entries of ALLOCATABLE_XMM, so
+/// split_at is correct here.
+pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = ALLOCATABLE_XMM.split_at(13).0; // 16 - 3 reserved
 
 /// Excludes a `Value`'s specific registers at SPECIFIC instruction
 /// positions (8a's `excluded_registers`, keyed per position for IntDiv/
@@ -248,38 +246,23 @@ impl<'a> LinearScan<'a> {
     /// same "parameterized, tested with synthetic values" pattern Phase
     /// 7d used for emit_prologue/emit_epilogue.
     ///
-    /// Deliberately narrow: handles ONLY the no-victim case. A genuine
-    /// eviction (some OTHER active interval already holds `phys`) needs
-    /// a real reassignment strategy this slice does not have cheaply --
-    /// choosing the victim's replacement register from the CURRENT
-    /// free_regs snapshot would be unsound (free_regs reflects
-    /// availability at the CURRENT scan position, not across the
-    /// victim's own [start, end]). Since there's no real producer to
-    /// correctness-test a reassignment against, this is deferred with a
-    /// clear panic rather than built unsoundly -- exactly like
-    /// spill_at_interval below.
+    /// A fixed interval cannot be assigned a different register. If another
+    /// active interval owns the required register, spill that victim and
+    /// hand the register directly to the fixed interval. The emitter will
+    /// reload the victim from its spill slot at later uses.
     fn evict_and_assign(&mut self, i: usize, phys: PhysReg) {
         if let Some(&victim) = self
             .active
             .iter()
             .find(|&&j| self.location_of(j) == Some(Location::Reg(phys)))
         {
-            unimplemented!(
-                "evicting an active interval to satisfy a fixed-register requirement needs a \
-                 real reassignment strategy (not built -- see the Phase 8b design doc's \
-                 'evict_and_assign' section for why this is deliberately deferred rather than \
-                 built unsoundly) -- Interval {:?} at {:?} would need to be evicted from \
-                 {phys:?} to satisfy Interval {i} ({:?})'s fixed requirement, and no real \
-                 Interval::fixed producer exists yet to force this path outside a hand-constructed \
-                 test, so there is no pressure to solve it correctly. Phase 8c built the spill \
-                 machinery that is the likely answer (treat the victim as a spill) and \
-                 deliberately did NOT wire it in here -- with Interval::fixed still having no \
-                 real producer, there is still nothing to correctness-test a reassignment \
-                 against, so this stays a loud panic rather than speculative generality",
-                victim,
-                self.intervals[victim].value,
-                self.intervals[i].value
-            );
+            if self.intervals[victim].fixed == Some(phys) {
+                panic!(
+                    "two overlapping fixed intervals require {phys:?}: {:?} and {:?}",
+                    self.intervals[victim].value, self.intervals[i].value
+                );
+            }
+            self.spill(victim);
         }
         self.free_regs.remove(&phys);
         self.assign(i, Location::Reg(phys));
@@ -550,8 +533,8 @@ mod tests {
         let spill_aware: HashSet<PhysReg> = SPILL_AWARE_ALLOCATABLE_GPR.iter().copied().collect();
         let original: HashSet<PhysReg> = ALLOCATABLE_GPR.iter().copied().collect();
 
-        assert_eq!(scratch.len(), 2);
-        assert_eq!(spill_aware.len(), 12);
+        assert_eq!(scratch.len(), 3);
+        assert_eq!(spill_aware.len(), 11);
         assert!(
             scratch.is_disjoint(&spill_aware),
             "a register can't be both scratch-reserved and ordinarily allocatable"
@@ -566,7 +549,7 @@ mod tests {
         // matters: pick_register's fallback scans `allocatable` in its
         // declared order (see pick_register_falls_back_to_free_register_
         // when_hint_unusable, which pins ALLOCATABLE_GPR[1] specifically),
-        // so a mutation reordering these same 12 registers would silently
+        // so a mutation reordering these same 11 registers would silently
         // change tie-breaking preference while still passing every
         // assertion above.
         assert_eq!(
@@ -579,7 +562,6 @@ mod tests {
                 PhysReg::Rsi,
                 PhysReg::Rdi,
                 PhysReg::R8,
-                PhysReg::R9,
                 PhysReg::R12,
                 PhysReg::R13,
                 PhysReg::R14,
@@ -594,8 +576,8 @@ mod tests {
         let spill_aware: HashSet<PhysReg> = SPILL_AWARE_ALLOCATABLE_XMM.iter().copied().collect();
         let original: HashSet<PhysReg> = ALLOCATABLE_XMM.iter().copied().collect();
 
-        assert_eq!(scratch.len(), 2);
-        assert_eq!(spill_aware.len(), 14);
+        assert_eq!(scratch.len(), 3);
+        assert_eq!(spill_aware.len(), 13);
         assert!(scratch.is_disjoint(&spill_aware));
         let union: HashSet<PhysReg> = scratch.union(&spill_aware).copied().collect();
         assert_eq!(union, original);
@@ -603,11 +585,11 @@ mod tests {
 
     #[test]
     fn scratch_gpr_is_caller_saved_not_callee_saved() {
-        // R10/R11, not R14/R15 -- R14/R15 are members of
+        // R9/R10/R11, not R14/R15 -- R14/R15 are members of
         // prologue::SYSV_CALLEE_SAVED, which would force every spilling
         // function's prologue/epilogue to push/pop a pair of registers
-        // used only transiently. R10/R11 have no such cost.
-        assert_eq!(SCRATCH_GPR, [PhysReg::R10, PhysReg::R11]);
+        // used only transiently. R9/R10/R11 have no such cost.
+        assert_eq!(SCRATCH_GPR, [PhysReg::R9, PhysReg::R10, PhysReg::R11]);
         for r in SCRATCH_GPR {
             assert!(
                 !forge_x64::SYSV_CALLEE_SAVED.contains(&r),
@@ -914,8 +896,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "evicting an active interval")]
-    fn evict_and_assign_with_a_victim_panics() {
+    fn evict_and_assign_spills_a_non_fixed_victim() {
         let occupant = iv(0, 0, 10, crate::interval::RegClass::Gpr);
         let fixed_iv = {
             let mut v = iv(1, 3, 5, crate::interval::RegClass::Gpr);
@@ -931,7 +912,29 @@ mod tests {
         scan.assign(0, Location::Reg(PhysReg::Rax));
         scan.active.push(0);
 
-        scan.evict_and_assign(1, PhysReg::Rax); // must panic -- Rax already occupied
+        scan.evict_and_assign(1, PhysReg::Rax);
+
+        assert_eq!(scan.assignment[&Value(0)], Location::Spill(0));
+        assert_eq!(scan.assignment[&Value(1)], Location::Reg(PhysReg::Rax));
+        assert_eq!(scan.active, vec![1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "two overlapping fixed intervals")]
+    fn evict_and_assign_rejects_two_fixed_intervals_in_one_register() {
+        let mut first = iv(0, 0, 10, crate::interval::RegClass::Gpr);
+        first.fixed = Some(PhysReg::Rax);
+        let mut second = iv(1, 3, 5, crate::interval::RegClass::Gpr);
+        second.fixed = Some(PhysReg::Rax);
+        let mut scan = LinearScan::new(
+            vec![first, second],
+            &HashMap::new(),
+            ALLOCATABLE_GPR,
+            Vec::new(),
+        );
+        scan.assign(0, Location::Reg(PhysReg::Rax));
+        scan.active.push(0);
+        scan.evict_and_assign(1, PhysReg::Rax);
     }
 
     #[test]
@@ -1488,17 +1491,17 @@ mod tests {
         // the XMM pass restarting its own cursor at 0 -- two genuinely
         // overlapping values, one per class, landed on the same slot.
         //
-        // 13 GPR intervals all sharing the exact range [0,100] -- the
-        // SPILL_AWARE_ALLOCATABLE_GPR pool has only 12 registers, so
+        // 12 GPR intervals all sharing the exact range [0,100] -- the
+        // SPILL_AWARE_ALLOCATABLE_GPR pool has only 11 registers, so
         // exactly the 13th (last-processed, tie-broken by Value order)
         // must spill.
-        let mut intervals: Vec<Interval> = (0..13)
+        let mut intervals: Vec<Interval> = (0..12)
             .map(|n| iv(n, 0, 100, crate::interval::RegClass::Gpr))
             .collect();
-        // 15 XMM intervals, same range [0,100] -- genuinely overlaps the
-        // GPR spill above. SPILL_AWARE_ALLOCATABLE_XMM has only 14
+        // 14 XMM intervals, same range [0,100] -- genuinely overlaps the
+        // GPR spill above. SPILL_AWARE_ALLOCATABLE_XMM has only 13
         // registers, so exactly one of these must also spill.
-        intervals.extend((100..115).map(|n| iv(n, 0, 100, crate::interval::RegClass::Xmm)));
+        intervals.extend((100..114).map(|n| iv(n, 0, 100, crate::interval::RegClass::Xmm)));
 
         let selected = selected_fn(vec![]);
         let (assignment, bytes) = allocate(intervals.clone(), &HashMap::new(), &selected);
@@ -1510,7 +1513,7 @@ mod tests {
                 Location::Spill(s) => Some(s),
                 Location::Reg(_) => None,
             })
-            .expect("13 GPR intervals into a 12-register pool must produce exactly one spill");
+            .expect("12 GPR intervals into an 11-register pool must produce exactly one spill");
         let xmm_spill_slot = intervals
             .iter()
             .filter(|iv| iv.reg_class == crate::interval::RegClass::Xmm)
@@ -1518,7 +1521,7 @@ mod tests {
                 Location::Spill(s) => Some(s),
                 Location::Reg(_) => None,
             })
-            .expect("15 XMM intervals into a 14-register pool must produce exactly one spill");
+            .expect("14 XMM intervals into a 13-register pool must produce exactly one spill");
 
         assert_ne!(
             gpr_spill_slot, xmm_spill_slot,
@@ -1530,7 +1533,7 @@ mod tests {
     #[test]
     fn allocate_spills_under_pressure_with_a_valid_frame_size_and_no_overlapping_slot_reuse() {
         // 20 GPR intervals, all sharing the exact range [0,50] --
-        // SPILL_AWARE_ALLOCATABLE_GPR has 12 registers, so exactly 8 must
+        // SPILL_AWARE_ALLOCATABLE_GPR has 11 registers, so exactly 9 must
         // spill. Because every spilled interval shares the SAME range,
         // NONE can reuse another's slot (slot_end[s] < start never holds
         // when start=0 and slot_end is always >= 0) -- so this exercises
@@ -1552,17 +1555,17 @@ mod tests {
             .collect();
         assert_eq!(
             spilled.len(),
-            8,
-            "20 intervals into a 12-register pool must spill exactly 8"
+            9,
+            "20 intervals into an 11-register pool must spill exactly 9"
         );
         // Exact, not just a lower bound: every spilled interval shares the
         // SAME [0,50] range, so slot_end[s] < start (0 < 0) never holds --
-        // no spilled interval can EVER reuse another's slot here, so the 8
-        // spills deterministically occupy 8 distinct slots, i.e. exactly
-        // 8 * 8 = 64 bytes.
+        // no spilled interval can EVER reuse another's slot here, so the 9
+        // spills deterministically occupy 9 distinct slots, i.e. exactly
+        // 9 * 8 = 72 bytes.
         assert_eq!(
-            bytes, 64,
-            "8 spills that can never reuse a slot must need exactly 64 bytes"
+            bytes, 72,
+            "9 spills that can never reuse a slot must need exactly 72 bytes"
         );
 
         // Extended no-overlap property, covering Location::Spill: unlike
