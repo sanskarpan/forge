@@ -31,18 +31,17 @@ fn sse_binop(
     asm.sse_reg_reg(op, dst_r, rhs_r);
 }
 
-/// Translates one `MachineInst` (register-only operands, `Location::Reg` only)
+/// Translates one `MachineInst` whose virtual operands have already been
+/// materialized in physical registers by the layout emitter.
 /// into real bytes on `asm`. `loc` resolves a `Value` to the `PhysReg` holding
 /// it. `pool_labels[i]` is the label for the constant-pool entry at index `i`
 /// (see `alloc_pool_labels`/`place_pool`); must already be allocated (not
 /// necessarily bound yet) before any instruction referencing the pool is
 /// translated.
 ///
-/// Phase 9a scope: `Param` and `CallLibm` are not yet implemented (Phase
-/// 9b/9e). `IntDiv`/`IntRem` place the dividend/result correctly but do not
-/// yet protect an unrelated value that happens to be resident in rax/rdx
-/// (Phase 9b). `Shl`/`Shr`/`Sar` require the shift amount to already be in
-/// `Rcx` (asserted) — displacing an occupied `Rcx` is Phase 9b's job.
+/// `Param` copies from the ABI's incoming register, and `CallLibm` emits a
+/// correctly aligned indirect call. The layout emitter surrounds calls and
+/// implicit-register instructions with the required live-register saves.
 /// `Jump`/`Branch`/`Return` are handled by `layout.rs`'s `emit_body` before
 /// this function is ever called on them.
 pub fn translate_inst(
@@ -155,7 +154,13 @@ pub fn translate_inst(
             }
             asm.sse_reg_reg(SseOp::Sqrt, dst_r, dst_r);
         }
-        MachineInst::FloatRound { dst, src, mode } => asm.roundsd(*mode, loc(*dst), loc(*src)),
+        MachineInst::FloatRound { dst, src, mode } => {
+            let (dst_r, src_r) = (loc(*dst), loc(*src));
+            if dst_r != src_r {
+                asm.movsd_reg_reg(dst_r, src_r);
+            }
+            asm.roundsd(*mode, dst_r, dst_r);
+        }
 
         MachineInst::FloatAbs {
             dst,
@@ -198,11 +203,62 @@ pub fn translate_inst(
             asm.cmovcc(forge_x64::ConditionCode::Equal, dst_r, else_r);
         }
 
-        MachineInst::Param { .. } => {
-            panic!("forge-emit (Phase 9a): Param placement not yet implemented — Phase 9b")
+        MachineInst::Param { dst, index } => {
+            let dst_r = loc(*dst);
+            let src_r = if is_xmm(dst_r) {
+                forge_regalloc::SYSV_FLOAT_ARGS
+                    .get(*index as usize)
+                    .copied()
+                    .unwrap_or_else(|| panic!("float parameter index {index} exceeds SysV ABI"))
+            } else {
+                forge_regalloc::SYSV_INT_ARGS
+                    .get(*index as usize)
+                    .copied()
+                    .unwrap_or_else(|| panic!("integer parameter index {index} exceeds SysV ABI"))
+            };
+            if dst_r != src_r {
+                if is_xmm(dst_r) {
+                    asm.movsd_reg_reg(dst_r, src_r);
+                } else {
+                    asm.mov_reg_reg(dst_r, src_r);
+                }
+            }
         }
-        MachineInst::CallLibm { .. } => {
-            panic!("forge-emit (Phase 9a): CallLibm sequence not yet implemented — Phase 9e")
+        MachineInst::CallLibm { dst, func, args } => {
+            assert!(
+                !args.is_empty() && args.len() <= 2,
+                "libm call has invalid arity"
+            );
+            let dst_r = loc(*dst);
+            let arg_regs: Vec<PhysReg> = args.iter().map(|v| loc(*v)).collect();
+            // Handle the only two-argument register swap without clobbering
+            // either source. Xmm15 is reserved by the allocator for scratch
+            // traffic and therefore cannot contain another live value.
+            if arg_regs.len() == 2 && arg_regs[0] == PhysReg::Xmm1 && arg_regs[1] == PhysReg::Xmm0 {
+                asm.movsd_reg_reg(PhysReg::Xmm15, PhysReg::Xmm0);
+                asm.movsd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
+                asm.movsd_reg_reg(PhysReg::Xmm1, PhysReg::Xmm15);
+            } else {
+                for (i, &src) in arg_regs.iter().enumerate() {
+                    let abi = [PhysReg::Xmm0, PhysReg::Xmm1][i];
+                    if src != abi {
+                        asm.movsd_reg_reg(abi, src);
+                    }
+                }
+            }
+            // A JIT function enters SysV with RSP % 16 == 8. Keep the
+            // caller's stack aligned immediately before CALL.
+            asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, 8);
+            asm.mov_reg_imm(PhysReg::R11, forge_x64::libm_address(*func));
+            asm.call_reg(PhysReg::R11);
+            asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, 8);
+            assert!(
+                is_xmm(dst_r),
+                "libm result must be assigned to an XMM register"
+            );
+            if dst_r != PhysReg::Xmm0 {
+                asm.movsd_reg_reg(dst_r, PhysReg::Xmm0);
+            }
         }
 
         MachineInst::Jump { .. } | MachineInst::Branch { .. } | MachineInst::Return { .. } => {
@@ -223,7 +279,7 @@ pub fn translate_inst(
 fn assert_div_rhs_not_rax_rdx(rhs_r: PhysReg) {
     assert!(
         rhs_r != PhysReg::Rax && rhs_r != PhysReg::Rdx,
-        "forge-emit (Phase 9a): IntDiv/IntRem divisor must not be Rax/Rdx — the real allocator's \
+        "forge-emit: IntDiv/IntRem divisor must not be Rax/Rdx — the real allocator's \
          excluded_registers() prevents this; this input is malformed"
     );
 }
@@ -266,13 +322,53 @@ fn shift_op(
     if dst_r != lhs_r {
         asm.mov_reg_reg(dst_r, lhs_r);
     }
-    assert_eq!(
-        rhs_r,
-        PhysReg::Rcx,
-        "forge-emit (Phase 9a): shift amount not in RCX/CL — displacing an occupied RCX is \
-         Phase 9b's job"
-    );
+    if rhs_r != PhysReg::Rcx {
+        assert_ne!(
+            dst_r,
+            PhysReg::Rcx,
+            "variable shift destination cannot be RCX when its count is elsewhere"
+        );
+        asm.mov_reg_reg(PhysReg::Rcx, rhs_r);
+    }
     asm.shift_reg_cl(op, dst_r);
+}
+
+fn is_xmm(reg: PhysReg) -> bool {
+    matches!(
+        reg,
+        PhysReg::Xmm0
+            | PhysReg::Xmm1
+            | PhysReg::Xmm2
+            | PhysReg::Xmm3
+            | PhysReg::Xmm4
+            | PhysReg::Xmm5
+            | PhysReg::Xmm6
+            | PhysReg::Xmm7
+            | PhysReg::Xmm8
+            | PhysReg::Xmm9
+            | PhysReg::Xmm10
+            | PhysReg::Xmm11
+            | PhysReg::Xmm12
+            | PhysReg::Xmm13
+            | PhysReg::Xmm14
+            | PhysReg::Xmm15
+            | PhysReg::Xmm16
+            | PhysReg::Xmm17
+            | PhysReg::Xmm18
+            | PhysReg::Xmm19
+            | PhysReg::Xmm20
+            | PhysReg::Xmm21
+            | PhysReg::Xmm22
+            | PhysReg::Xmm23
+            | PhysReg::Xmm24
+            | PhysReg::Xmm25
+            | PhysReg::Xmm26
+            | PhysReg::Xmm27
+            | PhysReg::Xmm28
+            | PhysReg::Xmm29
+            | PhysReg::Xmm30
+            | PhysReg::Xmm31
+    )
 }
 
 /// Which bitwise sign-mask operation `float_mask_op` should apply: `Abs`
@@ -287,13 +383,14 @@ enum MaskOp {
 /// mask from the constant pool, then `andpd`/`xorpd` it into `dst`" and
 /// differ only in which bitwise op is used, so `op` picks that.
 ///
-/// The mask is loaded into `PhysReg::Xmm14` — hardcoded, not resolved via
-/// `loc`. This is not an arbitrary choice: `Xmm14` is
+/// The mask is loaded into `PhysReg::Xmm13` — hardcoded, not resolved via
+/// `loc`. This is not an arbitrary choice: `Xmm13` is
 /// `forge_regalloc::linear_scan::SCRATCH_XMM[0]`
-/// (`SCRATCH_XMM = [PhysReg::Xmm14, PhysReg::Xmm15]`), the register the real
-/// allocator reserves as scratch and never assigns to a live `Value` across
-/// a `FloatAbs`/`FloatNeg` instruction. That invariant is what makes it safe
-/// to clobber `Xmm14` here without going through `loc`/consulting
+/// (`SCRATCH_XMM = [PhysReg::Xmm13, PhysReg::Xmm14, PhysReg::Xmm15]`), the
+/// first register the real allocator reserves as scratch and never assigns
+/// to a live `Value` across a `FloatAbs`/`FloatNeg` instruction. That
+/// invariant is what makes it safe to clobber `Xmm13` here without going
+/// through `loc`/consulting
 /// liveness — if `forge-regalloc` ever reorders or changes `SCRATCH_XMM`,
 /// this hardcoded literal would silently stop matching the allocator's
 /// reserved register and this function could clobber a live value.
@@ -310,11 +407,11 @@ fn float_mask_op(
     if dst_r != src_r {
         asm.movsd_reg_reg(dst_r, src_r);
     }
-    // Xmm14 == forge_regalloc::linear_scan::SCRATCH_XMM[0]; see doc comment
+    // Xmm13 == forge_regalloc::linear_scan::SCRATCH_XMM[0]; see doc comment
     // above for the invariant this depends on.
-    asm.movsd_reg_riprel(PhysReg::Xmm14, pool_labels[mask_pool.index()]);
+    asm.movsd_reg_riprel(PhysReg::Xmm13, pool_labels[mask_pool.index()]);
     match op {
-        MaskOp::Abs => asm.andpd_reg_reg(dst_r, PhysReg::Xmm14),
-        MaskOp::Neg => asm.xorpd_reg_reg(dst_r, PhysReg::Xmm14),
+        MaskOp::Abs => asm.andpd_reg_reg(dst_r, PhysReg::Xmm13),
+        MaskOp::Neg => asm.xorpd_reg_reg(dst_r, PhysReg::Xmm13),
     }
 }
