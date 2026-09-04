@@ -164,7 +164,7 @@ impl CompiledFunction {
     /// JIT surface is intentionally restricted to all-f64 functions; mixed
     /// integer/bool execution remains available through `interpret_source`.
     pub fn call(&self, args: &[f64]) -> f64 {
-        self.code.call_n(args)
+        self.code.call_args(args)
     }
 }
 
@@ -201,6 +201,11 @@ fn compile_with_optimization(
     {
         return Err(CompileError::UnsupportedTarget(
             "the scalar JIT entry point currently accepts and returns only f64",
+        ));
+    }
+    if function.params.len() > 8 {
+        return Err(CompileError::UnsupportedTarget(
+            "the scalar JIT entry point currently supports at most 8 f64 parameters",
         ));
     }
     if optimize {
