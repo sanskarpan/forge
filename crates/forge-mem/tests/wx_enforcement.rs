@@ -40,7 +40,10 @@ use forge_mem::ExecutableBuffer;
 /// violation only kills the disposable child, not the whole test binary,
 /// and an illegal write from this process directly would be UB.
 #[test]
-#[ignore = "requires a properly signed process with com.apple.security.cs.allow-jit; run explicitly on an entitled Apple Silicon binary"]
+#[cfg_attr(
+    all(target_os = "macos", target_arch = "aarch64"),
+    ignore = "requires a properly signed process with com.apple.security.cs.allow-jit; run explicitly on an entitled Apple Silicon binary"
+)]
 fn writing_to_an_executable_page_segfaults() {
     // Only the mmap (via new()) happens in the parent -- it doesn't touch
     // any per-thread protect toggle, so sharing it with the child via
