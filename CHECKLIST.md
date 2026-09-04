@@ -18,11 +18,11 @@ implemented lower-level work is absent.
 | Fixed-register allocation conflict | Implemented: non-fixed active victims spill; overlapping fixed intervals fail explicitly | `forge-regalloc` linear-scan tests |
 | Variable shifts | Implemented with allocator constraints for RCX/CL, an emission fallback move, and preservation of unrelated live RCX values | `forge-regalloc::excluded_registers`, emitter/layout tests |
 | Float remainder | Explicitly unsupported and rejected during x86 instruction selection; no approximation is emitted | `forge-x64/src/machine_inst/mod.rs` |
-| Runtime | Implemented source lowering, optimization, selection, allocation, verification and native JIT on x86-64; verified interpreter fallback on non-x86 hosts | `crates/forge-runtime` |
-| CLI | Implemented `eval`, `ir`, and `verify`; the larger SPEC §16 inspection/REPL surface remains open | `crates/forge-cli` |
-| SIMD | Host width detection API only; packed vector emission remains open | `crates/forge-simd` |
-| AArch64 | Native target capability API plus a minimal tested scalar encoder; full compiler backend remains open | `crates/forge-aarch64` |
-| WASM | Tested minimal all-f64 WASM byte emitter plus portable interpreter facade; wasm-bindgen/full language surface remains open | `crates/forge-wasm`, `crates/forge-wasm-api` |
+| Runtime | Implemented source lowering, optimization, selection, allocation, verification, native x86-64 JIT, non-x86 interpreter fallback, and thread-safe interpreter → baseline → optimized tier promotion | `crates/forge-runtime` |
+| CLI | Implemented documented `eval`, `compile`, `asm`, `ir`, `cfg`, `regalloc`, `bench`, `verify`, `cpuinfo`, and `repl` command surface; clap/history/color/exit-code polish remains open | `crates/forge-cli` |
+| SIMD | Runtime `CpuFeatures` snapshot and deterministic f64 width selection are implemented; packed vector emission and array loops remain open | `crates/forge-simd` |
+| AArch64 | Native target capability API plus tested scalar integer/float/conversion/memory/branch/immediate encoder forms; expression backend, literal pools, and ABI frame emission remain open | `crates/forge-aarch64` |
+| WASM | Tested all-f64 scalar byte emitter including arithmetic, comparisons, conditionals, lets, min/max, and portable interpreter facade; wasm-bindgen/full language surface remains open | `crates/forge-wasm`, `crates/forge-wasm-api` |
 | Benchmarks | Reusable compiled-expression benchmark helper and allocator Criterion benchmark exist | `crates/forge-bench`, `crates/forge-regalloc/benches` |
 | Workbench | Minimal dependency-free browser shell exists; the full SPEC workbench remains open | `workbench/`, `Makefile` |
 
