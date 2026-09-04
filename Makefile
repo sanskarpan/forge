@@ -45,6 +45,7 @@ workbench:
 
 container-images:
 	$(CONTAINER_ENGINE) build -f containers/Dockerfile.rust-ci -t $(CONTAINER_RUST_IMAGE) .
+	$(CONTAINER_ENGINE) build -f containers/Dockerfile.wasm-ci -t $(CONTAINER_WASM_IMAGE) .
 	$(CONTAINER_ENGINE) build -f containers/Dockerfile.workbench -t $(CONTAINER_WORKBENCH_IMAGE) .
 
 container-test-x86:
