@@ -120,14 +120,37 @@ fn main() {
 
     if let Err(error) = result {
         eprintln!("forge-cli: {error}");
-        std::process::exit(
-            if matches!(cli.command, Command::Verify(_)) && error.starts_with("mismatch") {
-                3
-            } else {
-                1
-            },
-        );
+        std::process::exit(exit_code(&cli.command, &error));
     }
+}
+
+fn exit_code(command: &Command, error: &str) -> i32 {
+    if matches!(command, Command::Verify(_)) && error.starts_with("mismatch") {
+        return 3;
+    }
+    if is_compile_error(error) {
+        2
+    } else {
+        1
+    }
+}
+
+fn is_compile_error(error: &str) -> bool {
+    [
+        "lexing failed",
+        "parsing failed",
+        "type checking failed",
+        "IR verification failed",
+        "register allocation verification failed",
+        "JIT unavailable",
+        "executable memory allocation failed",
+        "unknown architecture",
+        "--opt must be",
+        "WASM backend",
+        "AArch64 currently",
+    ]
+    .iter()
+    .any(|prefix| error.starts_with(prefix))
 }
 
 fn eval_command(expression: &str, args: &[String]) -> Result<(), String> {
