@@ -1,0 +1,19 @@
+FROM rust:1.87-bookworm
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# The versioned Rust image provides rustc/cargo but not rustup. Install a
+# matching rustup toolchain so target standard libraries can be added in a
+# reproducible container rather than depending on the host runner.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain 1.87.0 \
+    && /root/.cargo/bin/rustup target add wasm32-unknown-unknown \
+    && rm -rf /root/.rustup/downloads /root/.rustup/tmp
+
+ENV PATH="/root/.cargo/bin:/usr/local/cargo/bin:${PATH}"
+
+WORKDIR /workspace
+
+CMD ["cargo", "check", "-p", "forge-wasm-api", "--target", "wasm32-unknown-unknown", "--locked"]
