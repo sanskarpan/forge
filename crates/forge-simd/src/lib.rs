@@ -67,6 +67,71 @@ impl SimdWidth {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArrayPlan {
+    pub width: SimdWidth,
+    pub elements: usize,
+    pub full_chunks: usize,
+    pub tail: usize,
+}
+
+impl ArrayPlan {
+    pub fn for_len(elements: usize) -> Self {
+        let width = best_width();
+        let lanes = width.lanes();
+        Self {
+            width,
+            elements,
+            full_chunks: elements / lanes,
+            tail: elements % lanes,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ArrayResult {
+    pub values: Vec<f64>,
+    pub plan: ArrayPlan,
+    /// False until packed vector IR and encoders land. Keeping this explicit
+    /// prevents callers from mistaking the correct scalar fallback for SIMD.
+    pub used_packed_backend: bool,
+}
+
+/// Evaluates a pure expression over one column per free f64 parameter. The
+/// planner partitions the input into full-width chunks and a scalar tail;
+/// this implementation executes each lane through the verified runtime
+/// fallback until the packed backend is available.
+pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, String> {
+    let function = forge_runtime::lower_source(source).map_err(|error| error.to_string())?;
+    if function.params.len() != columns.len()
+        || function.params.iter().any(|(_, ty)| *ty != Ty::F64)
+        || function.types.last() != Some(&Ty::F64)
+    {
+        return Err(
+            "array evaluation requires an all-f64 expression and one column per parameter"
+                .to_string(),
+        );
+    }
+    let elements = columns.first().map_or(0, |column| column.len());
+    if columns.iter().any(|column| column.len() != elements) {
+        return Err("array columns must have equal lengths".to_string());
+    }
+    let plan = ArrayPlan::for_len(elements);
+    let mut values = Vec::with_capacity(elements);
+    for index in 0..elements {
+        let args = columns
+            .iter()
+            .map(|column| column[index])
+            .collect::<Vec<_>>();
+        values.push(forge_runtime::evaluate(source, &args).map_err(|error| error.to_string())?);
+    }
+    Ok(ArrayResult {
+        values,
+        plan,
+        used_packed_backend: false,
+    })
+}
+
 /// Selects the widest implementation supported by the current host for the
 /// scalar f64 vector pipeline. The actual packed encoder remains a separate
 /// backend; this function is nevertheless useful to callers and never
@@ -137,5 +202,31 @@ mod tests {
             best_width().lanes(),
             usize::from(features.best_width(Ty::F64))
         );
+    }
+
+    #[test]
+    fn array_fallback_handles_every_tail_length() {
+        for length in 1..=100 {
+            let input = (0..length).map(|value| value as f64).collect::<Vec<_>>();
+            let result = evaluate_array("x * x + 1.0", &[&input]).unwrap();
+            let expected = input
+                .iter()
+                .map(|value| value * value + 1.0)
+                .collect::<Vec<_>>();
+            assert_eq!(result.values, expected);
+            assert!(!result.used_packed_backend);
+            assert_eq!(result.plan.elements, length);
+            assert_eq!(
+                result.plan.full_chunks * result.plan.width.lanes() + result.plan.tail,
+                length
+            );
+        }
+    }
+
+    #[test]
+    fn array_fallback_rejects_mismatched_columns() {
+        let left = [1.0, 2.0];
+        let right = [3.0];
+        assert!(evaluate_array("x + y", &[&left, &right]).is_err());
     }
 }
