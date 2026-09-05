@@ -31,6 +31,10 @@
     <h2>Emitted WASM bytes</h2>
     <pre id="hex" aria-live="polite">No compilation yet.</pre>
     <pre id="signature" aria-live="polite">No signature metadata yet.</pre>
+    <h2>AST</h2>
+    <pre id="ast" aria-live="polite">No AST artifact yet.</pre>
+    <h2>Diagnostics</h2>
+    <pre id="diagnostics" aria-live="polite">No diagnostics.</pre>
     <h2>IR stages</h2>
     <pre id="ir" aria-live="polite">No IR artifacts yet.</pre>
     <h2>Control-flow graph</h2>
@@ -40,6 +44,8 @@
       const status = document.querySelector('#status');
       const hex = document.querySelector('#hex');
       const signature = document.querySelector('#signature');
+      const ast = document.querySelector('#ast');
+      const diagnostics = document.querySelector('#diagnostics');
       const ir = document.querySelector('#ir');
       const cfg = document.querySelector('#cfg');
       let debounce;
@@ -66,6 +72,27 @@
           return;
         }
         try {
+          if (api.parse_and_check) {
+            const checked = JSON.parse(await api.parse_and_check(source));
+            if (!checked.ok) {
+              diagnostics.textContent = checked.diagnostics
+                .map(diagnostic => `${diagnostic.message} (${diagnostic.primary.start}:${diagnostic.primary.end})`)
+                .join('\n');
+              ast.textContent = 'AST unavailable until the source is valid.';
+              status.textContent = `Source ${checked.stage} failed.`;
+              output.textContent = diagnostics.textContent;
+              hex.textContent = 'No valid module emitted.';
+              signature.textContent = 'No valid signature metadata.';
+              ir.textContent = 'No valid IR artifacts.';
+              cfg.textContent = 'No valid CFG artifact.';
+              return;
+            }
+            ast.textContent = JSON.stringify(checked.ast, null, 2);
+            diagnostics.textContent = 'No diagnostics.';
+          } else {
+            ast.textContent = 'AST and diagnostics unavailable in this bundle.';
+            diagnostics.textContent = 'AST and diagnostics unavailable in this bundle.';
+          }
           const compile = api.compile_wasm ?? api.compile;
           const run = api.run_wasm ?? api.run;
           if (api.compile_artifact_json) {
@@ -105,6 +132,8 @@
           output.textContent = String(error);
           hex.textContent = 'No valid module emitted.';
           signature.textContent = 'No valid signature metadata.';
+          ast.textContent = 'No valid AST artifact.';
+          diagnostics.textContent = 'No valid diagnostics.';
           ir.textContent = 'No valid IR artifacts.';
           cfg.textContent = 'No valid CFG artifact.';
         }
