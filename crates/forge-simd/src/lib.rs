@@ -228,6 +228,7 @@ pub fn reduce_sum(source: &str, columns: &[&[f64]]) -> Result<ReductionResult, S
 trait PackedOps {
     type Vector: Copy;
     const LANES: usize;
+    const HAS_FMA: bool = false;
 
     unsafe fn splat(value: f64) -> Self::Vector;
     unsafe fn load(values: *const f64) -> Self::Vector;
@@ -238,6 +239,9 @@ trait PackedOps {
     unsafe fn div(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
     unsafe fn sqrt(value: Self::Vector) -> Self::Vector;
     unsafe fn abs(value: Self::Vector) -> Self::Vector;
+    unsafe fn fma(lhs: Self::Vector, rhs: Self::Vector, addend: Self::Vector) -> Self::Vector {
+        Self::add(Self::mul(lhs, rhs), addend)
+    }
 }
 
 fn get_packed<V: PackedOps>(values: &[Option<V::Vector>], value: Value) -> Result<V::Vector, ()> {
@@ -296,11 +300,20 @@ unsafe fn evaluate_packed<V: PackedOps>(
             Inst::Sqrt(value) => V::sqrt(get_packed::<V>(&values, *value)?),
             Inst::Abs(value) => V::abs(get_packed::<V>(&values, *value)?),
             Inst::IToF(value) => get_packed::<V>(&values, *value)?,
+            Inst::Fma { a, b, c } => {
+                if !V::HAS_FMA {
+                    return Err(());
+                }
+                V::fma(
+                    get_packed::<V>(&values, *a)?,
+                    get_packed::<V>(&values, *b)?,
+                    get_packed::<V>(&values, *c)?,
+                )
+            }
             // These operations are deliberately rejected instead of being
             // approximated: their scalar oracle semantics are not guaranteed
             // by the corresponding packed instruction on every ISA.
-            Inst::Fma { .. }
-            | Inst::Rem(..)
+            Inst::Rem(..)
             | Inst::And(..)
             | Inst::Or(..)
             | Inst::Xor(..)
@@ -338,7 +351,15 @@ fn try_evaluate_packed_chunk(
 ) -> Option<Vec<f64>> {
     #[cfg(target_arch = "x86_64")]
     if width == SimdWidth::F64x4 && std::is_x86_feature_detected!("avx2") {
-        // SAFETY: runtime feature detection proves AVX2 is available.
+        // SAFETY: runtime feature detection proves AVX2 is available. FMA is
+        // selected separately because fused multiply-add changes rounding.
+        if function_uses_fma(function) {
+            if !std::is_x86_feature_detected!("fma") {
+                return None;
+            }
+            return unsafe { evaluate_packed::<x86_packed::Avx2Fma>(function, columns, start) }
+                .ok();
+        }
         return unsafe { evaluate_packed::<x86_packed::Avx2>(function, columns, start) }.ok();
     }
     #[cfg(target_arch = "x86_64")]
@@ -356,6 +377,14 @@ fn try_evaluate_packed_chunk(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn function_uses_fma(function: &Function) -> bool {
+    function
+        .insts
+        .iter()
+        .any(|inst| matches!(inst, Inst::Fma { .. }))
+}
+
+#[cfg(target_arch = "x86_64")]
 mod x86_packed {
     use super::PackedOps;
     use std::arch::x86_64::*;
@@ -370,6 +399,7 @@ mod x86_packed {
             impl PackedOps for $name {
                 type Vector = $vector;
                 const LANES: usize = $lanes;
+                const HAS_FMA: bool = false;
 
                 #[target_feature(enable = $feature)]
                 unsafe fn splat(value: f64) -> Self::Vector {
@@ -406,6 +436,14 @@ mod x86_packed {
                 #[target_feature(enable = $feature)]
                 unsafe fn abs(value: Self::Vector) -> Self::Vector {
                     $and(value, $mask)
+                }
+                #[target_feature(enable = $feature)]
+                unsafe fn fma(
+                    lhs: Self::Vector,
+                    rhs: Self::Vector,
+                    addend: Self::Vector,
+                ) -> Self::Vector {
+                    $add($mul(lhs, rhs), addend)
                 }
             }
         };
@@ -444,6 +482,55 @@ mod x86_packed {
         _mm256_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)),
         "avx2"
     );
+
+    pub struct Avx2Fma;
+
+    impl PackedOps for Avx2Fma {
+        type Vector = __m256d;
+        const LANES: usize = 4;
+        const HAS_FMA: bool = true;
+
+        #[target_feature(enable = "avx2")]
+        unsafe fn splat(value: f64) -> Self::Vector {
+            _mm256_set1_pd(value)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn load(values: *const f64) -> Self::Vector {
+            _mm256_loadu_pd(values)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn store(value: Self::Vector, values: *mut f64) {
+            _mm256_storeu_pd(values, value)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn add(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            _mm256_add_pd(lhs, rhs)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn sub(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            _mm256_sub_pd(lhs, rhs)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn mul(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            _mm256_mul_pd(lhs, rhs)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn div(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            _mm256_div_pd(lhs, rhs)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn sqrt(value: Self::Vector) -> Self::Vector {
+            _mm256_sqrt_pd(value)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn abs(value: Self::Vector) -> Self::Vector {
+            _mm256_and_pd(value, _mm256_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)))
+        }
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn fma(lhs: Self::Vector, rhs: Self::Vector, addend: Self::Vector) -> Self::Vector {
+            _mm256_fmadd_pd(lhs, rhs, addend)
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -614,5 +701,26 @@ mod tests {
         let result = reduce_sum("if x < 2.0 then x + 1.0 else x - 1.0", &[&input]).unwrap();
         assert_eq!(result.value, 6.0);
         assert!(!result.used_packed_backend);
+    }
+
+    #[test]
+    fn fma_uses_the_fused_packed_path_only_when_available() {
+        let left = vec![1.0e16; 9];
+        let right = vec![1.0000000000000002; 9];
+        let addend = vec![-1.0e16; 9];
+        let result = evaluate_array("fma(x, y, z)", &[&left, &right, &addend]).unwrap();
+        let expected = left
+            .iter()
+            .zip(&right)
+            .zip(&addend)
+            .map(|((left, right), addend)| left.mul_add(*right, *addend))
+            .collect::<Vec<_>>();
+        assert_eq!(result.values, expected);
+        assert_eq!(
+            result.used_packed_backend,
+            result.plan.width == SimdWidth::F64x4
+                && CpuFeatures::detect().avx2
+                && CpuFeatures::detect().fma
+        );
     }
 }
