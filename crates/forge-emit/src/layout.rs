@@ -1,4 +1,4 @@
-use forge_ir::{Block, Function, Ty, Value};
+use forge_ir::{Block, Function, Inst, Ty, Value};
 use forge_regalloc::{build_intervals, def_of, reads_of, Location, RegClass};
 use forge_x64::{AluOp, Assembler, ConditionCode, MachineInst, PhysReg, SelectedFunction};
 use std::collections::{HashMap, HashSet};
@@ -123,11 +123,16 @@ pub fn emit_body(
                         translate_inst(asm, inst, &loc, &pool_labels);
                     });
                 }
-                MachineInst::Jump { target } => asm.jmp(block_labels[target]),
+                MachineInst::Jump { target } => {
+                    emit_phi_edge_copies(func, block, *target, assignment, &mut asm);
+                    asm.jmp(block_labels[target]);
+                }
                 MachineInst::Branch { cond, then_, else_ } => {
+                    emit_phi_edge_copies(func, block, *then_, assignment, &mut asm);
                     let cond_r = loc(*cond);
                     asm.test_reg_reg(cond_r, cond_r);
                     asm.jcc(ConditionCode::NotEqual, block_labels[then_]);
+                    emit_phi_edge_copies(func, block, *else_, assignment, &mut asm);
                     asm.jmp(block_labels[else_]);
                 }
                 MachineInst::Return { value } => {
@@ -169,6 +174,130 @@ pub fn emit_body(
 
     place_pool(&mut asm, &selected.pool, &pool_labels);
     asm.code().to_vec()
+}
+
+#[derive(Clone, Copy)]
+struct PhiCopy {
+    src: Location,
+    dst: Location,
+    ty: Ty,
+}
+
+/// Materializes the values selected by φ nodes on one CFG edge. φ nodes are
+/// intentionally absent from `MachineInst`; their incoming values therefore
+/// have to be copied immediately before the edge's jump. The allocator keeps
+/// spill scratch registers out of ordinary assignments, so they are safe for
+/// breaking register cycles and for spill-to-spill transfers.
+fn emit_phi_edge_copies(
+    func: &Function,
+    source: Block,
+    target: Block,
+    assignment: &HashMap<Value, Location>,
+    asm: &mut Assembler,
+) {
+    let mut copies = Vec::new();
+    for &phi in &func.blocks[target.0 as usize].insts {
+        let Inst::Phi { incoming } = &func.insts[phi.0 as usize] else {
+            continue;
+        };
+        let Some((_, incoming_value)) = incoming.iter().find(|(pred, _)| *pred == source) else {
+            continue;
+        };
+        let Some(&src) = assignment.get(incoming_value) else {
+            panic!("missing allocation for φ incoming value {incoming_value:?}");
+        };
+        let Some(&dst) = assignment.get(&phi) else {
+            panic!("missing allocation for φ destination {phi:?}");
+        };
+        if src != dst {
+            copies.push(PhiCopy {
+                src,
+                dst,
+                ty: func.types[phi.0 as usize],
+            });
+        }
+    }
+    emit_parallel_copies(&mut copies, asm);
+}
+
+fn emit_parallel_copies(copies: &mut Vec<PhiCopy>, asm: &mut Assembler) {
+    while !copies.is_empty() {
+        let safe = (0..copies.len()).find(|&index| {
+            !copies
+                .iter()
+                .enumerate()
+                .any(|(other, copy)| other != index && copy.src == copies[index].dst)
+        });
+        if let Some(index) = safe {
+            let copy = copies.remove(index);
+            emit_copy(asm, copy.src, copy.dst, copy.ty);
+            continue;
+        }
+
+        // No destination is free to overwrite: the remaining moves form a
+        // register cycle. Preserve one source in a reserved scratch register
+        // and redirect every move that read it to that temporary.
+        let first = copies[0];
+        let scratch = phi_scratch(first.ty);
+        assert!(
+            copies.iter().all(
+                |copy| copy.src != Location::Reg(scratch) && copy.dst != Location::Reg(scratch)
+            ),
+            "φ parallel-copy scratch register is unexpectedly allocated"
+        );
+        emit_copy(asm, first.src, Location::Reg(scratch), first.ty);
+        for copy in copies.iter_mut() {
+            if copy.src == first.src {
+                copy.src = Location::Reg(scratch);
+            }
+        }
+    }
+}
+
+fn emit_copy(asm: &mut Assembler, src: Location, dst: Location, ty: Ty) {
+    match (src, dst) {
+        (Location::Reg(src), Location::Reg(dst)) => {
+            if src != dst {
+                if ty == Ty::F64 {
+                    asm.movsd_reg_reg(dst, src);
+                } else {
+                    asm.mov_reg_reg(dst, src);
+                }
+            }
+        }
+        (Location::Spill(slot), Location::Reg(dst)) => {
+            if ty == Ty::F64 {
+                asm.movsd_reg_mem(dst, PhysReg::Rbp, spill_offset(slot));
+            } else {
+                asm.mov_reg_mem(dst, PhysReg::Rbp, spill_offset(slot));
+            }
+        }
+        (Location::Reg(src), Location::Spill(slot)) => {
+            if ty == Ty::F64 {
+                asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(slot), src);
+            } else {
+                asm.mov_mem_reg(PhysReg::Rbp, spill_offset(slot), src);
+            }
+        }
+        (Location::Spill(src), Location::Spill(dst)) => {
+            let scratch = phi_scratch(ty);
+            if ty == Ty::F64 {
+                asm.movsd_reg_mem(scratch, PhysReg::Rbp, spill_offset(src));
+                asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(dst), scratch);
+            } else {
+                asm.mov_reg_mem(scratch, PhysReg::Rbp, spill_offset(src));
+                asm.mov_mem_reg(PhysReg::Rbp, spill_offset(dst), scratch);
+            }
+        }
+    }
+}
+
+fn phi_scratch(ty: Ty) -> PhysReg {
+    if ty == Ty::F64 {
+        forge_regalloc::SCRATCH_XMM[0]
+    } else {
+        forge_regalloc::SCRATCH_GPR[0]
+    }
 }
 
 fn spill_offset(slot: u32) -> i32 {
