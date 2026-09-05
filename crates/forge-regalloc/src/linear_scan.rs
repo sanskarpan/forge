@@ -73,7 +73,10 @@ pub const ALLOCATABLE_XMM: &[PhysReg] = &[
 /// because a selected instruction can have two reads plus a distinct spilled
 /// destination (for example a compare).
 pub const SCRATCH_GPR: [PhysReg; 3] = [PhysReg::R9, PhysReg::R10, PhysReg::R11];
+#[cfg(not(windows))]
 pub const SCRATCH_XMM: [PhysReg; 3] = [PhysReg::Xmm13, PhysReg::Xmm14, PhysReg::Xmm15];
+#[cfg(windows)]
+pub const SCRATCH_XMM: [PhysReg; 3] = [PhysReg::Xmm3, PhysReg::Xmm4, PhysReg::Xmm5];
 
 /// R9/R10/R11 sit at indices 7-9 of ALLOCATABLE_GPR's declared order (Rax,
 /// Rcx, Rdx, Rbx, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15), NOT the
@@ -93,9 +96,28 @@ pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
     PhysReg::R15,
 ]; // 14 - 3 reserved (R9, R10, R11 excluded)
 
-/// Xmm13/Xmm14/Xmm15 are the last three entries of ALLOCATABLE_XMM, so
-/// split_at is correct here.
+/// Xmm13/Xmm14/Xmm15 are the last three entries of ALLOCATABLE_XMM on
+/// System V. Windows reserves Xmm3/Xmm4/Xmm5 instead and keeps the
+/// nonvolatile XMM registers in this public analysis fixture; the actual
+/// Windows allocation pool remains caller-preserved only.
+#[cfg(not(windows))]
 pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = ALLOCATABLE_XMM.split_at(13).0; // 16 - 3 reserved
+#[cfg(windows)]
+pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = &[
+    PhysReg::Xmm0,
+    PhysReg::Xmm1,
+    PhysReg::Xmm2,
+    PhysReg::Xmm6,
+    PhysReg::Xmm7,
+    PhysReg::Xmm8,
+    PhysReg::Xmm9,
+    PhysReg::Xmm10,
+    PhysReg::Xmm11,
+    PhysReg::Xmm12,
+    PhysReg::Xmm13,
+    PhysReg::Xmm14,
+    PhysReg::Xmm15,
+];
 
 #[cfg(windows)]
 #[allow(dead_code)]
