@@ -48,7 +48,9 @@ and [docs/PLATFORMS.md](docs/PLATFORMS.md) for the implementation details.
 
 ## Scope notes
 
-The full AArch64 expression backend, packed SIMD loop/code generation,
-wasm-bindgen artifact API, and React workbench are intentionally not claimed
-as complete yet. They remain explicit follow-up phases rather than hidden
-runtime fallbacks. The current status table in `CHECKLIST.md` is authoritative.
+The full AArch64 expression backend and packed SIMD loop/code generation are
+not claimed as complete yet. The tested wasm-bindgen artifact/benchmark API
+and dependency-free browser shell are available, while the full React
+workbench remains open. These boundaries are explicit follow-up phases rather
+than hidden runtime fallbacks; the current status table in `CHECKLIST.md` is
+authoritative.
