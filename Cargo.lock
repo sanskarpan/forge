@@ -411,6 +411,7 @@ dependencies = [
  "forge-opt",
  "forge-syntax",
  "forge-wasm",
+ "js-sys",
  "wasm-bindgen",
 ]
 

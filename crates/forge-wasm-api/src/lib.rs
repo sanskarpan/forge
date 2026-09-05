@@ -18,6 +18,78 @@ pub fn cpu_features() -> &'static str {
     "portable-interpreter"
 }
 
+const MAX_BENCHMARK_CALLS: usize = 1_000_000;
+
+/// Benchmarks the portable source evaluator for the requested call counts.
+/// The browser workbench separately measures the instantiated WASM export;
+/// this API remains useful for hosts that need a deterministic, portable
+/// baseline and labels that backend explicitly in its response.
+pub fn benchmark_json(source: &str, sizes: &[u32]) -> String {
+    let artifact = match compile_artifact(source) {
+        Ok(artifact) => artifact,
+        Err(error) => return format!(r#"{{"ok":false,"error":{}}}"#, json_string(&error)),
+    };
+    if artifact.parameter_types.iter().any(|ty| ty != "f64") || artifact.result_type != "f64" {
+        return r#"{"ok":false,"error":"benchmark requires an all-f64 expression"}"#.to_string();
+    }
+    let args = vec![1.25; artifact.parameter_count()];
+    let results = sizes
+        .iter()
+        .map(|requested| {
+            let calls = (*requested as usize).min(MAX_BENCHMARK_CALLS);
+            let started = now_millis();
+            let mut last = None;
+            for _ in 0..calls {
+                match run(source, &args) {
+                    Ok(value) => last = Some(value),
+                    Err(error) => {
+                        return format!(
+                            r#"{{"size":{},"error":{}}}"#,
+                            requested,
+                            json_string(&error)
+                        )
+                    }
+                }
+            }
+            let elapsed_ms = now_millis() - started;
+            let result = last.map_or_else(
+                || "null".to_string(),
+                |value| {
+                    if value.is_finite() {
+                        value.to_string()
+                    } else {
+                        "null".to_string()
+                    }
+                },
+            );
+            format!(
+                r#"{{"size":{},"calls":{},"elapsed_ms":{},"last_result":{}}}"#,
+                requested, calls, elapsed_ms, result
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"ok":true,"backend":"portable-interpreter","results":[{}]}}"#,
+        results
+    )
+}
+
+fn now_millis() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64() * 1_000.0
+    }
+}
+
 /// Browser-facing error boundary for `run`. The Rust API above remains useful
 /// to native callers; these wrappers translate errors to JavaScript values.
 #[wasm_bindgen]
@@ -147,6 +219,11 @@ fn json_string(value: &str) -> String {
 #[wasm_bindgen]
 pub fn cpu_features_wasm() -> String {
     cpu_features().to_string()
+}
+
+#[wasm_bindgen]
+pub fn benchmark(source: &str, sizes: &[u32]) -> String {
+    benchmark_json(source, sizes)
 }
 
 /// Returns a compact JSON-shaped status string without requiring serde in the
@@ -307,5 +384,14 @@ mod tests {
         let error = compile_artifact_json("x +");
         assert!(error.contains(r#""ok":false"#));
         assert!(error.contains(r#""error":"#));
+    }
+
+    #[test]
+    fn browser_benchmark_reports_a_labeled_portable_baseline() {
+        let report = benchmark_json("x + 1.0", &[0, 2]);
+        assert!(report.contains(r#""ok":true"#));
+        assert!(report.contains(r#""backend":"portable-interpreter"#));
+        assert!(report.contains(r#""size":0,"calls":0"#));
+        assert!(report.contains(r#""size":2,"calls":2"#));
     }
 }
