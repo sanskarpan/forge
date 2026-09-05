@@ -257,6 +257,14 @@ mod tests {
     }
 
     #[test]
+    fn depth_100_expression_compiles_and_runs() {
+        let source = (0..100).fold("x".to_string(), |expression, _| {
+            format!("({expression} + 1.0)")
+        });
+        assert_eq!(evaluate(&source, &[1.0]).unwrap(), 101.0);
+    }
+
+    #[test]
     fn artifact_pipeline_can_preserve_unoptimized_ir() {
         let baseline = compile_artifacts_with_optimization("x * 1.0", false).unwrap();
         let optimized = compile_artifacts_with_optimization("x * 1.0", true).unwrap();
