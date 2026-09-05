@@ -507,8 +507,13 @@ fn float_abs_clears_sign_bit_via_pool_mask() {
 
     let lines = disassemble(asm.code());
     assert_eq!(lines[0], "movsd xmm0,xmm1");
-    assert!(lines[1].starts_with("movsd xmm13,"), "got: {}", lines[1]);
-    assert_eq!(lines[2], "andpd xmm0,xmm13");
+    let scratch = if cfg!(windows) { "xmm3" } else { "xmm13" };
+    assert!(
+        lines[1].starts_with(&format!("movsd {scratch},")),
+        "got: {}",
+        lines[1]
+    );
+    assert_eq!(lines[2], format!("andpd xmm0,{scratch}"));
 }
 
 #[test]
@@ -538,10 +543,15 @@ fn float_neg_flips_sign_bit_via_pool_mask() {
 
     let lines = disassemble(asm.code());
     assert_eq!(lines[0], "movsd xmm0,xmm1");
-    assert!(lines[1].starts_with("movsd xmm13,"), "got: {}", lines[1]);
+    let scratch = if cfg!(windows) { "xmm3" } else { "xmm13" };
+    assert!(
+        lines[1].starts_with(&format!("movsd {scratch},")),
+        "got: {}",
+        lines[1]
+    );
     // FloatNeg must use xorpd (flip the sign bit), not andpd (FloatAbs's
     // mnemonic) -- this is the bit that distinguishes it from FloatAbs.
-    assert_eq!(lines[2], "xorpd xmm0,xmm13");
+    assert_eq!(lines[2], format!("xorpd xmm0,{scratch}"));
 }
 
 #[test]
@@ -640,7 +650,12 @@ fn param_is_copied_from_the_integer_abi_register() {
         &loc_of(&assignment),
         &[],
     );
-    assert_eq!(disassemble(asm.code()), vec!["mov rax,rdi"]);
+    let expected = if cfg!(windows) {
+        "mov rax,rcx"
+    } else {
+        "mov rax,rdi"
+    };
+    assert_eq!(disassemble(asm.code()), vec![expected]);
 }
 
 #[test]
@@ -660,7 +675,12 @@ fn call_libm_emits_aligned_indirect_call() {
         &[],
     );
     let lines = disassemble(asm.code());
-    assert!(lines.iter().any(|line| line == "sub rsp,8"));
+    let stack_bytes = if cfg!(windows) { "40" } else { "8" };
+    assert!(lines
+        .iter()
+        .any(|line| line == &format!("sub rsp,{stack_bytes}")));
     assert!(lines.iter().any(|line| line.starts_with("call ")));
-    assert!(lines.iter().any(|line| line == "add rsp,8"));
+    assert!(lines
+        .iter()
+        .any(|line| line == &format!("add rsp,{stack_bytes}")));
 }
