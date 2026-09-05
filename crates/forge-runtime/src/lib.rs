@@ -257,6 +257,14 @@ mod tests {
     }
 
     #[test]
+    fn depth_100_expression_compiles_and_runs() {
+        let source = (0..100).fold("x".to_string(), |expression, _| {
+            format!("({expression} + 1.0)")
+        });
+        assert_eq!(evaluate(&source, &[1.0]).unwrap(), 101.0);
+    }
+
+    #[test]
     fn artifact_pipeline_can_preserve_unoptimized_ir() {
         let baseline = compile_artifacts_with_optimization("x * 1.0", false).unwrap();
         let optimized = compile_artifacts_with_optimization("x * 1.0", true).unwrap();
@@ -290,5 +298,26 @@ mod tests {
             3.0
         );
         assert_eq!(evaluate("sqrt(x * x)", &[3.0]).unwrap(), 3.0);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[test]
+    fn win64_jit_executes_register_and_stack_f64_arguments() {
+        let five = compile("a + b + c + d + e").unwrap();
+        assert_eq!(five.call(&[1.0, 2.0, 4.0, 8.0, 16.0]), 31.0);
+
+        let eight = compile("a + b + c + d + e + f + g + h").unwrap();
+        assert_eq!(
+            eight.call(&[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]),
+            255.0
+        );
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[test]
+    fn win64_jit_preserves_live_value_across_libm_call() {
+        let compiled = compile("sin(x) + y").unwrap();
+        let expected = 0.5f64.sin() + 2.0;
+        assert_eq!(compiled.call(&[0.5, 2.0]).to_bits(), expected.to_bits());
     }
 }

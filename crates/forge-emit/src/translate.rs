@@ -205,7 +205,16 @@ pub fn translate_inst(
 
         MachineInst::Param { dst, index } => {
             let dst_r = loc(*dst);
-            let src_r = if is_xmm(dst_r) {
+            let src_r = if cfg!(windows) {
+                if *index >= 4 {
+                    panic!("parameter index {index} requires layout-aware Win64 stack loading");
+                }
+                if is_xmm(dst_r) {
+                    [PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3][*index as usize]
+                } else {
+                    [PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8, PhysReg::R9][*index as usize]
+                }
+            } else if is_xmm(dst_r) {
                 forge_regalloc::SYSV_FLOAT_ARGS
                     .get(*index as usize)
                     .copied()
@@ -232,12 +241,13 @@ pub fn translate_inst(
             let dst_r = loc(*dst);
             let arg_regs: Vec<PhysReg> = args.iter().map(|v| loc(*v)).collect();
             // Handle the only two-argument register swap without clobbering
-            // either source. Xmm15 is reserved by the allocator for scratch
-            // traffic and therefore cannot contain another live value.
+            // either source. The ABI-selected scratch register is reserved
+            // by the allocator and therefore cannot contain another value.
             if arg_regs.len() == 2 && arg_regs[0] == PhysReg::Xmm1 && arg_regs[1] == PhysReg::Xmm0 {
-                asm.movsd_reg_reg(PhysReg::Xmm15, PhysReg::Xmm0);
+                let scratch = forge_regalloc::SCRATCH_XMM[0];
+                asm.movsd_reg_reg(scratch, PhysReg::Xmm0);
                 asm.movsd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
-                asm.movsd_reg_reg(PhysReg::Xmm1, PhysReg::Xmm15);
+                asm.movsd_reg_reg(PhysReg::Xmm1, scratch);
             } else {
                 for (i, &src) in arg_regs.iter().enumerate() {
                     let abi = [PhysReg::Xmm0, PhysReg::Xmm1][i];
@@ -246,12 +256,14 @@ pub fn translate_inst(
                     }
                 }
             }
-            // A JIT function enters SysV with RSP % 16 == 8. Keep the
-            // caller's stack aligned immediately before CALL.
-            asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, 8);
+            // A JIT function enters with RSP % 16 == 8. Keep the caller's
+            // stack aligned immediately before CALL; Microsoft x64 also
+            // requires 32 bytes of home space for the callee.
+            let call_stack_bytes = if cfg!(windows) { 40 } else { 8 };
+            asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, call_stack_bytes);
             asm.mov_reg_imm(PhysReg::R11, forge_x64::libm_address(*func));
             asm.call_reg(PhysReg::R11);
-            asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, 8);
+            asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, call_stack_bytes);
             assert!(
                 is_xmm(dst_r),
                 "libm result must be assigned to an XMM register"
@@ -414,17 +426,10 @@ enum MaskOp {
 /// mask from the constant pool, then `andpd`/`xorpd` it into `dst`" and
 /// differ only in which bitwise op is used, so `op` picks that.
 ///
-/// The mask is loaded into `PhysReg::Xmm13` — hardcoded, not resolved via
-/// `loc`. This is not an arbitrary choice: `Xmm13` is
-/// `forge_regalloc::linear_scan::SCRATCH_XMM[0]`
-/// (`SCRATCH_XMM = [PhysReg::Xmm13, PhysReg::Xmm14, PhysReg::Xmm15]`), the
-/// first register the real allocator reserves as scratch and never assigns
-/// to a live `Value` across a `FloatAbs`/`FloatNeg` instruction. That
-/// invariant is what makes it safe to clobber `Xmm13` here without going
-/// through `loc`/consulting
-/// liveness — if `forge-regalloc` ever reorders or changes `SCRATCH_XMM`,
-/// this hardcoded literal would silently stop matching the allocator's
-/// reserved register and this function could clobber a live value.
+/// The mask is loaded into the first ABI-selected scratch XMM register —
+/// hardcoded rather than resolved via `loc`. The allocator reserves this
+/// register and never assigns it to a live `Value`, making the clobber safe
+/// without a liveness lookup on either supported x86-64 ABI.
 fn float_mask_op(
     asm: &mut Assembler,
     loc: &dyn Fn(Value) -> PhysReg,
@@ -438,11 +443,10 @@ fn float_mask_op(
     if dst_r != src_r {
         asm.movsd_reg_reg(dst_r, src_r);
     }
-    // Xmm13 == forge_regalloc::linear_scan::SCRATCH_XMM[0]; see doc comment
-    // above for the invariant this depends on.
-    asm.movsd_reg_riprel(PhysReg::Xmm13, pool_labels[mask_pool.index()]);
+    let scratch = forge_regalloc::SCRATCH_XMM[0];
+    asm.movsd_reg_riprel(scratch, pool_labels[mask_pool.index()]);
     match op {
-        MaskOp::Abs => asm.andpd_reg_reg(dst_r, PhysReg::Xmm13),
-        MaskOp::Neg => asm.xorpd_reg_reg(dst_r, PhysReg::Xmm13),
+        MaskOp::Abs => asm.andpd_reg_reg(dst_r, scratch),
+        MaskOp::Neg => asm.xorpd_reg_reg(dst_r, scratch),
     }
 }

@@ -42,6 +42,18 @@ pub const SYSV_FLOAT_ARGS: &[PhysReg] = &[
     PhysReg::Xmm7,
 ];
 
+/// Microsoft x64 integer/pointer argument registers, in positional order.
+/// Unlike System V, Win64 exposes only four register argument slots.
+#[allow(dead_code)]
+pub const WIN64_INT_ARGS: &[PhysReg] = &[PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8, PhysReg::R9];
+
+/// Microsoft x64 floating-point argument registers, in positional order.
+/// The integer and floating-point register arrays describe the same four
+/// positional slots: a floating-point argument in slot `n` uses `XmmN`.
+#[allow(dead_code)]
+pub const WIN64_FLOAT_ARGS: &[PhysReg] =
+    &[PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3];
+
 /// A virtual register's live range: `[start, end]` INCLUSIVE positions
 /// into `SelectedFunction::insts` (the Vec index IS the linear
 /// instruction number -- no separate numbering pass needed). `end` is the
@@ -121,6 +133,18 @@ mod tests {
                 PhysReg::Xmm6,
                 PhysReg::Xmm7
             ]
+        );
+    }
+
+    #[test]
+    fn win64_argument_registers_match_positional_abi() {
+        assert_eq!(
+            WIN64_INT_ARGS,
+            &[PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8, PhysReg::R9]
+        );
+        assert_eq!(
+            WIN64_FLOAT_ARGS,
+            &[PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3]
         );
     }
 }
