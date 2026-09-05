@@ -13,3 +13,4 @@ forge-runtime = { path = "../forge-runtime" }
 forge-simd = { path = "../forge-simd" }
 forge-wasm = { path = "../forge-wasm" }
 forge-x64 = { path = "../forge-x64" }
+forge-aarch64 = { path = "../forge-aarch64" }

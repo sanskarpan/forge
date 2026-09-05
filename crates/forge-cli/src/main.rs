@@ -167,6 +167,7 @@ fn is_compile_error(error: &str) -> bool {
         "--opt must be",
         "WASM backend",
         "AArch64 currently",
+        "AArch64 compilation failed",
     ]
     .iter()
     .any(|prefix| error.starts_with(prefix))
@@ -277,10 +278,22 @@ fn compile_command(
             }
         }
         "aarch64" => {
-            return Err(
-                "AArch64 currently provides the tested scalar encoder only; expression selection and emission are not implemented"
-                    .to_string(),
+            let mut function =
+                forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
+            if opt != "0" {
+                forge_opt::optimize(&mut function);
+            }
+            forge_ir::verify::verify(&function).map_err(|e| e.to_string())?;
+            let bytes = forge_aarch64::emit_f64(&function)
+                .map_err(|error| format!("AArch64 compilation failed: {error}"))?;
+            println!(
+                "target: aarch64\noptimization: {opt}\nnative: {}\nbytes: {}",
+                forge_aarch64::is_native_target(),
+                bytes.len()
             );
+            if emit {
+                println!("hex: {}", hex(&bytes));
+            }
         }
         other => return Err(format!("unknown architecture {other:?}")),
     }
@@ -672,5 +685,27 @@ mod tests {
         let error = repl_command_line(":set 3x 1", &mut bindings, &mut history).unwrap_err();
         assert!(error.contains("invalid binding name"));
         assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn exit_codes_distinguish_compile_and_verification_failures() {
+        let compile = Command::Compile(CompileArgs {
+            expression: "if x then x else x".to_string(),
+            arch: "aarch64".to_string(),
+            opt: "2".to_string(),
+            features: None,
+            emit: false,
+        });
+        assert_eq!(
+            exit_code(&compile, "AArch64 compilation failed: unsupported"),
+            2
+        );
+
+        let verify = Command::Verify(VerifyArgs {
+            expression: "x".to_string(),
+            iters: 1,
+        });
+        assert_eq!(exit_code(&verify, "mismatch at iteration 0"), 3);
+        assert_eq!(exit_code(&verify, "type checking failed: bad input"), 2);
     }
 }
