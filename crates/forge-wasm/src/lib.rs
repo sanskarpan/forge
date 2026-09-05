@@ -6,6 +6,7 @@
 
 use forge_ir::interp::{interpret, RtValue};
 use forge_syntax::ast::{Ast, BinaryOp, Expr, ExprIdx, UnaryOp};
+use forge_syntax::typeck::{Ty, TypedAst};
 use std::collections::HashMap;
 
 pub fn evaluate(source: &str, args: &[f64]) -> Result<f64, String> {
@@ -35,9 +36,10 @@ pub fn evaluate(source: &str, args: &[f64]) -> Result<f64, String> {
     }
 }
 
-/// Compiles an all-f64 expression to a one-function WASM module exporting
-/// `eval`. The module uses the standard scalar f64 opcodes and a local for
-/// each `let` binding; it can be passed directly to `WebAssembly.instantiate`.
+/// Compiles a typed scalar expression to a one-function WASM module exporting
+/// `eval`. Parameters and results use their real WASM value types (`f64`,
+/// `i64`, or `i32` for Forge booleans), and each `let` binding becomes a local.
+/// The resulting bytes can be passed directly to `WebAssembly.instantiate`.
 pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
     if !lex_diags.is_empty() {
@@ -49,16 +51,6 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     }
     let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
         .map_err(|diags| format!("type checking failed: {diags:?}"))?;
-    if typed
-        .params
-        .iter()
-        .any(|(_, ty)| *ty != forge_syntax::typeck::Ty::F64)
-        || typed.types[typed.ast.root.index()] != forge_syntax::typeck::Ty::F64
-    {
-        return Err(
-            "WASM backend currently accepts all-f64 parameters and returns f64".to_string(),
-        );
-    }
     let params = typed
         .params
         .iter()
@@ -66,14 +58,17 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
         .map(|(i, (name, _))| (name.clone(), i as u32))
         .collect::<HashMap<_, _>>();
     let mut lets = HashMap::new();
+    let mut local_types = Vec::new();
     collect_lets(
+        &typed,
         &typed.ast,
         typed.ast.root,
         typed.params.len() as u32,
         &mut lets,
+        &mut local_types,
     );
     let mut expr = Vec::new();
-    emit_expr(&typed.ast, typed.ast.root, &params, &lets, &mut expr)?;
+    emit_expr(&typed, typed.ast.root, &params, &lets, &mut expr)?;
     expr.push(0x0b); // end
 
     let mut body = Vec::new();
@@ -81,8 +76,11 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
         body.push(0);
     } else {
         body.push(1);
-        push_uleb(lets.len() as u32, &mut body);
-        body.push(0x7c); // f64 local type
+        push_uleb(local_types.len() as u32, &mut body);
+        for ty in local_types {
+            body.push(1); // one local in each declaration group
+            body.push(wasm_valtype(ty));
+        }
     }
     body.extend(expr);
 
@@ -93,9 +91,9 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     let mut module = b"\0asm\x01\0\0\0".to_vec();
     let mut types = vec![1, 0x60];
     push_uleb(params.len() as u32, &mut types);
-    types.extend(vec![0x7c; params.len()]);
+    types.extend(typed.params.iter().map(|(_, ty)| wasm_valtype(*ty)));
     types.push(1);
-    types.push(0x7c);
+    types.push(wasm_valtype(typed.types[typed.ast.root.index()]));
     section(1, types, &mut module);
     section(3, vec![1, 0], &mut module);
     let export = vec![1, 4, b'e', b'v', b'a', b'l', 0, 0];
@@ -106,44 +104,62 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     Ok(module)
 }
 
-fn collect_lets(ast: &Ast, idx: ExprIdx, first_local: u32, lets: &mut HashMap<String, u32>) {
+fn collect_lets(
+    typed: &TypedAst,
+    ast: &Ast,
+    idx: ExprIdx,
+    first_local: u32,
+    lets: &mut HashMap<String, u32>,
+    local_types: &mut Vec<Ty>,
+) {
     match ast.get(idx) {
         Expr::Let { name, value, body } => {
             let local = first_local + lets.len() as u32;
             lets.insert(name.clone(), local);
-            collect_lets(ast, *value, first_local, lets);
-            collect_lets(ast, *body, first_local, lets);
+            local_types.push(typed.types[value.index()]);
+            collect_lets(typed, ast, *value, first_local, lets, local_types);
+            collect_lets(typed, ast, *body, first_local, lets, local_types);
         }
-        Expr::Unary { operand, .. } => collect_lets(ast, *operand, first_local, lets),
+        Expr::Unary { operand, .. } => {
+            collect_lets(typed, ast, *operand, first_local, lets, local_types)
+        }
         Expr::Binary { lhs, rhs, .. } => {
-            collect_lets(ast, *lhs, first_local, lets);
-            collect_lets(ast, *rhs, first_local, lets);
+            collect_lets(typed, ast, *lhs, first_local, lets, local_types);
+            collect_lets(typed, ast, *rhs, first_local, lets, local_types);
         }
         Expr::Call { args, .. } => {
             for arg in args {
-                collect_lets(ast, *arg, first_local, lets);
+                collect_lets(typed, ast, *arg, first_local, lets, local_types);
             }
         }
         Expr::If { cond, then_, else_ } => {
-            collect_lets(ast, *cond, first_local, lets);
-            collect_lets(ast, *then_, first_local, lets);
-            collect_lets(ast, *else_, first_local, lets);
+            collect_lets(typed, ast, *cond, first_local, lets, local_types);
+            collect_lets(typed, ast, *then_, first_local, lets, local_types);
+            collect_lets(typed, ast, *else_, first_local, lets, local_types);
         }
         Expr::Float(_) | Expr::Int(_) | Expr::Bool(_) | Expr::Ident(_) => {}
     }
 }
 
 fn emit_expr(
-    ast: &Ast,
+    typed: &TypedAst,
     idx: ExprIdx,
     params: &HashMap<String, u32>,
     lets: &HashMap<String, u32>,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
+    let ast = &typed.ast;
     match ast.get(idx) {
         Expr::Float(value) => {
             out.push(0x44);
             out.extend(value.to_le_bytes());
+        }
+        Expr::Int(value) => {
+            out.push(0x42);
+            push_sleb(*value, out);
+        }
+        Expr::Bool(value) => {
+            out.extend([0x41, u8::from(*value)]);
         }
         Expr::Ident(name) => {
             let local = params
@@ -153,47 +169,92 @@ fn emit_expr(
             out.push(0x20);
             push_uleb(*local, out);
         }
-        Expr::Unary {
-            op: UnaryOp::Neg,
-            operand,
-        } => {
-            emit_expr(ast, *operand, params, lets, out)?;
-            out.push(0x9a);
-        }
-        Expr::Unary { .. } => {
-            return Err("boolean and integer unary operations are not f64 WASM ops".to_string())
-        }
+        Expr::Unary { op, operand } => match (op, typed.types[idx.index()]) {
+            (UnaryOp::Neg, Ty::F64) => {
+                emit_expr(typed, *operand, params, lets, out)?;
+                out.push(0x9a);
+            }
+            (UnaryOp::Neg, Ty::I64) => {
+                out.extend([0x42, 0]);
+                emit_expr(typed, *operand, params, lets, out)?;
+                out.push(0x7d); // i64.sub
+            }
+            (UnaryOp::Not, Ty::Bool) => {
+                emit_expr(typed, *operand, params, lets, out)?;
+                out.push(0x45); // i32.eqz
+            }
+            (UnaryOp::BitNot, Ty::I64) => {
+                emit_expr(typed, *operand, params, lets, out)?;
+                out.push(0x42);
+                push_sleb(-1, out);
+                out.push(0x85); // i64.xor
+            }
+            _ => return Err("invalid typed unary operation".to_string()),
+        },
         Expr::Binary { op, lhs, rhs } => {
-            emit_expr(ast, *lhs, params, lets, out)?;
-            emit_expr(ast, *rhs, params, lets, out)?;
-            out.push(match op {
-                BinaryOp::Add => 0xa0,
-                BinaryOp::Sub => 0xa1,
-                BinaryOp::Mul => 0xa2,
-                BinaryOp::Div => 0xa3,
-                BinaryOp::Eq => 0x61,
-                BinaryOp::Ne => 0x62,
-                BinaryOp::Lt => 0x63,
-                BinaryOp::Gt => 0x64,
-                BinaryOp::Le => 0x65,
-                BinaryOp::Ge => 0x66,
-                BinaryOp::Rem => return Err("WASM has no scalar f64 remainder opcode".to_string()),
-                _ => {
-                    return Err(
-                        "bitwise, logical, and shift operations need a non-f64 WASM path"
-                            .to_string(),
-                    )
-                }
+            emit_expr(typed, *lhs, params, lets, out)?;
+            emit_expr(typed, *rhs, params, lets, out)?;
+            let lhs_ty = typed.types[lhs.index()];
+            out.push(match lhs_ty {
+                Ty::F64 => match op {
+                    BinaryOp::Add => 0xa0,
+                    BinaryOp::Sub => 0xa1,
+                    BinaryOp::Mul => 0xa2,
+                    BinaryOp::Div => 0xa3,
+                    BinaryOp::Eq => 0x61,
+                    BinaryOp::Ne => 0x62,
+                    BinaryOp::Lt => 0x63,
+                    BinaryOp::Gt => 0x64,
+                    BinaryOp::Le => 0x65,
+                    BinaryOp::Ge => 0x66,
+                    BinaryOp::Rem => {
+                        return Err("WASM has no scalar f64 remainder opcode".to_string())
+                    }
+                    _ => return Err("invalid f64 binary operation".to_string()),
+                },
+                Ty::I64 => match op {
+                    BinaryOp::Add => 0x7c,
+                    BinaryOp::Sub => 0x7d,
+                    BinaryOp::Mul => 0x7e,
+                    BinaryOp::Div => 0x7f,
+                    BinaryOp::Rem => 0x81,
+                    BinaryOp::BitAnd => 0x83,
+                    BinaryOp::BitOr => 0x84,
+                    BinaryOp::BitXor => 0x85,
+                    BinaryOp::Shl => 0x86,
+                    BinaryOp::Shr => 0x88,
+                    BinaryOp::Eq => 0x51,
+                    BinaryOp::Ne => 0x52,
+                    BinaryOp::Lt => 0x53,
+                    BinaryOp::Gt => 0x55,
+                    BinaryOp::Le => 0x57,
+                    BinaryOp::Ge => 0x59,
+                    _ => return Err("invalid i64 binary operation".to_string()),
+                },
+                Ty::Bool => match op {
+                    BinaryOp::And => 0x71,
+                    BinaryOp::Or => 0x72,
+                    BinaryOp::Eq => 0x46,
+                    BinaryOp::Ne => 0x47,
+                    _ => return Err("invalid bool binary operation".to_string()),
+                },
             });
         }
         Expr::Call { callee, args } => match (callee.as_str(), args.as_slice()) {
             ("min", [lhs, rhs]) | ("max", [lhs, rhs]) => {
-                emit_expr(ast, *lhs, params, lets, out)?;
-                emit_expr(ast, *rhs, params, lets, out)?;
+                emit_expr(typed, *lhs, params, lets, out)?;
+                emit_expr(typed, *rhs, params, lets, out)?;
                 out.push(if callee == "min" { 0xa4 } else { 0xa5 });
             }
+            ("fma", [a, b, c]) => {
+                emit_expr(typed, *a, params, lets, out)?;
+                emit_expr(typed, *b, params, lets, out)?;
+                out.push(0xa2); // f64.mul
+                emit_expr(typed, *c, params, lets, out)?;
+                out.push(0xa0); // f64.add
+            }
             (name, [operand]) => {
-                emit_expr(ast, *operand, params, lets, out)?;
+                emit_expr(typed, *operand, params, lets, out)?;
                 out.push(match name {
                     "sqrt" => 0x9f,
                     "abs" => 0x99,
@@ -216,24 +277,29 @@ fn emit_expr(
             }
         },
         Expr::If { cond, then_, else_ } => {
-            emit_expr(ast, *cond, params, lets, out)?;
-            out.extend([0x04, 0x7c]);
-            emit_expr(ast, *then_, params, lets, out)?;
+            emit_expr(typed, *cond, params, lets, out)?;
+            out.extend([0x04, wasm_valtype(typed.types[idx.index()])]);
+            emit_expr(typed, *then_, params, lets, out)?;
             out.push(0x05);
-            emit_expr(ast, *else_, params, lets, out)?;
+            emit_expr(typed, *else_, params, lets, out)?;
             out.push(0x0b);
         }
         Expr::Let { name, value, body } => {
-            emit_expr(ast, *value, params, lets, out)?;
+            emit_expr(typed, *value, params, lets, out)?;
             out.push(0x21);
             push_uleb(lets[name], out);
-            emit_expr(ast, *body, params, lets, out)?;
-        }
-        Expr::Int(_) | Expr::Bool(_) => {
-            return Err("WASM backend currently emits f64 expressions only".to_string())
+            emit_expr(typed, *body, params, lets, out)?;
         }
     }
     Ok(())
+}
+
+fn wasm_valtype(ty: Ty) -> u8 {
+    match ty {
+        Ty::F64 => 0x7c,
+        Ty::I64 => 0x7e,
+        Ty::Bool => 0x7f,
+    }
 }
 
 fn push_uleb(mut value: u32, out: &mut Vec<u8>) {
@@ -245,6 +311,18 @@ fn push_uleb(mut value: u32, out: &mut Vec<u8>) {
         }
         out.push(byte);
         if value == 0 {
+            break;
+        }
+    }
+}
+
+fn push_sleb(mut value: i64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (value as u8) & 0x7f;
+        let sign_done = (value >> 6 == 0) || (value >> 6 == -1);
+        value >>= 7;
+        out.push(if sign_done { byte } else { byte | 0x80 });
+        if sign_done {
             break;
         }
     }
@@ -278,6 +356,28 @@ mod tests {
         let max = compile("max(x, y)").unwrap();
         assert!(min.contains(&0xa4));
         assert!(max.contains(&0xa5));
+    }
+
+    #[test]
+    fn emits_integer_and_boolean_wasm_types() {
+        let integer = compile("x & 1").unwrap();
+        assert!(integer.contains(&0x7e)); // i64 parameter/result type
+        assert!(integer.contains(&0x83)); // i64.and
+
+        let boolean = compile("x == y").unwrap();
+        assert!(boolean.contains(&0x7f)); // i32 result type for bool
+        assert!(boolean.contains(&0x61)); // f64.eq
+    }
+
+    #[test]
+    fn emits_typed_conditionals_and_fma() {
+        let conditional = compile("if flag then 1 else 2").unwrap();
+        assert!(conditional.contains(&0x04)); // if
+        assert!(conditional.contains(&0x7e)); // i64 block result
+
+        let fma = compile("fma(x, y, z)").unwrap();
+        assert!(fma.contains(&0xa2)); // f64.mul
+        assert!(fma.contains(&0xa0)); // f64.add
     }
 
     #[test]
