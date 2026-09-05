@@ -141,16 +141,15 @@ pub fn interpret(f: &Function, args: &[RtValue]) -> RtValue {
                     (get(&vals, *a).as_i64() as u64).wrapping_shr(get(&vals, *b).as_i64() as u32)
                         as i64,
                 ),
-                // Not currently reachable from lower.rs — see Task 10/
-                // language-design follow-up on whether i64's `>>` should be
-                // arithmetic; source `>>` only ever lowers to `Inst::Shr`
-                // (logical shift) today, so this arm is correctly
-                // interpreted but untested from the language surface.
-                Inst::Sar(a, b) => RtValue::I64(
-                    get(&vals, *a)
-                        .as_i64()
-                        .wrapping_shr(get(&vals, *b).as_i64() as u32),
-                ),
+                // `Sar` is the signed counterpart to `Shr`: preserve the
+                // sign bit while masking the shift count like the hardware
+                // instruction does. This path is emitted by the optimizer's
+                // signed power-of-two division reduction.
+                Inst::Sar(a, b) => {
+                    let value = get(&vals, *a).as_i64();
+                    let amount = (get(&vals, *b).as_i64() as u32) & 63;
+                    RtValue::I64(value >> amount)
+                }
 
                 Inst::Cmp { op, lhs, rhs } => {
                     RtValue::Bool(eval_cmp(*op, get(&vals, *lhs), get(&vals, *rhs)))
@@ -233,6 +232,7 @@ mod tests {
     use forge_syntax::lexer::lex;
     use forge_syntax::parser::parse;
     use forge_syntax::resolve::resolve;
+    use forge_syntax::span::Span;
     use forge_syntax::typeck::typecheck;
 
     fn run(src: &str, args: &[RtValue]) -> RtValue {
@@ -310,6 +310,27 @@ mod tests {
             }
             _ => panic!("expected f64"),
         }
+    }
+
+    #[test]
+    fn arithmetic_shift_right_preserves_the_sign_bit() {
+        let function = Function {
+            insts: vec![
+                Inst::ConstI64(-3),
+                Inst::ConstI64(1),
+                Inst::Sar(Value(0), Value(1)),
+            ],
+            types: vec![Ty::I64, Ty::I64, Ty::I64],
+            spans: vec![Span::new(0, 0); 3],
+            blocks: vec![BlockData {
+                insts: vec![Value(0), Value(1), Value(2)],
+                term: Some(Terminator::Return(Value(2))),
+                preds: vec![].into(),
+            }],
+            entry: Block(0),
+            params: vec![],
+        };
+        assert_eq!(interpret(&function, &[]), RtValue::I64(-2));
     }
 
     #[test]
