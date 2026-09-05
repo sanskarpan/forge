@@ -2,6 +2,9 @@
 //! backend. Instructions are kept as 32-bit words until [`Assembler::bytes`]
 //! serializes them in architectural little-endian order.
 
+use forge_ir::{Function, Inst, Terminator, Ty, Value};
+use std::collections::HashMap;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gpr(u8);
 
@@ -204,6 +207,18 @@ impl Assembler {
     pub fn ret(&mut self) {
         self.words.push(0xd65f_03c0);
     }
+
+    /// Emits `ldr Dd, <literal>` with a signed byte offset from the current
+    /// instruction. Literal-pool placement and range validation belong to the
+    /// higher-level emitter.
+    pub fn ldr_literal_d(&mut self, dst: Gpr, offset_bytes: i32) {
+        self.words.push(encode_ldr_literal_d(dst, offset_bytes));
+    }
+
+    /// Emits `fmov Dd, Dn`.
+    pub fn fmov_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(fmov_d(dst, src));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,6 +321,10 @@ pub fn fneg_d(dst: Gpr, src: Gpr) -> u32 {
     0x1e61_4000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
 }
 
+pub fn fmov_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e60_4000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
 pub fn fmadd_d(dst: Gpr, lhs: Gpr, rhs: Gpr, addend: Gpr) -> u32 {
     0x1f40_0000
         | (u32::from(rhs.index()) << 16)
@@ -380,6 +399,19 @@ pub fn encode_branch_cond(condition: Condition, offset_bytes: i32) -> u32 {
     let imm = offset_bytes / 4;
     assert!((-(1 << 18)..(1 << 18)).contains(&imm));
     0x5400_0000 | (((imm as u32) & 0x7ffff) << 5) | u32::from(condition as u8)
+}
+
+fn encode_ldr_literal_d(dst: Gpr, offset_bytes: i32) -> u32 {
+    assert!(
+        offset_bytes % 4 == 0,
+        "AArch64 literal offset must be 4-byte aligned"
+    );
+    let words = offset_bytes / 4;
+    assert!(
+        (-0x40000..=0x3ffff).contains(&words),
+        "AArch64 literal offset is outside the signed imm19 range"
+    );
+    0x5c00_0000 | (((words as u32) & 0x7ffff) << 5) | u32::from(dst.index())
 }
 
 /// Encodes the AArch64 logical-immediate pattern as `(N, immr, imms)`.
@@ -469,6 +501,153 @@ pub fn is_native_target() -> bool {
     backend_info().target_available
 }
 
+/// Emits a complete AAPCS64 scalar f64 function for a straight-line IR
+/// function. Parameters use D0..D7, temporaries use D8..D30, and constants
+/// are loaded from an aligned literal pool placed after the return. This is a
+/// deliberately strict first executable boundary: control flow, integer
+/// values, conversions, and libm calls return an explicit error until their
+/// ABI and lowering rules are implemented for AArch64.
+pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
+    if function.blocks.len() != 1 {
+        return Err("AArch64 emitter currently requires one straight-line block".to_string());
+    }
+    let Some(Terminator::Return(result)) = function.blocks[0].term.as_ref() else {
+        return Err("AArch64 emitter requires a returning function".to_string());
+    };
+    if function.params.iter().any(|(_, ty)| *ty != Ty::F64) {
+        return Err("AArch64 emitter currently accepts f64 parameters and result only".to_string());
+    }
+    let Some(result_ty) = function.types.get(result.0 as usize) else {
+        return Err(format!("return value {result:?} has no type"));
+    };
+    if *result_ty != Ty::F64 {
+        return Err("AArch64 emitter currently accepts f64 parameters and result only".to_string());
+    }
+
+    let mut registers = HashMap::<Value, Gpr>::new();
+    for &value in &function.blocks[0].insts {
+        let Some(inst) = function.insts.get(value.0 as usize) else {
+            return Err(format!("block references missing instruction {value:?}"));
+        };
+        let register = match inst {
+            Inst::Param { index, ty: Ty::F64 } => {
+                let Some((_, _)) = function.params.get(*index as usize) else {
+                    return Err(format!("parameter index {index} is out of range"));
+                };
+                let ordinal = function.params[..*index as usize]
+                    .iter()
+                    .filter(|(_, ty)| *ty == Ty::F64)
+                    .count();
+                if ordinal >= 8 {
+                    return Err("AArch64 emitter supports at most 8 f64 parameters".to_string());
+                }
+                Gpr::new(ordinal as u8)
+            }
+            Inst::Param { .. } => {
+                return Err("AArch64 emitter currently accepts f64 parameters only".to_string())
+            }
+            _ => {
+                let index = u8::try_from(value.0)
+                    .ok()
+                    .and_then(|index| index.checked_add(8))
+                    .filter(|index| *index < 31)
+                    .ok_or_else(|| {
+                        "AArch64 emitter ran out of D-register temporaries".to_string()
+                    })?;
+                Gpr::new(index)
+            }
+        };
+        registers.insert(value, register);
+    }
+
+    let register_of = |value: Value| {
+        registers
+            .get(&value)
+            .copied()
+            .ok_or_else(|| format!("missing AArch64 register for value {value:?}"))
+    };
+    let mut asm = Assembler::new();
+    let mut pool = Vec::<u64>::new();
+    let mut pool_indices = HashMap::<u64, usize>::new();
+    let mut literal_loads = Vec::<(usize, usize, Gpr)>::new();
+
+    for &value in &function.blocks[0].insts {
+        let dst = registers[&value];
+        let Some(inst) = function.insts.get(value.0 as usize) else {
+            return Err(format!("block references missing instruction {value:?}"));
+        };
+        match inst {
+            Inst::ConstF64(bits) => {
+                let pool_index = match pool_indices.get(bits) {
+                    Some(index) => *index,
+                    None => {
+                        let index = pool.len();
+                        pool.push(*bits);
+                        pool_indices.insert(*bits, index);
+                        index
+                    }
+                };
+                let instruction_index = asm.words.len();
+                asm.ldr_literal_d(dst, 0);
+                literal_loads.push((instruction_index, pool_index, dst));
+            }
+            Inst::Param { .. } => {}
+            Inst::Add(lhs, rhs) => asm.fadd_d(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Inst::Sub(lhs, rhs) => asm.fsub_d(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Inst::Mul(lhs, rhs) => asm.fmul_d(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Inst::Div(lhs, rhs) => asm.fdiv_d(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Inst::Neg(value) => asm.fneg_d(dst, register_of(*value)?),
+            Inst::Abs(value) => asm.fabs_d(dst, register_of(*value)?),
+            Inst::Sqrt(value) => asm.fsqrt_d(dst, register_of(*value)?),
+            Inst::Fma { a, b, c } => {
+                asm.fmadd_d(dst, register_of(*a)?, register_of(*b)?, register_of(*c)?)
+            }
+            Inst::ConstI64(_)
+            | Inst::ConstBool(_)
+            | Inst::Rem(..)
+            | Inst::And(..)
+            | Inst::Or(..)
+            | Inst::Xor(..)
+            | Inst::Not(..)
+            | Inst::Shl(..)
+            | Inst::Shr(..)
+            | Inst::Sar(..)
+            | Inst::Cmp { .. }
+            | Inst::Min(..)
+            | Inst::Max(..)
+            | Inst::Floor(..)
+            | Inst::Ceil(..)
+            | Inst::Round(..)
+            | Inst::Trunc(..)
+            | Inst::Call { .. }
+            | Inst::IToF(..)
+            | Inst::FToI(..)
+            | Inst::Phi { .. } => {
+                return Err(format!("AArch64 f64 emitter does not support {:?}", inst))
+            }
+        }
+    }
+
+    let result_register = register_of(*result)?;
+    if result_register != Gpr::new(0) {
+        asm.fmov_d(Gpr::new(0), result_register);
+    }
+    asm.ret();
+    if !pool.is_empty() && !asm.words.len().is_multiple_of(2) {
+        asm.words.push(0);
+    }
+    let pool_start = asm.words.len() * 4;
+    for (instruction_index, _, dst) in literal_loads {
+        let offset = pool_start as i32 - (instruction_index * 4) as i32;
+        asm.words[instruction_index] = encode_ldr_literal_d(dst, offset);
+    }
+    for bits in pool {
+        asm.words.push(bits as u32);
+        asm.words.push((bits >> 32) as u32);
+    }
+    Ok(asm.bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,5 +699,54 @@ mod tests {
         assert_eq!(encode_logical_imm(0, true), None);
         assert_eq!(encode_logical_imm(u64::MAX, true), None);
         assert!(encode_logical_imm(0x0123_4567_89ab_cdef, true).is_none());
+    }
+
+    #[test]
+    fn encodes_scalar_literal_load_and_register_move() {
+        assert_eq!(encode_ldr_literal_d(Gpr::new(3), 8), 0x5c00_0043);
+        assert_eq!(fmov_d(Gpr::new(0), Gpr::new(3)), 0x1e60_4060);
+    }
+
+    #[test]
+    fn emits_straight_line_f64_function_and_deduplicates_literals() {
+        let function = forge_runtime::lower_source("x * 2.5 + 2.5").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        assert_eq!(
+            bytes.len() % 8,
+            0,
+            "literal pool must be eight-byte aligned"
+        );
+        let words = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words.len(),
+            8,
+            "two loads, two arithmetic ops, move, return, one literal"
+        );
+        assert_eq!(
+            u64::from(words[6]) | (u64::from(words[7]) << 32),
+            2.5f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn rejects_control_flow_until_phi_and_branch_lowering_exists() {
+        let function = forge_runtime::lower_source("if x > 0.0 then x else -x").unwrap();
+        let error = emit_f64(&function).unwrap_err();
+        assert!(error.contains("one straight-line block"));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_emitted_f64_function_on_native_aarch64() {
+        let function = forge_runtime::lower_source("x * 2.5 + 2.5").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
+        assert_eq!(compiled.call_args(&[3.0]), 10.0);
     }
 }
