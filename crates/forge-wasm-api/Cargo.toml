@@ -5,4 +5,7 @@ edition.workspace = true
 
 [dependencies]
 forge-wasm = { path = "../forge-wasm" }
+forge-ir = { path = "../forge-ir" }
+forge-opt = { path = "../forge-opt" }
+forge-syntax = { path = "../forge-syntax" }
 wasm-bindgen = "0.2"
