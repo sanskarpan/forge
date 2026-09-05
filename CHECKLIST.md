@@ -4,7 +4,7 @@
 > **Differential testing (Phase 11) is the spine. A JIT that computes wrong answers silently is worse than no JIT. Wire up interpreter-vs-JIT comparison in Phase 6, the moment the first instruction executes.**
 > **Every encoder function gets a disassembler round-trip test in the same commit. No exceptions.**
 
-## Current implementation status — 2026-09-05
+## Current implementation status — 2026-09-06
 
 This section is the current-state source of truth for the implementation
 audit. The long phase sections below retain the original design history and
@@ -25,7 +25,7 @@ implemented lower-level work is absent.
 | WASM | Tested typed scalar byte emitter for `f64`, `i64`, and bool values, including arithmetic, comparisons, conditionals, lets, min/max, and fma lowering; structured artifact JSON exposes bytes, hex, parameter types, result type, lowered/optimized IR, and CFG; parse/type diagnostics now include source spans and a serialized AST; `benchmark(source, sizes)` exposes portable baseline timings and results; reproducible `wasm-pack --target web --release` plus `wasm-opt -Oz` packaging is CI-validated under the documented gzip-size boundary; native interval/assembly artifacts remain open because this target is stack-machine WASM | `crates/forge-wasm`, `crates/forge-wasm-api`, `.github/workflows/ci-containers.yml`, `containers/Dockerfile.wasm-ci` |
 | Benchmarks | Reusable compiled-expression benchmark helper and allocator Criterion benchmark exist | `crates/forge-bench`, `crates/forge-regalloc/benches` |
 | Workbench | Dependency-free browser shell now supports debounced live compilation, structured AST and source diagnostics, execution status, error state, emitted WASM hex, signature metadata, lowered/optimized IR, CFG output, direct compiled-export timing samples, and the portable `benchmark(source, sizes)` baseline API; the full SPEC React workbench remains open | `workbench/`, `Makefile` |
-| Windows executable memory | Implemented `VirtualAlloc`/`VirtualProtect`/`FlushInstructionCache`/`VirtualFree` backend with platform-gated Unix tests and Windows compilation path; native Windows execution remains a future CI gap | `crates/forge-mem` |
+| Windows executable memory | Implemented `VirtualAlloc`/`VirtualProtect`/`FlushInstructionCache`/`VirtualFree` backend; Windows ABI fixtures and a native `windows-latest` CI lane now run workspace tests, clippy, and rustfmt; generated x86 execution remains SysV-gated and full Win64 ABI code generation remains open | `crates/forge-mem`, `.github/workflows/ci.yml`, `crates/forge-emit/tests/execution_corpus.rs` |
 
 The remaining open rows are intentional scope boundaries, not silent stubs.
 
