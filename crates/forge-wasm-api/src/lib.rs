@@ -154,9 +154,126 @@ pub fn cpu_features_wasm() -> String {
 /// boundary; this function gives editors an immediate diagnostics hook.
 #[wasm_bindgen]
 pub fn parse_and_check(source: &str) -> String {
-    match forge_wasm::compile(source) {
-        Ok(_) => r#"{"ok":true}"#.to_string(),
-        Err(error) => format!(r#"{{"ok":false,"error":{error:?}}}"#),
+    let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
+    if !lex_diags.is_empty() {
+        return diagnostic_report("lex", &lex_diags);
+    }
+    let (ast, parse_diags) = forge_syntax::parser::parse(&tokens);
+    if !parse_diags.is_empty() {
+        return diagnostic_report("parse", &parse_diags);
+    }
+    let typed = match forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast)) {
+        Ok(typed) => typed,
+        Err(diags) => return diagnostic_report("type", &diags),
+    };
+    let root = ast_json(&typed.ast, typed.ast.root);
+    let params = typed
+        .params
+        .iter()
+        .map(|(name, ty)| {
+            format!(
+                "{{\"name\":{},\"type\":{}}}",
+                json_string(name),
+                json_string(&format!("{ty:?}").to_lowercase())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"ok":true,"stage":"checked","ast":{},"parameters":[{}],"result_type":{}}}"#,
+        root,
+        params,
+        json_string(&format!("{:?}", typed.types[typed.ast.root.index()]).to_lowercase())
+    )
+}
+
+fn diagnostic_report(stage: &str, diagnostics: &[forge_syntax::Diagnostic]) -> String {
+    let diagnostics = diagnostics
+        .iter()
+        .map(diagnostic_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"ok":false,"stage":{},"diagnostics":[{}]}}"#,
+        json_string(stage),
+        diagnostics
+    )
+}
+
+fn diagnostic_json(diagnostic: &forge_syntax::Diagnostic) -> String {
+    let secondary = diagnostic
+        .secondary
+        .iter()
+        .map(label_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"message":{},"primary":{},"secondary":[{}]}}"#,
+        json_string(&diagnostic.message),
+        label_json(&diagnostic.primary),
+        secondary
+    )
+}
+
+fn label_json(label: &forge_syntax::diagnostic::Label) -> String {
+    format!(
+        r#"{{"start":{},"end":{},"message":{}}}"#,
+        label.span.start,
+        label.span.end,
+        json_string(&label.message)
+    )
+}
+
+fn ast_json(ast: &forge_syntax::ast::Ast, idx: forge_syntax::ast::ExprIdx) -> String {
+    use forge_syntax::ast::Expr;
+
+    let span = ast.span(idx);
+    let span_json = format!(r#""span":{{"start":{},"end":{}}}"#, span.start, span.end);
+    match ast.get(idx) {
+        Expr::Float(value) => format!(r#"{{"kind":"float","value":{},{} }}"#, value, span_json),
+        Expr::Int(value) => format!(r#"{{"kind":"int","value":{},{} }}"#, value, span_json),
+        Expr::Bool(value) => format!(r#"{{"kind":"bool","value":{},{} }}"#, value, span_json),
+        Expr::Ident(name) => format!(
+            r#"{{"kind":"ident","name":{},{} }}"#,
+            json_string(name),
+            span_json
+        ),
+        Expr::Unary { op, operand } => format!(
+            r#"{{"kind":"unary","op":{},"operand":{},{} }}"#,
+            json_string(&format!("{op:?}").to_lowercase()),
+            ast_json(ast, *operand),
+            span_json
+        ),
+        Expr::Binary { op, lhs, rhs } => format!(
+            r#"{{"kind":"binary","op":{},"lhs":{},"rhs":{},{} }}"#,
+            json_string(&format!("{op:?}").to_lowercase()),
+            ast_json(ast, *lhs),
+            ast_json(ast, *rhs),
+            span_json
+        ),
+        Expr::Call { callee, args } => format!(
+            r#"{{"kind":"call","callee":{},"args":[{}],{} }}"#,
+            json_string(callee),
+            args.iter()
+                .map(|arg| ast_json(ast, *arg))
+                .collect::<Vec<_>>()
+                .join(","),
+            span_json
+        ),
+        Expr::If { cond, then_, else_ } => format!(
+            r#"{{"kind":"if","cond":{},"then":{},"else":{},{} }}"#,
+            ast_json(ast, *cond),
+            ast_json(ast, *then_),
+            ast_json(ast, *else_),
+            span_json
+        ),
+        Expr::Let { name, value, body } => format!(
+            r#"{{"kind":"let","name":{},"value":{},"body":{},{} }}"#,
+            json_string(name),
+            ast_json(ast, *value),
+            ast_json(ast, *body),
+            span_json
+        ),
     }
 }
 
@@ -166,8 +283,14 @@ mod tests {
 
     #[test]
     fn browser_status_reports_success_and_diagnostics() {
-        assert_eq!(parse_and_check("x + 1.0"), r#"{"ok":true}"#);
-        assert!(parse_and_check("x +").contains(r#""ok":false"#));
+        let success = parse_and_check("x + 1.0");
+        assert!(success.contains(r#""ok":true"#));
+        assert!(success.contains(r#""kind":"binary""#));
+        assert!(success.contains(r#""start":0,"end":7"#));
+        let error = parse_and_check("x +");
+        assert!(error.contains(r#""ok":false"#));
+        assert!(error.contains(r#""stage":"parse""#));
+        assert!(error.contains(r#""diagnostics":["#));
     }
 
     #[test]
