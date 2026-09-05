@@ -304,4 +304,12 @@ mod tests {
             255.0
         );
     }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[test]
+    fn win64_jit_preserves_live_value_across_libm_call() {
+        let compiled = compile("sin(x) + y").unwrap();
+        let expected = 0.5f64.sin() + 2.0;
+        assert_eq!(compiled.call(&[0.5, 2.0]).to_bits(), expected.to_bits());
+    }
 }
