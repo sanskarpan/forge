@@ -954,7 +954,7 @@ mod tests {
             "literal pool must be eight-byte aligned"
         );
         let words = bytes
-            .chunks_exact(4)
+            .chunks(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(
@@ -983,7 +983,7 @@ mod tests {
         let bytes = emit_i64(&function).unwrap();
         assert_eq!(bytes.len() % 4, 0);
         let words = bytes
-            .chunks_exact(4)
+            .chunks(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(words.iter().any(|word| word & 0xffc0_0000 == 0x9ac0_0000));
