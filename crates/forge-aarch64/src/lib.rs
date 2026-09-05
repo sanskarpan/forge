@@ -2,7 +2,7 @@
 //! backend. Instructions are kept as 32-bit words until [`Assembler::bytes`]
 //! serializes them in architectural little-endian order.
 
-use forge_ir::{Function, Inst, Terminator, Ty, Value};
+use forge_ir::{CmpOp, Function, Inst, Terminator, Ty, Value};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +219,11 @@ impl Assembler {
     pub fn fmov_d(&mut self, dst: Gpr, src: Gpr) {
         self.words.push(fmov_d(dst, src));
     }
+
+    /// Emits `fcmp Dn, Dm`, which writes the AArch64 condition flags.
+    pub fn fcmp_d(&mut self, lhs: Gpr, rhs: Gpr) {
+        self.words.push(fcmp_d(lhs, rhs));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,6 +328,10 @@ pub fn fneg_d(dst: Gpr, src: Gpr) -> u32 {
 
 pub fn fmov_d(dst: Gpr, src: Gpr) -> u32 {
     0x1e60_4000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
+pub fn fcmp_d(lhs: Gpr, rhs: Gpr) -> u32 {
+    0x1e60_2000 | (u32::from(rhs.index()) << 16) | (u32::from(lhs.index()) << 5)
 }
 
 pub fn fmadd_d(dst: Gpr, lhs: Gpr, rhs: Gpr, addend: Gpr) -> u32 {
@@ -501,63 +510,56 @@ pub fn is_native_target() -> bool {
     backend_info().target_available
 }
 
-/// Emits a complete AAPCS64 scalar f64 function for a straight-line IR
-/// function. Parameters use D0..D7, temporaries use D8..D30, and constants
-/// are loaded from an aligned literal pool placed after the return. This is a
-/// deliberately strict first executable boundary: control flow, integer
-/// values, conversions, and libm calls return an explicit error until their
-/// ABI and lowering rules are implemented for AArch64.
+/// Emits a complete AAPCS64 scalar f64 function for the supported IR subset.
+/// Parameters use D0..D7, temporaries use D8..D30, and constants are loaded
+/// from an aligned literal pool placed after the code. Arithmetic and f64
+/// comparisons are emitted directly; branch edges materialize SSA φ values
+/// before control transfer. Integer values, conversions, and libm calls return
+/// an explicit error until their AArch64 ABI and lowering rules are implemented.
 pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
-    if function.blocks.len() != 1 {
-        return Err("AArch64 emitter currently requires one straight-line block".to_string());
+    if function.blocks.is_empty() {
+        return Err("AArch64 emitter requires at least one block".to_string());
     }
-    let Some(Terminator::Return(result)) = function.blocks[0].term.as_ref() else {
-        return Err("AArch64 emitter requires a returning function".to_string());
-    };
     if function.params.iter().any(|(_, ty)| *ty != Ty::F64) {
-        return Err("AArch64 emitter currently accepts f64 parameters and result only".to_string());
-    }
-    let Some(result_ty) = function.types.get(result.0 as usize) else {
-        return Err(format!("return value {result:?} has no type"));
-    };
-    if *result_ty != Ty::F64 {
         return Err("AArch64 emitter currently accepts f64 parameters and result only".to_string());
     }
 
     let mut registers = HashMap::<Value, Gpr>::new();
-    for &value in &function.blocks[0].insts {
-        let Some(inst) = function.insts.get(value.0 as usize) else {
-            return Err(format!("block references missing instruction {value:?}"));
-        };
-        let register = match inst {
-            Inst::Param { index, ty: Ty::F64 } => {
-                let Some((_, _)) = function.params.get(*index as usize) else {
-                    return Err(format!("parameter index {index} is out of range"));
-                };
-                let ordinal = function.params[..*index as usize]
-                    .iter()
-                    .filter(|(_, ty)| *ty == Ty::F64)
-                    .count();
-                if ordinal >= 8 {
-                    return Err("AArch64 emitter supports at most 8 f64 parameters".to_string());
+    for block in &function.blocks {
+        for &value in &block.insts {
+            let Some(inst) = function.insts.get(value.0 as usize) else {
+                return Err(format!("block references missing instruction {value:?}"));
+            };
+            let register = match inst {
+                Inst::Param { index, ty: Ty::F64 } => {
+                    let Some((_, _)) = function.params.get(*index as usize) else {
+                        return Err(format!("parameter index {index} is out of range"));
+                    };
+                    let ordinal = function.params[..*index as usize]
+                        .iter()
+                        .filter(|(_, ty)| *ty == Ty::F64)
+                        .count();
+                    if ordinal >= 8 {
+                        return Err("AArch64 emitter supports at most 8 f64 parameters".to_string());
+                    }
+                    Gpr::new(ordinal as u8)
                 }
-                Gpr::new(ordinal as u8)
-            }
-            Inst::Param { .. } => {
-                return Err("AArch64 emitter currently accepts f64 parameters only".to_string())
-            }
-            _ => {
-                let index = u8::try_from(value.0)
-                    .ok()
-                    .and_then(|index| index.checked_add(8))
-                    .filter(|index| *index < 31)
-                    .ok_or_else(|| {
-                        "AArch64 emitter ran out of D-register temporaries".to_string()
-                    })?;
-                Gpr::new(index)
-            }
-        };
-        registers.insert(value, register);
+                Inst::Param { .. } => {
+                    return Err("AArch64 emitter currently accepts f64 parameters only".to_string())
+                }
+                _ => {
+                    let index = u8::try_from(value.0)
+                        .ok()
+                        .and_then(|index| index.checked_add(8))
+                        .filter(|index| *index < 31)
+                        .ok_or_else(|| {
+                            "AArch64 emitter ran out of D-register temporaries".to_string()
+                        })?;
+                    Gpr::new(index)
+                }
+            };
+            registers.insert(value, register);
+        }
     }
 
     let register_of = |value: Value| {
@@ -571,68 +573,117 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
     let mut pool_indices = HashMap::<u64, usize>::new();
     let mut literal_loads = Vec::<(usize, usize, Gpr)>::new();
 
-    for &value in &function.blocks[0].insts {
-        let dst = registers[&value];
-        let Some(inst) = function.insts.get(value.0 as usize) else {
-            return Err(format!("block references missing instruction {value:?}"));
-        };
-        match inst {
-            Inst::ConstF64(bits) => {
-                let pool_index = match pool_indices.get(bits) {
-                    Some(index) => *index,
-                    None => {
-                        let index = pool.len();
-                        pool.push(*bits);
-                        pool_indices.insert(*bits, index);
-                        index
+    let mut block_offsets = vec![None; function.blocks.len()];
+    let mut branch_fixups = Vec::<(usize, usize, Option<Condition>)>::new();
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        block_offsets[block_index] = Some(asm.words.len() * 4);
+        for &value in &block.insts {
+            let dst = registers[&value];
+            let Some(inst) = function.insts.get(value.0 as usize) else {
+                return Err(format!("block references missing instruction {value:?}"));
+            };
+            match inst {
+                Inst::ConstF64(bits) => {
+                    let pool_index = match pool_indices.get(bits) {
+                        Some(index) => *index,
+                        None => {
+                            let index = pool.len();
+                            pool.push(*bits);
+                            pool_indices.insert(*bits, index);
+                            index
+                        }
+                    };
+                    let instruction_index = asm.words.len();
+                    asm.ldr_literal_d(dst, 0);
+                    literal_loads.push((instruction_index, pool_index, dst));
+                }
+                Inst::Param { .. } | Inst::Phi { .. } => {}
+                Inst::Add(lhs, rhs) => asm.fadd_d(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Sub(lhs, rhs) => asm.fsub_d(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Mul(lhs, rhs) => asm.fmul_d(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Div(lhs, rhs) => asm.fdiv_d(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Neg(value) => asm.fneg_d(dst, register_of(*value)?),
+                Inst::Abs(value) => asm.fabs_d(dst, register_of(*value)?),
+                Inst::Sqrt(value) => asm.fsqrt_d(dst, register_of(*value)?),
+                Inst::Fma { a, b, c } => {
+                    asm.fmadd_d(dst, register_of(*a)?, register_of(*b)?, register_of(*c)?)
+                }
+                Inst::Cmp { lhs, rhs, .. } => {
+                    if function.types[lhs.0 as usize] != Ty::F64
+                        || function.types[rhs.0 as usize] != Ty::F64
+                    {
+                        return Err("AArch64 f64 comparisons require f64 operands".to_string());
                     }
+                    asm.fcmp_d(register_of(*lhs)?, register_of(*rhs)?);
+                }
+                Inst::ConstI64(_)
+                | Inst::ConstBool(_)
+                | Inst::Rem(..)
+                | Inst::And(..)
+                | Inst::Or(..)
+                | Inst::Xor(..)
+                | Inst::Not(..)
+                | Inst::Shl(..)
+                | Inst::Shr(..)
+                | Inst::Sar(..)
+                | Inst::Min(..)
+                | Inst::Max(..)
+                | Inst::Floor(..)
+                | Inst::Ceil(..)
+                | Inst::Round(..)
+                | Inst::Trunc(..)
+                | Inst::Call { .. }
+                | Inst::IToF(..)
+                | Inst::FToI(..) => {
+                    return Err(format!("AArch64 f64 emitter does not support {:?}", inst))
+                }
+            }
+        }
+
+        match block.term.as_ref() {
+            Some(Terminator::Return(result)) => {
+                let Some(result_ty) = function.types.get(result.0 as usize) else {
+                    return Err(format!("return value {result:?} has no type"));
                 };
+                if *result_ty != Ty::F64 {
+                    return Err(
+                        "AArch64 emitter currently accepts f64 parameters and result only"
+                            .to_string(),
+                    );
+                }
+                let result_register = register_of(*result)?;
+                if result_register != Gpr::new(0) {
+                    asm.fmov_d(Gpr::new(0), result_register);
+                }
+                asm.ret();
+            }
+            Some(Terminator::Jump(target)) => {
+                let target = target.0 as usize;
+                validate_target(function, target)?;
+                emit_phi_edge_copies(function, target, block_index, &registers, &mut asm)?;
                 let instruction_index = asm.words.len();
-                asm.ldr_literal_d(dst, 0);
-                literal_loads.push((instruction_index, pool_index, dst));
+                asm.b(0);
+                branch_fixups.push((instruction_index, target, None));
             }
-            Inst::Param { .. } => {}
-            Inst::Add(lhs, rhs) => asm.fadd_d(dst, register_of(*lhs)?, register_of(*rhs)?),
-            Inst::Sub(lhs, rhs) => asm.fsub_d(dst, register_of(*lhs)?, register_of(*rhs)?),
-            Inst::Mul(lhs, rhs) => asm.fmul_d(dst, register_of(*lhs)?, register_of(*rhs)?),
-            Inst::Div(lhs, rhs) => asm.fdiv_d(dst, register_of(*lhs)?, register_of(*rhs)?),
-            Inst::Neg(value) => asm.fneg_d(dst, register_of(*value)?),
-            Inst::Abs(value) => asm.fabs_d(dst, register_of(*value)?),
-            Inst::Sqrt(value) => asm.fsqrt_d(dst, register_of(*value)?),
-            Inst::Fma { a, b, c } => {
-                asm.fmadd_d(dst, register_of(*a)?, register_of(*b)?, register_of(*c)?)
+            Some(Terminator::Branch { cond, then_, else_ }) => {
+                let condition = condition_for_cmp(function, *cond)?;
+                let then_target = then_.0 as usize;
+                let else_target = else_.0 as usize;
+                validate_target(function, then_target)?;
+                validate_target(function, else_target)?;
+                emit_phi_edge_copies(function, then_target, block_index, &registers, &mut asm)?;
+                let conditional_index = asm.words.len();
+                asm.b_cond(condition, 0);
+                branch_fixups.push((conditional_index, then_target, Some(condition)));
+                emit_phi_edge_copies(function, else_target, block_index, &registers, &mut asm)?;
+                let else_index = asm.words.len();
+                asm.b(0);
+                branch_fixups.push((else_index, else_target, None));
             }
-            Inst::ConstI64(_)
-            | Inst::ConstBool(_)
-            | Inst::Rem(..)
-            | Inst::And(..)
-            | Inst::Or(..)
-            | Inst::Xor(..)
-            | Inst::Not(..)
-            | Inst::Shl(..)
-            | Inst::Shr(..)
-            | Inst::Sar(..)
-            | Inst::Cmp { .. }
-            | Inst::Min(..)
-            | Inst::Max(..)
-            | Inst::Floor(..)
-            | Inst::Ceil(..)
-            | Inst::Round(..)
-            | Inst::Trunc(..)
-            | Inst::Call { .. }
-            | Inst::IToF(..)
-            | Inst::FToI(..)
-            | Inst::Phi { .. } => {
-                return Err(format!("AArch64 f64 emitter does not support {:?}", inst))
-            }
+            None => return Err(format!("AArch64 block {block_index} has no terminator")),
         }
     }
 
-    let result_register = register_of(*result)?;
-    if result_register != Gpr::new(0) {
-        asm.fmov_d(Gpr::new(0), result_register);
-    }
-    asm.ret();
     if !pool.is_empty() && !asm.words.len().is_multiple_of(2) {
         asm.words.push(0);
     }
@@ -641,11 +692,82 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         let offset = pool_start as i32 - (instruction_index * 4) as i32;
         asm.words[instruction_index] = encode_ldr_literal_d(dst, offset);
     }
+    for (instruction_index, target, condition) in branch_fixups {
+        let target_offset = block_offsets[target].expect("validated block offset") as i32;
+        let source_offset = (instruction_index * 4) as i32;
+        let offset = target_offset - source_offset;
+        asm.words[instruction_index] = match condition {
+            Some(condition) => encode_branch_cond(condition, offset),
+            None => encode_branch(offset),
+        };
+    }
     for bits in pool {
         asm.words.push(bits as u32);
         asm.words.push((bits >> 32) as u32);
     }
     Ok(asm.bytes())
+}
+
+fn validate_target(function: &Function, target: usize) -> Result<(), String> {
+    if target >= function.blocks.len() {
+        Err(format!(
+            "AArch64 branch target block {target} is out of range"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn emit_phi_edge_copies(
+    function: &Function,
+    target: usize,
+    predecessor: usize,
+    registers: &HashMap<Value, Gpr>,
+    asm: &mut Assembler,
+) -> Result<(), String> {
+    for &value in &function.blocks[target].insts {
+        let Inst::Phi { incoming } = &function.insts[value.0 as usize] else {
+            continue;
+        };
+        if function.types[value.0 as usize] != Ty::F64 {
+            return Err("AArch64 emitter currently supports f64 phi values only".to_string());
+        }
+        let Some((_, source)) = incoming
+            .iter()
+            .find(|(block, _)| block.0 as usize == predecessor)
+        else {
+            return Err(format!(
+                "phi {value:?} has no incoming value for block {predecessor}"
+            ));
+        };
+        let destination = registers[&value];
+        let source = registers
+            .get(source)
+            .copied()
+            .ok_or_else(|| format!("missing phi source register for {source:?}"))?;
+        if destination != source {
+            asm.fmov_d(destination, source);
+        }
+    }
+    Ok(())
+}
+
+fn condition_for_cmp(function: &Function, value: Value) -> Result<Condition, String> {
+    let Inst::Cmp { op, .. } = function
+        .insts
+        .get(value.0 as usize)
+        .ok_or_else(|| format!("missing branch condition {value:?}"))?
+    else {
+        return Err("AArch64 branches currently require a direct f64 comparison".to_string());
+    };
+    Ok(match op {
+        CmpOp::Eq => Condition::Eq,
+        CmpOp::Ne => Condition::Ne,
+        CmpOp::Lt => Condition::Lt,
+        CmpOp::Le => Condition::Le,
+        CmpOp::Gt => Condition::Gt,
+        CmpOp::Ge => Condition::Ge,
+    })
 }
 
 #[cfg(test)]
@@ -675,6 +797,7 @@ mod tests {
         assert_eq!(sdiv(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x9ac2_0c20);
         assert_eq!(and_reg(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x8a02_0020);
         assert_eq!(fadd_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_2820);
+        assert_eq!(fcmp_d(Gpr::new(1), Gpr::new(2)), 0x1e62_2020);
         assert_eq!(fsqrt_d(Gpr::new(0), Gpr::new(1)), 0x1e61_c020);
         assert_eq!(
             fmadd_d(Gpr::new(0), Gpr::new(1), Gpr::new(2), Gpr::new(3)),
@@ -732,10 +855,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_control_flow_until_phi_and_branch_lowering_exists() {
+    fn emits_control_flow_and_phi_edge_copies() {
         let function = forge_runtime::lower_source("if x > 0.0 then x else -x").unwrap();
-        let error = emit_f64(&function).unwrap_err();
-        assert!(error.contains("one straight-line block"));
+        let bytes = emit_f64(&function).unwrap();
+        assert!(bytes.windows(4).any(|word| {
+            u32::from_le_bytes(word.try_into().unwrap()) & 0x7f00_0000 == 0x5400_0000
+        }));
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -748,5 +873,18 @@ mod tests {
         buffer.make_executable().unwrap();
         let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
         assert_eq!(compiled.call_args(&[3.0]), 10.0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_emitted_conditional_on_native_aarch64() {
+        let function = forge_runtime::lower_source("if x > 0.0 then x else -x").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
+        assert_eq!(compiled.call_args(&[3.0]), 3.0);
+        assert_eq!(compiled.call_args(&[-3.0]), 3.0);
     }
 }
