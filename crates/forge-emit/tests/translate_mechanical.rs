@@ -370,14 +370,6 @@ fn float_binops_use_the_matching_sse_op() {
             forge_x64::MachineInst::FloatDiv { dst, lhs, rhs },
             "divsd xmm0,xmm2",
         ),
-        (
-            forge_x64::MachineInst::FloatMin { dst, lhs, rhs },
-            "minsd xmm0,xmm2",
-        ),
-        (
-            forge_x64::MachineInst::FloatMax { dst, lhs, rhs },
-            "maxsd xmm0,xmm2",
-        ),
     ];
 
     for (inst, expected) in cases {
@@ -386,6 +378,29 @@ fn float_binops_use_the_matching_sse_op() {
         // dst == lhs here (both Xmm0), so the two-address `movsd` is
         // elided and only the op mnemonic should appear.
         assert_eq!(disassemble(asm.code()), vec![expected.to_string()]);
+    }
+
+    for (inst, op) in [
+        (
+            forge_x64::MachineInst::FloatMin { dst, lhs, rhs },
+            "minsd xmm0,xmm2",
+        ),
+        (
+            forge_x64::MachineInst::FloatMax { dst, lhs, rhs },
+            "maxsd xmm0,xmm2",
+        ),
+    ] {
+        let mut asm = Assembler::new();
+        forge_emit::translate_inst(&mut asm, &inst, &loc, &[]);
+        let actual = disassemble(asm.code());
+        assert_eq!(actual.len(), 7);
+        assert_eq!(actual[0], "ucomisd xmm0,xmm0");
+        assert!(actual[1].starts_with("jp near "));
+        assert_eq!(actual[2], "ucomisd xmm2,xmm2");
+        assert!(actual[3].starts_with("jp near "));
+        assert_eq!(actual[4], op);
+        assert!(actual[5].starts_with("jmp "));
+        assert_eq!(actual[6], "movsd xmm0,xmm2");
     }
 }
 

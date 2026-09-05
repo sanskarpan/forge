@@ -1,5 +1,5 @@
 use forge_ir::Value;
-use forge_x64::{AluOp, Assembler, Label, MachineInst, PhysReg, SseOp};
+use forge_x64::{AluOp, Assembler, ConditionCode, Label, MachineInst, PhysReg, SseOp};
 
 fn alu_binop(
     asm: &mut Assembler,
@@ -141,10 +141,10 @@ pub fn translate_inst(
             sse_binop(asm, loc, SseOp::Div, *dst, *lhs, *rhs)
         }
         MachineInst::FloatMin { dst, lhs, rhs } => {
-            sse_binop(asm, loc, SseOp::Min, *dst, *lhs, *rhs)
+            sse_minmax(asm, loc, *dst, *lhs, *rhs, SseOp::Min)
         }
         MachineInst::FloatMax { dst, lhs, rhs } => {
-            sse_binop(asm, loc, SseOp::Max, *dst, *lhs, *rhs)
+            sse_minmax(asm, loc, *dst, *lhs, *rhs, SseOp::Max)
         }
 
         MachineInst::FloatSqrt { dst, src } => {
@@ -268,6 +268,37 @@ pub fn translate_inst(
             )
         }
     }
+}
+
+/// Emits scalar min/max with the interpreter's `f64::min`/`f64::max` NaN
+/// behavior. x86 `minsd`/`maxsd` return the second operand whenever either
+/// operand is unordered, which is not the language contract: a single NaN
+/// is ignored and the non-NaN operand is returned. The unordered checks also
+/// preserve the ordinary hardware min/max behavior for signed zeroes.
+fn sse_minmax(
+    asm: &mut Assembler,
+    loc: &dyn Fn(Value) -> PhysReg,
+    dst: Value,
+    lhs: Value,
+    rhs: Value,
+    op: SseOp,
+) {
+    let (dst_r, lhs_r, rhs_r) = (loc(dst), loc(lhs), loc(rhs));
+    if dst_r != lhs_r {
+        asm.movsd_reg_reg(dst_r, lhs_r);
+    }
+
+    let lhs_nan = asm.new_label();
+    let done = asm.new_label();
+    asm.ucomisd_reg_reg(lhs_r, lhs_r);
+    asm.jcc(ConditionCode::Parity, lhs_nan);
+    asm.ucomisd_reg_reg(rhs_r, rhs_r);
+    asm.jcc(ConditionCode::Parity, done);
+    asm.sse_reg_reg(op, dst_r, rhs_r);
+    asm.jmp(done);
+    asm.bind(lhs_nan);
+    asm.movsd_reg_reg(dst_r, rhs_r);
+    asm.bind(done);
 }
 
 /// `idiv_reg`'s divisor operand must not itself be Rax/Rdx: `cqo` has already
