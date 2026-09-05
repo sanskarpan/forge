@@ -2,6 +2,18 @@
 
 use forge_ir::{Function, Inst, Terminator, Ty, Value};
 
+fn evaluate_scalar(source: &str, args: &[f64]) -> Result<f64, String> {
+    let values = args
+        .iter()
+        .copied()
+        .map(forge_ir::interp::RtValue::F64)
+        .collect::<Vec<_>>();
+    match forge_runtime::interpret_source(source, &values).map_err(|error| error.to_string())? {
+        forge_ir::interp::RtValue::F64(value) => Ok(value),
+        _ => Err("array evaluation expression did not return f64".to_string()),
+    }
+}
+
 /// CPU capabilities sampled when a compilation starts. The JIT uses a
 /// snapshot instead of compiling ISA assumptions into the portable frontend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,9 +144,7 @@ pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, S
                     .iter()
                     .map(|column| column[index])
                     .collect::<Vec<_>>();
-                values.push(
-                    forge_runtime::evaluate(source, &args).map_err(|error| error.to_string())?,
-                );
+                values.push(evaluate_scalar(source, &args)?);
             }
             return Ok(ArrayResult {
                 values,
@@ -150,7 +160,7 @@ pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, S
             .iter()
             .map(|column| column[index])
             .collect::<Vec<_>>();
-        values.push(forge_runtime::evaluate(source, &args).map_err(|error| error.to_string())?);
+        values.push(evaluate_scalar(source, &args)?);
     }
     Ok(ArrayResult {
         values,
