@@ -712,6 +712,116 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
     Ok(asm.bytes())
 }
 
+/// Emits a complete AAPCS64 scalar i64 function for straight-line IR.
+/// Parameters use X0..X7 and temporaries use X8..X30. Integer constants are
+/// materialized with MOVZ/MOVK, so this path does not need a literal pool.
+/// Control flow, boolean results, and mixed-type conversions remain separate
+/// ABI work; rejecting them here is safer than silently using the f64 path.
+pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
+    if function.blocks.len() != 1 {
+        return Err("AArch64 i64 emitter currently requires one straight-line block".to_string());
+    }
+    if function.params.iter().any(|(_, ty)| *ty != Ty::I64) {
+        return Err("AArch64 i64 emitter requires i64 parameters only".to_string());
+    }
+    let Some(Terminator::Return(result)) = function.blocks[0].term.as_ref() else {
+        return Err("AArch64 i64 emitter requires a return terminator".to_string());
+    };
+    if function.types.get(result.0 as usize) != Some(&Ty::I64) {
+        return Err("AArch64 i64 emitter requires an i64 result".to_string());
+    }
+
+    let mut registers = HashMap::<Value, Gpr>::new();
+    for block in &function.blocks {
+        for &value in &block.insts {
+            let Some(inst) = function.insts.get(value.0 as usize) else {
+                return Err(format!("block references missing instruction {value:?}"));
+            };
+            let register = match inst {
+                Inst::Param { index, ty: Ty::I64 } => {
+                    if *index as usize >= function.params.len() || *index >= 8 {
+                        return Err("AArch64 i64 emitter supports at most 8 parameters".to_string());
+                    }
+                    Gpr::new(*index as u8)
+                }
+                Inst::Param { .. } => {
+                    return Err("AArch64 i64 emitter requires i64 parameters only".to_string())
+                }
+                _ => {
+                    let index = u8::try_from(value.0)
+                        .ok()
+                        .and_then(|index| index.checked_add(8))
+                        .filter(|index| *index < 31)
+                        .ok_or_else(|| {
+                            "AArch64 i64 emitter ran out of X-register temporaries".to_string()
+                        })?;
+                    Gpr::new(index)
+                }
+            };
+            registers.insert(value, register);
+        }
+    }
+
+    let register_of = |value: Value| {
+        registers
+            .get(&value)
+            .copied()
+            .ok_or_else(|| format!("missing AArch64 register for value {value:?}"))
+    };
+    let mut asm = Assembler::new();
+    for &value in &function.blocks[0].insts {
+        let dst = registers[&value];
+        match function.insts.get(value.0 as usize) {
+            Some(Inst::ConstI64(number)) => emit_i64_constant(&mut asm, dst, *number as u64),
+            Some(Inst::Param { .. }) => {}
+            Some(Inst::Add(lhs, rhs)) => asm.add_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(Inst::Sub(lhs, rhs)) => asm.sub_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(Inst::Mul(lhs, rhs)) => asm.mul(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(Inst::Div(lhs, rhs)) => asm.sdiv(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(Inst::Rem(lhs, rhs)) => {
+                let lhs_reg = register_of(*lhs)?;
+                let rhs_reg = register_of(*rhs)?;
+                asm.sdiv(dst, lhs_reg, rhs_reg);
+                asm.msub(dst, dst, rhs_reg, lhs_reg);
+            }
+            Some(Inst::Neg(operand)) => asm.sub_reg(dst, SP, register_of(*operand)?),
+            Some(Inst::And(lhs, rhs)) => asm.and_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(Inst::Or(lhs, rhs)) => asm.orr_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(Inst::Xor(lhs, rhs)) => asm.eor_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(Inst::Not(operand)) => {
+                emit_i64_constant(&mut asm, dst, u64::MAX);
+                asm.eor_reg(dst, dst, register_of(*operand)?);
+            }
+            Some(Inst::Shl(lhs, rhs)) => asm.lsl(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(Inst::Shr(lhs, rhs)) => asm.lsr(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(Inst::Sar(lhs, rhs)) => asm.asr(dst, register_of(*lhs)?, register_of(*rhs)?),
+            Some(inst) => return Err(format!("AArch64 i64 emitter does not support {inst:?}")),
+            None => return Err(format!("missing instruction for value {value:?}")),
+        }
+    }
+
+    let result_register = register_of(*result)?;
+    if result_register != Gpr::new(0) {
+        // ORR Xd, XZR, Xm is the architectural MOV register alias.
+        asm.orr_reg(Gpr::new(0), SP, result_register);
+    }
+    asm.ret();
+    Ok(asm.bytes())
+}
+
+fn emit_i64_constant(asm: &mut Assembler, dst: Gpr, value: u64) {
+    let mut emitted = false;
+    for shift in [0u8, 16, 32, 48] {
+        let immediate = ((value >> shift) & u64::from(u16::MAX)) as u16;
+        if !emitted {
+            asm.movz(dst, immediate, shift);
+            emitted = true;
+        } else if immediate != 0 {
+            asm.movk(dst, immediate, shift);
+        }
+    }
+}
+
 fn validate_target(function: &Function, target: usize) -> Result<(), String> {
     if target >= function.blocks.len() {
         Err(format!(
@@ -865,6 +975,27 @@ mod tests {
         assert!(bytes.windows(4).any(|word| {
             u32::from_le_bytes(word.try_into().unwrap()) & 0x7f00_0000 == 0x5400_0000
         }));
+    }
+
+    #[test]
+    fn emits_straight_line_i64_arithmetic_without_a_literal_pool() {
+        let function = forge_runtime::lower_source("n % 7 + (n >> 2) + ~n").unwrap();
+        let bytes = emit_i64(&function).unwrap();
+        assert_eq!(bytes.len() % 4, 0);
+        let words = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.iter().any(|word| word & 0xffc0_0000 == 0x9ac0_0000));
+        assert!(words.iter().any(|word| word & 0xffc0_0000 == 0x9b00_0000));
+        assert_eq!(words.last(), Some(&0xd65f_03c0));
+    }
+
+    #[test]
+    fn i64_emitter_rejects_mixed_parameters_explicitly() {
+        let function = forge_runtime::lower_source("x + 1").unwrap();
+        let error = emit_i64(&function).unwrap_err();
+        assert!(error.contains("i64 parameters only"));
     }
 
     #[cfg(target_arch = "aarch64")]
