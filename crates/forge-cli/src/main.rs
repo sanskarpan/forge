@@ -29,7 +29,7 @@ enum Command {
     /// Compile an expression for an inspection target.
     Compile(CompileArgs),
     /// Print selected instructions and encoded bytes.
-    Asm(SourceArgs),
+    Asm(AsmArgs),
     /// Print textual SSA IR.
     Ir(IrArgs),
     /// Print the control-flow graph.
@@ -49,6 +49,14 @@ enum Command {
 #[derive(Debug, Args)]
 struct SourceArgs {
     expression: String,
+}
+
+#[derive(Debug, Args)]
+struct AsmArgs {
+    expression: String,
+    /// Add live virtual values and their allocated locations to each row.
+    #[arg(long)]
+    annotate: bool,
 }
 
 #[derive(Debug, Args)]
@@ -92,6 +100,12 @@ struct BenchArgs {
     expression: String,
     #[arg(long, default_value = "1,10,100,1K")]
     sizes: String,
+    /// Run this many calls before timing each sample.
+    #[arg(long, default_value_t = 0)]
+    warmup: usize,
+    /// Emit a stable JSON report instead of the tabular report.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -112,11 +126,13 @@ fn main() {
             args.features.as_deref(),
             args.emit,
         ),
-        Command::Asm(args) => inspect_command(&args.expression, Inspection::Assembly),
+        Command::Asm(args) => inspect_assembly(&args.expression, args.annotate),
         Command::Ir(args) => ir_command(&args.expression, args.after.as_deref()),
         Command::Cfg(args) => inspect_command_with_dot(&args.expression, args.dot),
         Command::Regalloc(args) => inspect_command(&args.expression, Inspection::Regalloc),
-        Command::Bench(args) => bench_command(&args.expression, &args.sizes),
+        Command::Bench(args) => {
+            bench_command(&args.expression, &args.sizes, args.warmup, args.json)
+        }
         Command::Verify(args) => verify_command(&args.expression, args.iters),
         Command::Cpuinfo => cpuinfo_command(&[]),
         Command::Repl => repl_command(),
@@ -301,16 +317,20 @@ fn compile_command(
 }
 
 enum Inspection {
-    Assembly,
     Regalloc,
 }
 
 fn inspect_command(expression: &str, inspection: Inspection) -> Result<(), String> {
     let artifacts = forge_runtime::compile_artifacts(expression).map_err(|e| e.to_string())?;
     match inspection {
-        Inspection::Assembly => print_assembly(&artifacts),
         Inspection::Regalloc => print_regalloc(&artifacts),
     }
+    Ok(())
+}
+
+fn inspect_assembly(expression: &str, annotate: bool) -> Result<(), String> {
+    let artifacts = forge_runtime::compile_artifacts(expression).map_err(|e| e.to_string())?;
+    print_assembly(&artifacts, annotate);
     Ok(())
 }
 
@@ -329,7 +349,7 @@ fn ir_command(expression: &str, after: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn print_assembly(artifacts: &forge_runtime::CompilationArtifacts) {
+fn print_assembly(artifacts: &forge_runtime::CompilationArtifacts, annotate: bool) {
     println!(
         "{}",
         paint(
@@ -339,10 +359,37 @@ fn print_assembly(artifacts: &forge_runtime::CompilationArtifacts) {
         )
     );
     for (index, instruction) in artifacts.selected.insts.iter().enumerate() {
-        println!("{index:04}: {instruction:?}");
+        if annotate {
+            println!(
+                "{index:04}: {instruction:?}    ; live: {}",
+                live_annotation(index as u32, artifacts)
+            );
+        } else {
+            println!("{index:04}: {instruction:?}");
+        }
     }
     println!("; encoded bytes ({})", artifacts.bytes.len());
     println!("{}", hex(&artifacts.bytes));
+}
+
+fn live_annotation(index: u32, artifacts: &forge_runtime::CompilationArtifacts) -> String {
+    let mut live = artifacts
+        .intervals
+        .iter()
+        .filter(|interval| interval.start <= index && index <= interval.end)
+        .filter_map(|interval| {
+            artifacts
+                .assignment
+                .get(&interval.value)
+                .map(|location| format!("v{}={location:?}", interval.value.0))
+        })
+        .collect::<Vec<_>>();
+    live.sort();
+    if live.is_empty() {
+        "none".to_string()
+    } else {
+        live.join(", ")
+    }
 }
 
 fn print_cfg(function: &forge_ir::Function, dot: bool) {
@@ -403,7 +450,7 @@ fn print_regalloc(artifacts: &forge_runtime::CompilationArtifacts) {
     println!("spills: {spills}");
 }
 
-fn bench_command(expression: &str, sizes: &str) -> Result<(), String> {
+fn bench_command(expression: &str, sizes: &str, warmup: usize, json: bool) -> Result<(), String> {
     let function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
     if function
         .params
@@ -413,26 +460,79 @@ fn bench_command(expression: &str, sizes: &str) -> Result<(), String> {
         return Err("bench currently accepts f64 parameters only".to_string());
     }
     let values = vec![1.25; function.params.len()];
-    println!("size\ttotal_us\tper_eval_ns");
-    for size in sizes
+    let interpreter_values = values
+        .iter()
+        .copied()
+        .map(forge_runtime::RtValue::F64)
+        .collect::<Vec<_>>();
+    let compiled = forge_runtime::compile(expression).ok();
+    let backend = if compiled.is_some() {
+        "native-jit"
+    } else {
+        "interpreter"
+    };
+    let samples = sizes
         .split(',')
         .map(parse_size)
         .collect::<Result<Vec<_>, _>>()?
-    {
-        let start = Instant::now();
-        for _ in 0..size {
-            std::hint::black_box(
-                forge_runtime::evaluate(expression, &values).map_err(|e| e.to_string())?,
+        .into_iter()
+        .map(|size| {
+            if size == 0 {
+                return Err("benchmark sizes must be greater than zero".to_string());
+            }
+            for _ in 0..warmup {
+                std::hint::black_box(run_bench_call(
+                    compiled.as_ref(),
+                    &function,
+                    &values,
+                    &interpreter_values,
+                ));
+            }
+            let start = Instant::now();
+            for _ in 0..size {
+                std::hint::black_box(run_bench_call(
+                    compiled.as_ref(),
+                    &function,
+                    &values,
+                    &interpreter_values,
+                ));
+            }
+            let elapsed = start.elapsed();
+            let nanos = elapsed.as_nanos() as f64 / size as f64;
+            Ok((size, elapsed.as_secs_f64() * 1_000_000.0, nanos))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if json {
+        print!("{{\"backend\":\"{backend}\",\"warmup\":{warmup},\"results\":[");
+        for (index, (size, total_us, per_eval_ns)) in samples.iter().enumerate() {
+            if index > 0 {
+                print!(",");
+            }
+            print!(
+                "{{\"size\":{size},\"total_us\":{total_us:.3},\"per_eval_ns\":{per_eval_ns:.1}}}"
             );
         }
-        let elapsed = start.elapsed();
-        let nanos = elapsed.as_nanos() as f64 / size as f64;
-        println!(
-            "{size}\t{:.3}\t{nanos:.1}",
-            elapsed.as_secs_f64() * 1_000_000.0
-        );
+        println!("]}}");
+    } else {
+        println!("backend: {backend}\nwarmup: {warmup}\nsize\ttotal_us\tper_eval_ns");
+        for (size, total_us, per_eval_ns) in samples {
+            println!("{size}\t{total_us:.3}\t{per_eval_ns:.1}");
+        }
     }
     Ok(())
+}
+
+fn run_bench_call(
+    compiled: Option<&forge_runtime::CompiledFunction>,
+    function: &forge_ir::Function,
+    values: &[f64],
+    interpreter_values: &[forge_runtime::RtValue],
+) -> forge_runtime::RtValue {
+    if let Some(compiled) = compiled {
+        forge_runtime::RtValue::F64(compiled.call(values))
+    } else {
+        forge_ir::interp::interpret(function, interpreter_values)
+    }
 }
 
 fn verify_command(expression: &str, iterations: usize) -> Result<(), String> {
@@ -594,7 +694,7 @@ fn repl_command_line(
         ":clear" => bindings.clear(),
         ":asm" => {
             let expression = parts.next().ok_or("usage: :asm EXPR")?;
-            inspect_command(expression, Inspection::Assembly)?;
+            inspect_assembly(expression, false)?;
         }
         ":ir" => {
             let expression = parts.next().ok_or("usage: :ir EXPR")?;
@@ -603,7 +703,7 @@ fn repl_command_line(
         ":bench" => {
             let expression = parts.next().ok_or("usage: :bench EXPR [SIZES]")?;
             let sizes = parts.next().unwrap_or("1,10,100,1K");
-            bench_command(expression, sizes)?;
+            bench_command(expression, sizes, 0, false)?;
         }
         command => return Err(format!("unknown REPL command {command:?}; try :help")),
     }
@@ -707,5 +807,13 @@ mod tests {
         });
         assert_eq!(exit_code(&verify, "mismatch at iteration 0"), 3);
         assert_eq!(exit_code(&verify, "type checking failed: bad input"), 2);
+    }
+
+    #[test]
+    fn asm_annotation_reports_allocated_values() {
+        let artifacts = forge_runtime::compile_artifacts("x + 1.0").unwrap();
+        let annotation = live_annotation(0, &artifacts);
+        assert!(annotation.contains("v"));
+        assert!(annotation.contains("Xmm"));
     }
 }
