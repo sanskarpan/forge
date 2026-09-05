@@ -14,7 +14,7 @@ implemented lower-level work is absent.
 | Area | Current state | Evidence |
 |---|---|---|
 | Front end, SSA IR, interpreter, optimizer, executable memory, x86 encoder and selection | Implemented and workspace-tested | `crates/forge-*/src`, `cargo test --workspace --offline` |
-| Final x86 emission | Implemented for selected scalar instructions, ABI parameters, libm calls, spill reload/store, stack frames, control flow, and return placement | `crates/forge-emit`, focused emitter tests |
+| Final x86 emission | Implemented for selected scalar instructions, System V and Win64 ABI parameters (including Win64 stack parameters), libm calls, spill reload/store, stack frames, control flow, return placement, and ABI-safe scratch selection; mixed-signature and broader external-ABI coverage remain open | `crates/forge-emit`, focused emitter tests, Windows-native CI |
 | Fixed-register allocation conflict | Implemented: non-fixed active victims spill; overlapping fixed intervals fail explicitly | `forge-regalloc` linear-scan tests |
 | Variable shifts | Implemented with allocator constraints for RCX/CL, an emission fallback move, and preservation of unrelated live RCX values | `forge-regalloc::excluded_registers`, emitter/layout tests |
 | Float remainder | Explicitly unsupported and rejected during x86 instruction selection; no approximation is emitted | `forge-x64/src/machine_inst/mod.rs` |
@@ -23,11 +23,27 @@ implemented lower-level work is absent.
 | SIMD | Runtime `CpuFeatures` snapshot, deterministic f64 width selection, packed straight-line f64 array execution on SSE2/AVX2/NEON, chunk/tail handling, source-ordered `reduce_sum` over packed chunks, and scalar fallback are implemented; vector IR and AVX-512 masked tails remain open | `crates/forge-simd` |
 | AArch64 | Native target capability API plus tested scalar integer/float/conversion/memory/branch/immediate encoder forms; AAPCS64 scalar f64 expression emission now includes arithmetic, comparisons, CFG branches, phi edge copies, aligned literal pools, CLI output, native ARM execution, and Linux ARM64 QEMU coverage; pure straight-line i64 emission now covers constants, arithmetic, signed division/remainder, bitwise operations, and shifts; mixed-type lowering, full ABI frames, libm calls, and broader register allocation remain open | `crates/forge-aarch64` |
 | WASM | Tested typed scalar byte emitter for `f64`, `i64`, and bool values, including arithmetic, comparisons, conditionals, lets, min/max, and fma lowering; structured artifact JSON exposes bytes, hex, parameter types, result type, lowered/optimized IR, and CFG; parse/type diagnostics now include source spans and a serialized AST; `benchmark(source, sizes)` exposes portable baseline timings and results; reproducible `wasm-pack --target web --release` plus `wasm-opt -Oz` packaging is CI-validated under the documented gzip-size boundary; native interval/assembly artifacts remain open because this target is stack-machine WASM | `crates/forge-wasm`, `crates/forge-wasm-api`, `.github/workflows/ci-containers.yml`, `containers/Dockerfile.wasm-ci` |
-| Benchmarks | Reusable compiled-expression benchmark helper and allocator Criterion benchmark exist | `crates/forge-bench`, `crates/forge-regalloc/benches` |
+| Benchmarks | Reusable compiled-expression benchmark helper exists; allocator Criterion benchmark now measures about 42–43 µs for its 1000-value workload, below the 50 µs target on the validation machine | `crates/forge-bench`, `crates/forge-regalloc/benches` |
 | Workbench | Dependency-free browser shell now supports debounced live compilation, structured AST and source diagnostics, execution status, error state, emitted WASM hex, signature metadata, lowered/optimized IR, CFG output, direct compiled-export timing samples, and the portable `benchmark(source, sizes)` baseline API; the full SPEC React workbench remains open | `workbench/`, `Makefile` |
-| Windows executable memory | Implemented `VirtualAlloc`/`VirtualProtect`/`FlushInstructionCache`/`VirtualFree` backend; Windows ABI fixtures and a native `windows-latest` CI lane now run workspace tests, clippy, and rustfmt; generated x86 execution remains SysV-gated and full Win64 ABI code generation remains open | `crates/forge-mem`, `.github/workflows/ci.yml`, `crates/forge-emit/tests/execution_corpus.rs` |
+| Windows executable memory | Implemented `VirtualAlloc`/`VirtualProtect`/`FlushInstructionCache`/`VirtualFree` backend; Win64 register/stack parameters, shadow space, caller-preserved scratch, live-value preservation across libm, and native `windows-latest` workspace/clippy/rustfmt coverage are implemented; mixed signatures, nonvolatile-register allocation, and broader external-ABI coverage remain open | `crates/forge-mem`, `crates/forge-emit`, `crates/forge-runtime`, `.github/workflows/ci.yml` |
 
 The remaining open rows are intentional scope boundaries, not silent stubs.
+
+### Validated implementation batch — 2026-09-06
+
+- PR #124 completed ABI-aware translation assertions and volatile Win64 XMM
+  scratch selection; PR #126 completed layout-level libm scratch selection and
+  native live-value coverage.
+- PR #128 reduced the allocator benchmark from the mid-50 µs range to about
+  42–43 µs without changing its workload or allocation policy.
+- PR #130 adds an end-to-end depth-100 runtime regression. These changes are
+  validated through the repository’s full Linux x86-64, emulated ARM64, WASM,
+  Workbench, build/lint, and native Windows lanes as their PRs merge.
+- The historical phase checkboxes below remain design-history markers. Open
+  scope is tracked explicitly in the table above and in each phase’s notes;
+  this section must not be read as claiming completion of vector IR/AVX-512,
+  full React Workbench, mixed AArch64 code generation, fuzz/Miri/Valgrind, or
+  other still-open boundaries.
 
 ---
 
