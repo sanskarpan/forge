@@ -104,6 +104,20 @@ pub fn evaluate(source: &str, args: &[f64]) -> Result<f64, CompileError> {
             "portable fallback accepts all-f64 functions only",
         ));
     }
+    #[cfg(target_arch = "aarch64")]
+    if function.types.last() == Some(&forge_ir::Ty::F64) {
+        // Keep the portable interpreter as the fallback for operations that
+        // the current AArch64 emitter has not implemented yet (libm calls,
+        // integer conversions, and so on). Supported scalar f64 expressions
+        // execute through the same W^X buffer API used by the x86 runtime.
+        if let Ok(bytes) = forge_aarch64::emit_f64(&function) {
+            let mut buffer = ExecutableBuffer::new(bytes.len())?;
+            buffer.write(|dst| dst[..bytes.len()].copy_from_slice(&bytes));
+            buffer.make_executable()?;
+            let compiled = CompiledExpr::from_buffer(buffer, args.len());
+            return Ok(compiled.call_args(args));
+        }
+    }
     match forge_ir::interp::interpret(
         &function,
         &args.iter().copied().map(RtValue::F64).collect::<Vec<_>>(),
@@ -262,5 +276,19 @@ mod tests {
         let compiled = compile("x * x + 1").unwrap();
         assert_eq!(compiled.arity(), 1);
         assert_eq!(compiled.call(&[3.0]), 10.0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn evaluate_runs_supported_code_natively_and_keeps_libm_fallback() {
+        assert_eq!(
+            evaluate("if x > 0.0 then x * 2.0 else -x", &[3.0]).unwrap(),
+            6.0
+        );
+        assert_eq!(
+            evaluate("if x > 0.0 then x * 2.0 else -x", &[-3.0]).unwrap(),
+            3.0
+        );
+        assert_eq!(evaluate("sqrt(x * x)", &[3.0]).unwrap(), 3.0);
     }
 }
