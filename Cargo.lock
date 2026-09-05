@@ -285,6 +285,8 @@ name = "forge-aarch64"
 version = "0.1.0"
 dependencies = [
  "forge-ir",
+ "forge-mem",
+ "forge-runtime",
 ]
 
 [[package]]
