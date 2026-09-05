@@ -37,6 +37,10 @@ pub fn compile_wasm(source: &str) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
 pub fn compile_artifact_json(source: &str) -> String {
     match compile_artifact(source) {
         Ok(artifact) => {
+            let analysis = match analysis_json(source) {
+                Ok(analysis) => analysis,
+                Err(error) => return format!(r#"{{"ok":false,"error":{}}}"#, json_string(&error)),
+            };
             let params = artifact
                 .parameter_types
                 .iter()
@@ -44,14 +48,80 @@ pub fn compile_artifact_json(source: &str) -> String {
                 .collect::<Vec<_>>()
                 .join(",");
             format!(
-                r#"{{"ok":true,"parameter_types":[{params}],"result_type":{},"wasm_bytes_hex":{},"wasm_bytes_len":{}}}"#,
+                r#"{{"ok":true,"parameter_types":[{params}],"result_type":{},"wasm_bytes_hex":{},"wasm_bytes_len":{},{} }}"#,
                 json_string(&artifact.result_type),
                 json_string(&artifact.wasm_hex),
-                artifact.wasm_bytes.len()
+                artifact.wasm_bytes.len(),
+                analysis
             )
         }
         Err(error) => format!(r#"{{"ok":false,"error":{}}}"#, json_string(&error)),
     }
+}
+
+/// Produces the target-independent analysis fields used by the workbench.
+/// WASM is a stack machine, so register intervals and native assembly are
+/// represented as empty arrays with an explicit encoding marker; the lowered
+/// and optimized IR plus CFG remain real artifacts from the compiler itself.
+fn analysis_json(source: &str) -> Result<String, String> {
+    let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
+    if !lex_diags.is_empty() {
+        return Err(format!("lexing failed: {lex_diags:?}"));
+    }
+    let (ast, parse_diags) = forge_syntax::parser::parse(&tokens);
+    if !parse_diags.is_empty() {
+        return Err(format!("parsing failed: {parse_diags:?}"));
+    }
+    let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
+        .map_err(|diags| format!("type checking failed: {diags:?}"))?;
+    let lowered = forge_ir::lower::lower(&typed);
+    forge_ir::verify::verify(&lowered)
+        .map_err(|error| format!("IR verification failed: {error}"))?;
+    let lowered_text = forge_ir::print::print_function(&lowered);
+    let mut optimized = forge_ir::lower::lower(&typed);
+    forge_opt::optimize(&mut optimized);
+    forge_ir::verify::verify(&optimized)
+        .map_err(|error| format!("optimized IR verification failed: {error}"))?;
+    let optimized_text = forge_ir::print::print_function(&optimized);
+    let ir_stages = format!(
+        "[{{\"name\":\"lowered\",\"text\":{}}},{{\"name\":\"optimized\",\"text\":{}}}]",
+        json_string(&lowered_text),
+        json_string(&optimized_text)
+    );
+    let cfg = cfg_dot(&optimized);
+    Ok(format!(
+        r#""ir_stages":{ir_stages},"cfg":{},"intervals":[],"asm":[],"encoding":"wasm-stack""#,
+        json_string(&cfg)
+    ))
+}
+
+fn cfg_dot(function: &forge_ir::Function) -> String {
+    use std::fmt::Write;
+
+    let mut dot = String::from("digraph forge_cfg {\n");
+    for (index, block) in function.blocks.iter().enumerate() {
+        writeln!(
+            dot,
+            "  block{index} [label=\"block{index}\\n{} instructions\"];",
+            block.insts.len()
+        )
+        .expect("writing to a String cannot fail");
+        match &block.term {
+            Some(forge_ir::Terminator::Jump(target)) => {
+                writeln!(dot, "  block{index} -> block{};", target.0)
+                    .expect("writing to a String cannot fail");
+            }
+            Some(forge_ir::Terminator::Branch { then_, else_, .. }) => {
+                writeln!(dot, "  block{index} -> block{} [label=\"then\"];", then_.0)
+                    .expect("writing to a String cannot fail");
+                writeln!(dot, "  block{index} -> block{} [label=\"else\"];", else_.0)
+                    .expect("writing to a String cannot fail");
+            }
+            Some(forge_ir::Terminator::Return(_)) | None => {}
+        }
+    }
+    dot.push('}');
+    dot
 }
 
 fn json_string(value: &str) -> String {
@@ -106,6 +176,10 @@ mod tests {
         assert!(artifact.contains(r#""ok":true"#));
         assert!(artifact.contains(r#""parameter_types":["f64","f64"]"#));
         assert!(artifact.contains(r#""wasm_bytes_len":"#));
+        assert!(artifact.contains(r#""ir_stages":["#));
+        assert!(artifact.contains(r#""cfg":"digraph forge_cfg"#));
+        assert!(artifact.contains(r#""intervals":[]"#));
+        assert!(artifact.contains(r#""encoding":"wasm-stack""#));
 
         let error = compile_artifact_json("x +");
         assert!(error.contains(r#""ok":false"#));
