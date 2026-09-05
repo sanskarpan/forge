@@ -10,16 +10,7 @@ use forge_syntax::typeck::{Ty, TypedAst};
 use std::collections::HashMap;
 
 pub fn evaluate(source: &str, args: &[f64]) -> Result<f64, String> {
-    let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
-    if !lex_diags.is_empty() {
-        return Err(format!("lexing failed: {lex_diags:?}"));
-    }
-    let (ast, parse_diags) = forge_syntax::parser::parse(&tokens);
-    if !parse_diags.is_empty() {
-        return Err(format!("parsing failed: {parse_diags:?}"));
-    }
-    let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
-        .map_err(|diags| format!("type checking failed: {diags:?}"))?;
+    let typed = typecheck_source(source)?;
     let function = forge_ir::lower::lower(&typed);
     if function.params.len() != args.len()
         || function
@@ -36,11 +27,24 @@ pub fn evaluate(source: &str, args: &[f64]) -> Result<f64, String> {
     }
 }
 
-/// Compiles a typed scalar expression to a one-function WASM module exporting
-/// `eval`. Parameters and results use their real WASM value types (`f64`,
-/// `i64`, or `i32` for Forge booleans), and each `let` binding becomes a local.
-/// The resulting bytes can be passed directly to `WebAssembly.instantiate`.
-pub fn compile(source: &str) -> Result<Vec<u8>, String> {
+/// The structured result of WASM compilation. The byte vector is directly
+/// consumable by `WebAssembly.instantiate`; the type metadata lets a browser
+/// host validate arguments before invocation without reparsing the source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WasmArtifact {
+    pub wasm_bytes: Vec<u8>,
+    pub wasm_hex: String,
+    pub parameter_types: Vec<String>,
+    pub result_type: String,
+}
+
+impl WasmArtifact {
+    pub fn parameter_count(&self) -> usize {
+        self.parameter_types.len()
+    }
+}
+
+fn typecheck_source(source: &str) -> Result<TypedAst, String> {
     let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
     if !lex_diags.is_empty() {
         return Err(format!("lexing failed: {lex_diags:?}"));
@@ -49,8 +53,31 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     if !parse_diags.is_empty() {
         return Err(format!("parsing failed: {parse_diags:?}"));
     }
-    let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
-        .map_err(|diags| format!("type checking failed: {diags:?}"))?;
+    forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
+        .map_err(|diags| format!("type checking failed: {diags:?}"))
+}
+
+fn type_name(ty: Ty) -> String {
+    match ty {
+        Ty::F64 => "f64",
+        Ty::I64 => "i64",
+        Ty::Bool => "bool",
+    }
+    .to_string()
+}
+
+/// Compiles a typed scalar expression to a one-function WASM module exporting
+/// `eval`. Parameters and results use their real WASM value types (`f64`,
+/// `i64`, or `i32` for Forge booleans), and each `let` binding becomes a local.
+/// The resulting bytes can be passed directly to `WebAssembly.instantiate`.
+pub fn compile(source: &str) -> Result<Vec<u8>, String> {
+    Ok(compile_artifact(source)?.wasm_bytes)
+}
+
+/// Compiles a source expression and returns both executable bytes and the
+/// signature metadata needed by a host-side ABI adapter.
+pub fn compile_artifact(source: &str) -> Result<WasmArtifact, String> {
+    let typed = typecheck_source(source)?;
     let params = typed
         .params
         .iter()
@@ -101,7 +128,17 @@ pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     let mut code = vec![1];
     code.extend(code_body);
     section(10, code, &mut module);
-    Ok(module)
+    let wasm_hex = module
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(WasmArtifact {
+        wasm_bytes: module,
+        wasm_hex,
+        parameter_types: typed.params.iter().map(|(_, ty)| type_name(*ty)).collect(),
+        result_type: type_name(typed.types[typed.ast.root.index()]),
+    })
 }
 
 fn collect_lets(
@@ -378,6 +415,19 @@ mod tests {
         let fma = compile("fma(x, y, z)").unwrap();
         assert!(fma.contains(&0xa2)); // f64.mul
         assert!(fma.contains(&0xa0)); // f64.add
+    }
+
+    #[test]
+    fn structured_artifact_contains_signature_and_hex() {
+        let artifact = compile_artifact("x + y").unwrap();
+        assert_eq!(artifact.parameter_types, ["f64", "f64"]);
+        assert_eq!(artifact.result_type, "f64");
+        assert_eq!(artifact.parameter_count(), 2);
+        assert_eq!(
+            artifact.wasm_hex.split_whitespace().count(),
+            artifact.wasm_bytes.len()
+        );
+        assert_eq!(artifact.wasm_hex.split_whitespace().next(), Some("00"));
     }
 
     #[test]
