@@ -686,4 +686,26 @@ mod tests {
         assert!(error.contains("invalid binding name"));
         assert!(bindings.is_empty());
     }
+
+    #[test]
+    fn exit_codes_distinguish_compile_and_verification_failures() {
+        let compile = Command::Compile(CompileArgs {
+            expression: "if x then x else x".to_string(),
+            arch: "aarch64".to_string(),
+            opt: "2".to_string(),
+            features: None,
+            emit: false,
+        });
+        assert_eq!(
+            exit_code(&compile, "AArch64 compilation failed: unsupported"),
+            2
+        );
+
+        let verify = Command::Verify(VerifyArgs {
+            expression: "x".to_string(),
+            iters: 1,
+        });
+        assert_eq!(exit_code(&verify, "mismatch at iteration 0"), 3);
+        assert_eq!(exit_code(&verify, "type checking failed: bad input"), 2);
+    }
 }
