@@ -31,11 +31,17 @@
     <h2>Emitted WASM bytes</h2>
     <pre id="hex" aria-live="polite">No compilation yet.</pre>
     <pre id="signature" aria-live="polite">No signature metadata yet.</pre>
+    <h2>IR stages</h2>
+    <pre id="ir" aria-live="polite">No IR artifacts yet.</pre>
+    <h2>Control-flow graph</h2>
+    <pre id="cfg" aria-live="polite">No CFG artifact yet.</pre>
     <script>
       const output = document.querySelector('#output');
       const status = document.querySelector('#status');
       const hex = document.querySelector('#hex');
       const signature = document.querySelector('#signature');
+      const ir = document.querySelector('#ir');
+      const cfg = document.querySelector('#cfg');
       let debounce;
 
       function parseArgs() {
@@ -66,8 +72,14 @@
             const report = JSON.parse(await api.compile_artifact_json(source));
             if (!report.ok) throw new Error(report.error);
             signature.textContent = `Signature: (${report.parameter_types.join(', ')}) → ${report.result_type}\nWASM bytes: ${report.wasm_bytes_len}`;
+            ir.textContent = report.ir_stages
+              .map(stage => `${stage.name}:\n${stage.text}`)
+              .join('\n');
+            cfg.textContent = report.cfg;
           } else {
             signature.textContent = 'Signature metadata unavailable in this bundle.';
+            ir.textContent = 'IR artifacts unavailable in this bundle.';
+            cfg.textContent = 'CFG artifact unavailable in this bundle.';
           }
           if (compile) {
             status.textContent = 'Compiling and instantiating WASM…';
@@ -93,6 +105,8 @@
           output.textContent = String(error);
           hex.textContent = 'No valid module emitted.';
           signature.textContent = 'No valid signature metadata.';
+          ir.textContent = 'No valid IR artifacts.';
+          cfg.textContent = 'No valid CFG artifact.';
         }
       }
 
