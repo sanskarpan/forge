@@ -1,5 +1,7 @@
 // crates/forge-mem/tests/wx_enforcement.rs
 
+#![cfg(unix)]
+
 use forge_mem::ExecutableBuffer;
 
 /// Proves W^X is genuinely enforced by the OS, not just "we didn't call
