@@ -369,6 +369,7 @@ dependencies = [
 name = "forge-runtime"
 version = "0.1.0"
 dependencies = [
+ "forge-aarch64",
  "forge-emit",
  "forge-ir",
  "forge-mem",
