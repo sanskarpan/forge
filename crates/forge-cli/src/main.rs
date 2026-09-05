@@ -7,7 +7,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::time::Instant;
 
 #[derive(Debug, Parser)]
@@ -123,8 +123,23 @@ fn main() {
     };
 
     if let Err(error) = result {
-        eprintln!("forge-cli: {error}");
+        eprintln!(
+            "{}",
+            paint(
+                &format!("forge-cli: {error}"),
+                31,
+                io::stderr().is_terminal()
+            )
+        );
         std::process::exit(exit_code(&cli.command, &error));
+    }
+}
+
+fn paint(text: &str, color: u8, terminal: bool) -> String {
+    if terminal && env::var_os("NO_COLOR").is_none() {
+        format!("\x1b[{color}m{text}\x1b[0m")
+    } else {
+        text.to_string()
     }
 }
 
@@ -302,7 +317,14 @@ fn ir_command(expression: &str, after: Option<&str>) -> Result<(), String> {
 }
 
 fn print_assembly(artifacts: &forge_runtime::CompilationArtifacts) {
-    println!("; selected x86-64 instructions");
+    println!(
+        "{}",
+        paint(
+            "; selected x86-64 instructions",
+            36,
+            io::stdout().is_terminal()
+        )
+    );
     for (index, instruction) in artifacts.selected.insts.iter().enumerate() {
         println!("{index:04}: {instruction:?}");
     }
@@ -463,8 +485,11 @@ fn repl_command() -> Result<(), String> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut line = String::new();
+    let mut bindings = HashMap::new();
+    let mut history = Vec::new();
     loop {
-        print!("forge> ");
+        let prompt = paint("forge>", 36, stdout.is_terminal());
+        print!("{prompt} ");
         stdout.flush().map_err(|e| e.to_string())?;
         line.clear();
         if stdin
@@ -482,12 +507,123 @@ fn repl_command() -> Result<(), String> {
         if expression.is_empty() {
             continue;
         }
-        match forge_runtime::evaluate(expression, &[]) {
+        history.push(expression.to_string());
+        if expression.starts_with(':') {
+            if expression == ":quit" || expression == ":q" {
+                break;
+            }
+            repl_command_line(expression, &mut bindings, &mut history)?;
+            continue;
+        }
+        match repl_evaluate(expression, &bindings) {
             Ok(value) => println!("{value}"),
-            Err(error) => eprintln!("forge-cli: {error}"),
+            Err(error) => eprintln!(
+                "{}",
+                paint(
+                    &format!("forge-cli: {error}"),
+                    31,
+                    io::stderr().is_terminal()
+                )
+            ),
         }
     }
     Ok(())
+}
+
+fn repl_command_line(
+    line: &str,
+    bindings: &mut HashMap<String, f64>,
+    history: &mut [String],
+) -> Result<(), String> {
+    let mut parts = line
+        .splitn(3, char::is_whitespace)
+        .filter(|part| !part.is_empty());
+    match parts.next().unwrap_or_default() {
+        ":help" => {
+            println!(":set NAME VALUE  bind a persistent f64 value");
+            println!(":unset NAME       remove a binding");
+            println!(":vars              list bindings");
+            println!(":history           list expressions entered this session");
+            println!(":clear             remove all bindings");
+            println!(":asm EXPR          inspect selected instructions and bytes");
+            println!(":ir EXPR           inspect SSA IR");
+            println!(":bench EXPR [SIZES] benchmark an expression");
+            println!(":quit              leave the REPL");
+        }
+        ":set" => {
+            let name = parts.next().ok_or("usage: :set NAME VALUE")?;
+            let value = parts
+                .next()
+                .ok_or("usage: :set NAME VALUE")?
+                .parse::<f64>()
+                .map_err(|error| format!("invalid value for {name}: {error}"))?;
+            if !is_identifier(name) {
+                return Err(format!("invalid binding name {name:?}"));
+            }
+            bindings.insert(name.to_string(), value);
+        }
+        ":unset" => {
+            let name = parts.next().ok_or("usage: :unset NAME")?;
+            bindings.remove(name);
+        }
+        ":vars" => {
+            let mut names = bindings.keys().collect::<Vec<_>>();
+            names.sort();
+            for name in names {
+                println!("{name} = {}", bindings[name]);
+            }
+        }
+        ":history" => {
+            for (index, entry) in history.iter().enumerate() {
+                println!("{:>4}  {entry}", index + 1);
+            }
+        }
+        ":clear" => bindings.clear(),
+        ":asm" => {
+            let expression = parts.next().ok_or("usage: :asm EXPR")?;
+            inspect_command(expression, Inspection::Assembly)?;
+        }
+        ":ir" => {
+            let expression = parts.next().ok_or("usage: :ir EXPR")?;
+            ir_command(expression, None)?;
+        }
+        ":bench" => {
+            let expression = parts.next().ok_or("usage: :bench EXPR [SIZES]")?;
+            let sizes = parts.next().unwrap_or("1,10,100,1K");
+            bench_command(expression, sizes)?;
+        }
+        command => return Err(format!("unknown REPL command {command:?}; try :help")),
+    }
+    Ok(())
+}
+
+fn repl_evaluate(expression: &str, bindings: &HashMap<String, f64>) -> Result<f64, String> {
+    let function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
+    if function
+        .params
+        .iter()
+        .any(|(_, ty)| *ty != forge_ir::Ty::F64)
+        || function.types.last() != Some(&forge_ir::Ty::F64)
+    {
+        return Err("REPL currently accepts f64 parameters and results only".to_string());
+    }
+    let values = function
+        .params
+        .iter()
+        .map(|(name, _)| {
+            bindings
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("missing binding for parameter {name:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    forge_runtime::evaluate(expression, &values).map_err(|e| e.to_string())
+}
+
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn parse_size(value: &str) -> Result<usize, String> {
@@ -510,4 +646,31 @@ fn hex(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_output_is_disabled_without_a_terminal() {
+        assert_eq!(paint("error", 31, false), "error");
+    }
+
+    #[test]
+    fn repl_bindings_are_reused_by_later_expressions() {
+        let mut bindings = HashMap::new();
+        let mut history = Vec::new();
+        repl_command_line(":set x 3", &mut bindings, &mut history).unwrap();
+        assert_eq!(repl_evaluate("x * 2", &bindings).unwrap(), 6.0);
+    }
+
+    #[test]
+    fn binding_names_are_checked_before_insertion() {
+        let mut bindings = HashMap::new();
+        let mut history = Vec::new();
+        let error = repl_command_line(":set 3x 1", &mut bindings, &mut history).unwrap_err();
+        assert!(error.contains("invalid binding name"));
+        assert!(bindings.is_empty());
+    }
 }
