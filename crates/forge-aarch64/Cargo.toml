@@ -5,3 +5,7 @@ edition.workspace = true
 
 [dependencies]
 forge-ir = { path = "../forge-ir" }
+
+[dev-dependencies]
+forge-mem = { path = "../forge-mem" }
+forge-runtime = { path = "../forge-runtime" }
