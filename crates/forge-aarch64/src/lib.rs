@@ -688,8 +688,12 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         asm.words.push(0);
     }
     let pool_start = asm.words.len() * 4;
-    for (instruction_index, _, dst) in literal_loads {
-        let offset = pool_start as i32 - (instruction_index * 4) as i32;
+    for (instruction_index, pool_index, dst) in literal_loads {
+        let literal_offset = pool_index
+            .checked_mul(8)
+            .and_then(|offset| i32::try_from(offset).ok())
+            .ok_or_else(|| "AArch64 literal pool is too large".to_string())?;
+        let offset = pool_start as i32 + literal_offset - (instruction_index * 4) as i32;
         asm.words[instruction_index] = encode_ldr_literal_d(dst, offset);
     }
     for (instruction_index, target, condition) in branch_fixups {
@@ -861,6 +865,19 @@ mod tests {
         assert!(bytes.windows(4).any(|word| {
             u32::from_le_bytes(word.try_into().unwrap()) & 0x7f00_0000 == 0x5400_0000
         }));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_distinct_literal_pool_entries_on_native_aarch64() {
+        let function = forge_runtime::lower_source("if x > 0.0 then x * 2.0 else -x").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
+        assert_eq!(compiled.call_args(&[3.0]), 6.0);
+        assert_eq!(compiled.call_args(&[-3.0]), 3.0);
     }
 
     #[cfg(target_arch = "aarch64")]
