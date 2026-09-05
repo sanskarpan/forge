@@ -533,7 +533,7 @@ fn repl_command() -> Result<(), String> {
 fn repl_command_line(
     line: &str,
     bindings: &mut HashMap<String, f64>,
-    history: &mut Vec<String>,
+    history: &mut [String],
 ) -> Result<(), String> {
     let mut parts = line
         .splitn(3, char::is_whitespace)
