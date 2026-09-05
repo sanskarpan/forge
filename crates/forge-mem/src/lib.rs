@@ -780,7 +780,13 @@ mod tests {
         {
             &[0xC0, 0x03, 0x5F, 0xD6]
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        {
+            // Windows x64 passes the first integer argument in RCX; the
+            // Unix x86-64 ABI uses RDI instead.
+            &[0x48, 0x89, 0xC8, 0xC3]
+        }
+        #[cfg(all(not(target_arch = "aarch64"), not(target_os = "windows")))]
         {
             &[0x48, 0x89, 0xF8, 0xC3]
         }
@@ -813,7 +819,12 @@ mod tests {
         {
             &[0x00, 0x00, 0x40, 0xFD, 0xC0, 0x03, 0x5F, 0xD6]
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(all(not(target_arch = "aarch64"), target_os = "windows"))]
+        {
+            // Windows x64 passes a pointer in RCX; Unix x86-64 uses RDI.
+            &[0xF2, 0x0F, 0x10, 0x01, 0xC3]
+        }
+        #[cfg(all(not(target_arch = "aarch64"), not(target_os = "windows")))]
         {
             &[0xF2, 0x0F, 0x10, 0x07, 0xC3]
         }

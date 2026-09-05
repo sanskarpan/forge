@@ -33,3 +33,17 @@ jobs:
           codesign --entitlements entitlements.plist -s - target/debug/examples/spike
       - name: run spike
         run: ./target/debug/examples/spike
+
+  windows-native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: cargo test
+        run: cargo test --workspace --locked
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
