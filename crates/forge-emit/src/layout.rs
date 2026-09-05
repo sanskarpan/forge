@@ -517,10 +517,11 @@ fn emit_libm_call(
     }
 
     let sources: Vec<PhysReg> = args.iter().map(|v| loc(*v)).collect();
+    let scratch = forge_regalloc::SCRATCH_XMM[2];
     if sources.len() == 2 && sources[0] == PhysReg::Xmm1 && sources[1] == PhysReg::Xmm0 {
-        asm.movsd_reg_reg(PhysReg::Xmm15, PhysReg::Xmm0);
+        asm.movsd_reg_reg(scratch, PhysReg::Xmm0);
         asm.movsd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
-        asm.movsd_reg_reg(PhysReg::Xmm1, PhysReg::Xmm15);
+        asm.movsd_reg_reg(PhysReg::Xmm1, scratch);
     } else {
         for (i, source) in sources.iter().enumerate() {
             let target = [PhysReg::Xmm0, PhysReg::Xmm1][i];
@@ -531,7 +532,7 @@ fn emit_libm_call(
     }
     asm.mov_reg_imm(PhysReg::R11, forge_x64::libm_address(func));
     asm.call_reg(PhysReg::R11);
-    asm.movsd_reg_reg(PhysReg::Xmm15, PhysReg::Xmm0);
+    asm.movsd_reg_reg(scratch, PhysReg::Xmm0);
     for (i, (reg, _)) in saved.iter().enumerate().rev() {
         if is_xmm_reg(*reg) {
             asm.movsd_reg_mem(*reg, PhysReg::Rsp, (save_base + i * 8) as i32);
@@ -539,8 +540,8 @@ fn emit_libm_call(
             asm.mov_reg_mem(*reg, PhysReg::Rsp, (save_base + i * 8) as i32);
         }
     }
-    if dst != PhysReg::Xmm15 {
-        asm.movsd_reg_reg(dst, PhysReg::Xmm15);
+    if dst != scratch {
+        asm.movsd_reg_reg(dst, scratch);
     }
     asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, bytes as i32);
 }
