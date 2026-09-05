@@ -497,6 +497,7 @@ impl<'a> LinearScan<'a> {
 /// per-comparison would risk the two computations silently drifting.
 pub fn populate_spill_weights(selected: &SelectedFunction, intervals: &mut [Interval]) {
     if selected.insts.is_empty() {
+        intervals.iter_mut().for_each(|iv| iv.spill_weight = 0.0);
         return;
     }
     let mut use_counts: FxHashMap<Value, u32> = FxHashMap::default();
@@ -1585,7 +1586,9 @@ mod tests {
     #[test]
     fn populate_spill_weights_a_value_never_read_scores_zero() {
         let selected = selected_fn(vec![]);
-        let mut intervals = vec![iv(0, 0, 10, crate::interval::RegClass::Gpr)];
+        let mut interval = iv(0, 0, 10, crate::interval::RegClass::Gpr);
+        interval.spill_weight = 99.0;
+        let mut intervals = vec![interval];
 
         populate_spill_weights(&selected, &mut intervals);
 
