@@ -33,14 +33,6 @@ pub struct ExecutableBuffer {
     state: ProtState,
 }
 
-#[cfg(windows)]
-compile_error!(
-    "forge-mem does not implement Windows yet (VirtualAlloc/VirtualProtect/FlushInstructionCache) -- \
-     see CHECKLIST.md Phase 5 and the design doc's explicit scope decision to skip Windows until \
-     there's a way to actually test it. Contributions welcome, but this must not silently compile \
-     into a no-op or panic-at-runtime stub that looks like it works."
-);
-
 // SAFETY: `ExecutableBuffer` owns its mapping exclusively. Moving it to
 // another thread and calling `write()`/executing there is safe --
 // `pthread_jit_write_protect_np` (macOS AArch64) is a per-thread hardware
@@ -50,9 +42,15 @@ unsafe impl Send for ExecutableBuffer {}
 // Deliberately NOT Sync: concurrent write() calls on the same buffer from
 // multiple threads need external synchronization this type doesn't provide.
 
+#[cfg(not(windows))]
 pub fn page_size() -> usize {
     // SAFETY: sysconf(_SC_PAGESIZE) has no preconditions.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+}
+
+#[cfg(windows)]
+pub fn page_size() -> usize {
+    platform::page_size()
 }
 
 fn round_up_to_page(size: usize, page: usize) -> usize {
@@ -408,6 +406,158 @@ mod platform {
         // x86-64: the icache is hardware-coherent with the dcache. Nothing
         // to do -- this empty fn exists so `write()`'s call site doesn't
         // need its own `#[cfg]` split.
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    use std::ffi::c_void;
+    use std::ptr;
+
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const MEM_RELEASE: u32 = 0x8000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+
+    #[repr(C)]
+    struct SystemInfo {
+        processor_architecture: u16,
+        reserved: u16,
+        page_size: u32,
+        minimum_application_address: *mut c_void,
+        maximum_application_address: *mut c_void,
+        active_processor_mask: usize,
+        number_of_processors: u32,
+        processor_type: u32,
+        allocation_granularity: u32,
+        processor_level: u16,
+        processor_revision: u16,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemInfo(info: *mut SystemInfo);
+        fn VirtualAlloc(
+            address: *mut c_void,
+            size: usize,
+            allocation_type: u32,
+            protect: u32,
+        ) -> *mut c_void;
+        fn VirtualProtect(
+            address: *mut c_void,
+            size: usize,
+            new_protect: u32,
+            old_protect: *mut u32,
+        ) -> i32;
+        fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
+        fn FlushInstructionCache(process: *mut c_void, address: *const c_void, size: usize) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+    }
+
+    pub fn page_size() -> usize {
+        let mut info = SystemInfo {
+            processor_architecture: 0,
+            reserved: 0,
+            page_size: 0,
+            minimum_application_address: ptr::null_mut(),
+            maximum_application_address: ptr::null_mut(),
+            active_processor_mask: 0,
+            number_of_processors: 0,
+            processor_type: 0,
+            allocation_granularity: 0,
+            processor_level: 0,
+            processor_revision: 0,
+        };
+        // SAFETY: `info` is a valid writable SYSTEM_INFO-sized structure;
+        // GetSystemInfo has no other preconditions.
+        unsafe { GetSystemInfo(&mut info) };
+        usize::try_from(info.page_size).unwrap_or(4096).max(1)
+    }
+
+    impl ExecutableBuffer {
+        pub fn new(size: usize) -> io::Result<Self> {
+            let len = round_up_to_page(size, page_size());
+            // SAFETY: null address requests an OS-selected region; `len` is
+            // non-zero and the protection is RW only, never RWX.
+            let ptr = unsafe {
+                VirtualAlloc(
+                    ptr::null_mut(),
+                    len,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            if ptr.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                ptr: ptr.cast(),
+                len,
+                state: ProtState::Writable,
+            })
+        }
+
+        pub fn write<F: FnOnce(&mut [u8])>(&mut self, f: F) {
+            debug_assert_eq!(
+                self.state,
+                ProtState::Writable,
+                "cannot write after make_executable on Windows"
+            );
+            // SAFETY: ptr/len are from a successful VirtualAlloc and the
+            // buffer is writable until make_executable is called.
+            unsafe {
+                f(std::slice::from_raw_parts_mut(self.ptr, self.len));
+                // There is no useful recovery channel in this API. The next
+                // make_executable/call will surface an OS error if the
+                // mapping itself is invalid; keep write's signature uniform
+                // with the Unix implementations.
+                let _ = FlushInstructionCache(GetCurrentProcess(), self.ptr.cast(), self.len);
+            }
+        }
+
+        pub fn make_executable(&mut self) -> io::Result<()> {
+            let mut old_protect = 0;
+            // SAFETY: ptr/len identify the complete allocation returned by
+            // VirtualAlloc, and old_protect points to valid stack storage.
+            let ok = unsafe {
+                VirtualProtect(
+                    self.ptr.cast(),
+                    self.len,
+                    PAGE_EXECUTE_READ,
+                    &mut old_protect,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.state = ProtState::Executable;
+            Ok(())
+        }
+
+        pub fn reset_to_writable(&mut self) -> io::Result<()> {
+            let mut old_protect = 0;
+            // SAFETY: ptr/len identify this live VirtualAlloc mapping.
+            let ok = unsafe {
+                VirtualProtect(self.ptr.cast(), self.len, PAGE_READWRITE, &mut old_protect)
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.state = ProtState::Writable;
+            Ok(())
+        }
+    }
+
+    impl Drop for ExecutableBuffer {
+        fn drop(&mut self) {
+            // SAFETY: ptr is the live allocation returned by VirtualAlloc;
+            // VirtualFree with MEM_RELEASE requires size zero.
+            unsafe {
+                let _ = VirtualFree(self.ptr.cast(), 0, MEM_RELEASE);
+            }
+        }
     }
 }
 
