@@ -224,6 +224,12 @@ impl Assembler {
     pub fn fcmp_d(&mut self, lhs: Gpr, rhs: Gpr) {
         self.words.push(fcmp_d(lhs, rhs));
     }
+
+    /// Emits `cmp Xn, Xm` (`subs XZR, Xn, Xm`), which writes the integer
+    /// condition flags used by the conditional branch forms.
+    pub fn cmp_reg(&mut self, lhs: Gpr, rhs: Gpr) {
+        self.words.push(cmp_reg(lhs, rhs));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,6 +338,10 @@ pub fn fmov_d(dst: Gpr, src: Gpr) -> u32 {
 
 pub fn fcmp_d(lhs: Gpr, rhs: Gpr) -> u32 {
     0x1e60_2000 | (u32::from(rhs.index()) << 16) | (u32::from(lhs.index()) << 5)
+}
+
+pub fn cmp_reg(lhs: Gpr, rhs: Gpr) -> u32 {
+    0xeb00_001f | (u32::from(rhs.index()) << 16) | (u32::from(lhs.index()) << 5)
 }
 
 pub fn fmadd_d(dst: Gpr, lhs: Gpr, rhs: Gpr, addend: Gpr) -> u32 {
@@ -510,18 +520,20 @@ pub fn is_native_target() -> bool {
     backend_info().target_available
 }
 
-/// Emits a complete AAPCS64 scalar f64 function for the supported IR subset.
-/// Parameters use D0..D7, temporaries use D8..D30, and constants are loaded
-/// from an aligned literal pool placed after the code. Arithmetic and f64
-/// comparisons are emitted directly; branch edges materialize SSA φ values
-/// before control transfer. Integer values, conversions, and libm calls return
-/// an explicit error until their AArch64 ABI and lowering rules are implemented.
+/// Emits a complete AAPCS64 scalar function with an f64 result for the
+/// supported IR subset. Floating parameters use D0..D7 and integer/bool
+/// parameters use X0..X7, as required by the independent AAPCS64 argument
+/// banks. Temporaries use the corresponding register number in their class;
+/// constants are loaded from an aligned literal pool or materialized with
+/// MOVZ/MOVK. Branch edges materialize typed SSA φ values before transfer.
+/// Stack frames, libm calls, and nonvolatile-register allocation remain outside
+/// this deliberately bounded emitter.
 pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
     if function.blocks.is_empty() {
         return Err("AArch64 emitter requires at least one block".to_string());
     }
-    if function.params.iter().any(|(_, ty)| *ty != Ty::F64) {
-        return Err("AArch64 emitter currently accepts f64 parameters and result only".to_string());
+    if function.types.last() != Some(&Ty::F64) {
+        return Err("AArch64 mixed scalar emitter requires an f64 result".to_string());
     }
 
     let mut registers = HashMap::<Value, Gpr>::new();
@@ -531,21 +543,23 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                 return Err(format!("block references missing instruction {value:?}"));
             };
             let register = match inst {
-                Inst::Param { index, ty: Ty::F64 } => {
-                    let Some((_, _)) = function.params.get(*index as usize) else {
+                Inst::Param { index, ty } => {
+                    let Some((_, declared_ty)) = function.params.get(*index as usize) else {
                         return Err(format!("parameter index {index} is out of range"));
                     };
+                    if declared_ty != ty {
+                        return Err(format!("parameter {index} has inconsistent IR type"));
+                    }
                     let ordinal = function.params[..*index as usize]
                         .iter()
-                        .filter(|(_, ty)| *ty == Ty::F64)
+                        .filter(|(_, candidate)| candidate == ty)
                         .count();
                     if ordinal >= 8 {
-                        return Err("AArch64 emitter supports at most 8 f64 parameters".to_string());
+                        return Err(format!(
+                            "AArch64 emitter supports at most 8 {ty:?} parameters"
+                        ));
                     }
                     Gpr::new(ordinal as u8)
-                }
-                Inst::Param { .. } => {
-                    return Err("AArch64 emitter currently accepts f64 parameters only".to_string())
                 }
                 _ => {
                     let index = u8::try_from(value.0)
@@ -598,43 +612,96 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                     literal_loads.push((instruction_index, pool_index, dst));
                 }
                 Inst::Param { .. } | Inst::Phi { .. } => {}
-                Inst::Add(lhs, rhs) => asm.fadd_d(dst, register_of(*lhs)?, register_of(*rhs)?),
-                Inst::Sub(lhs, rhs) => asm.fsub_d(dst, register_of(*lhs)?, register_of(*rhs)?),
-                Inst::Mul(lhs, rhs) => asm.fmul_d(dst, register_of(*lhs)?, register_of(*rhs)?),
-                Inst::Div(lhs, rhs) => asm.fdiv_d(dst, register_of(*lhs)?, register_of(*rhs)?),
-                Inst::Neg(value) => asm.fneg_d(dst, register_of(*value)?),
-                Inst::Abs(value) => asm.fabs_d(dst, register_of(*value)?),
-                Inst::Sqrt(value) => asm.fsqrt_d(dst, register_of(*value)?),
+                Inst::ConstI64(number) => emit_i64_constant(&mut asm, dst, *number as u64),
+                Inst::ConstBool(value) => emit_i64_constant(&mut asm, dst, u64::from(*value)),
+                Inst::Add(lhs, rhs) => {
+                    if function.types[value.0 as usize] == Ty::F64 {
+                        asm.fadd_d(dst, register_of(*lhs)?, register_of(*rhs)?);
+                    } else {
+                        asm.add_reg(dst, register_of(*lhs)?, register_of(*rhs)?);
+                    }
+                }
+                Inst::Sub(lhs, rhs) => {
+                    if function.types[value.0 as usize] == Ty::F64 {
+                        asm.fsub_d(dst, register_of(*lhs)?, register_of(*rhs)?);
+                    } else {
+                        asm.sub_reg(dst, register_of(*lhs)?, register_of(*rhs)?);
+                    }
+                }
+                Inst::Mul(lhs, rhs) => {
+                    if function.types[value.0 as usize] == Ty::F64 {
+                        asm.fmul_d(dst, register_of(*lhs)?, register_of(*rhs)?);
+                    } else {
+                        asm.mul(dst, register_of(*lhs)?, register_of(*rhs)?);
+                    }
+                }
+                Inst::Div(lhs, rhs) => {
+                    if function.types[value.0 as usize] == Ty::F64 {
+                        asm.fdiv_d(dst, register_of(*lhs)?, register_of(*rhs)?);
+                    } else {
+                        asm.sdiv(dst, register_of(*lhs)?, register_of(*rhs)?);
+                    }
+                }
+                Inst::Rem(lhs, rhs) => {
+                    if function.types[value.0 as usize] != Ty::I64 {
+                        return Err("AArch64 remainder requires i64 operands".to_string());
+                    }
+                    let lhs_reg = register_of(*lhs)?;
+                    let rhs_reg = register_of(*rhs)?;
+                    asm.sdiv(dst, lhs_reg, rhs_reg);
+                    asm.msub(dst, dst, rhs_reg, lhs_reg);
+                }
+                Inst::Neg(operand) => {
+                    if function.types[value.0 as usize] == Ty::F64 {
+                        asm.fneg_d(dst, register_of(*operand)?);
+                    } else {
+                        asm.sub_reg(dst, SP, register_of(*operand)?);
+                    }
+                }
+                Inst::Abs(value) => {
+                    if function.types[value.0 as usize] != Ty::F64 {
+                        return Err("AArch64 abs requires an f64 operand".to_string());
+                    }
+                    asm.fabs_d(dst, register_of(*value)?);
+                }
+                Inst::Sqrt(value) => {
+                    if function.types[value.0 as usize] != Ty::F64 {
+                        return Err("AArch64 sqrt requires an f64 operand".to_string());
+                    }
+                    asm.fsqrt_d(dst, register_of(*value)?);
+                }
                 Inst::Fma { a, b, c } => {
+                    if function.types[value.0 as usize] != Ty::F64 {
+                        return Err("AArch64 fma requires f64 operands".to_string());
+                    }
                     asm.fmadd_d(dst, register_of(*a)?, register_of(*b)?, register_of(*c)?)
                 }
-                Inst::Cmp { lhs, rhs, .. } => {
-                    if function.types[lhs.0 as usize] != Ty::F64
-                        || function.types[rhs.0 as usize] != Ty::F64
-                    {
-                        return Err("AArch64 f64 comparisons require f64 operands".to_string());
-                    }
-                    asm.fcmp_d(register_of(*lhs)?, register_of(*rhs)?);
+                Inst::And(lhs, rhs) => asm.and_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Or(lhs, rhs) => asm.orr_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Xor(lhs, rhs) => asm.eor_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Not(operand) => {
+                    emit_i64_constant(&mut asm, dst, u64::MAX);
+                    asm.eor_reg(dst, dst, register_of(*operand)?);
                 }
-                Inst::ConstI64(_)
-                | Inst::ConstBool(_)
-                | Inst::Rem(..)
-                | Inst::And(..)
-                | Inst::Or(..)
-                | Inst::Xor(..)
-                | Inst::Not(..)
-                | Inst::Shl(..)
-                | Inst::Shr(..)
-                | Inst::Sar(..)
-                | Inst::Min(..)
+                Inst::Shl(lhs, rhs) => asm.lsl(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Shr(lhs, rhs) => asm.lsr(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Sar(lhs, rhs) => asm.asr(dst, register_of(*lhs)?, register_of(*rhs)?),
+                Inst::Cmp { lhs, rhs, .. } => match function.types.get(lhs.0 as usize) {
+                    Some(Ty::F64) => asm.fcmp_d(register_of(*lhs)?, register_of(*rhs)?),
+                    Some(Ty::I64) | Some(Ty::Bool) => {
+                        asm.cmp_reg(register_of(*lhs)?, register_of(*rhs)?)
+                    }
+                    _ => return Err("AArch64 comparison has an invalid operand".to_string()),
+                },
+                Inst::IToF(value) => asm.scvtf(dst, register_of(*value)?),
+                Inst::FToI(value) => asm.fcvtzs(dst, register_of(*value)?),
+                Inst::Min(..)
                 | Inst::Max(..)
                 | Inst::Floor(..)
                 | Inst::Ceil(..)
                 | Inst::Round(..)
                 | Inst::Trunc(..)
-                | Inst::Call { .. }
-                | Inst::IToF(..)
-                | Inst::FToI(..) => {
+                | Inst::Call { .. } => {
                     return Err(format!("AArch64 f64 emitter does not support {:?}", inst))
                 }
             }
@@ -646,10 +713,7 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                     return Err(format!("return value {result:?} has no type"));
                 };
                 if *result_ty != Ty::F64 {
-                    return Err(
-                        "AArch64 emitter currently accepts f64 parameters and result only"
-                            .to_string(),
-                    );
+                    return Err("AArch64 mixed scalar emitter requires an f64 result".to_string());
                 }
                 let result_register = register_of(*result)?;
                 if result_register != Gpr::new(0) {
@@ -843,9 +907,7 @@ fn emit_phi_edge_copies(
         let Inst::Phi { incoming } = &function.insts[value.0 as usize] else {
             continue;
         };
-        if function.types[value.0 as usize] != Ty::F64 {
-            return Err("AArch64 emitter currently supports f64 phi values only".to_string());
-        }
+        let phi_type = function.types[value.0 as usize];
         let Some((_, source)) = incoming
             .iter()
             .find(|(block, _)| block.0 as usize == predecessor)
@@ -860,7 +922,11 @@ fn emit_phi_edge_copies(
             .copied()
             .ok_or_else(|| format!("missing phi source register for {source:?}"))?;
         if destination != source {
-            asm.fmov_d(destination, source);
+            if phi_type == Ty::F64 {
+                asm.fmov_d(destination, source);
+            } else {
+                asm.orr_reg(destination, SP, source);
+            }
         }
     }
     Ok(())
@@ -872,7 +938,7 @@ fn condition_for_cmp(function: &Function, value: Value) -> Result<Condition, Str
         .get(value.0 as usize)
         .ok_or_else(|| format!("missing branch condition {value:?}"))?
     else {
-        return Err("AArch64 branches currently require a direct f64 comparison".to_string());
+        return Err("AArch64 branches require a direct scalar comparison".to_string());
     };
     Ok(match op {
         CmpOp::Eq => Condition::Eq,
@@ -910,6 +976,7 @@ mod tests {
         assert_eq!(add_reg(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x8b02_0020);
         assert_eq!(sdiv(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x9ac2_0c20);
         assert_eq!(and_reg(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x8a02_0020);
+        assert_eq!(cmp_reg(Gpr::new(1), Gpr::new(2)), 0xeb02_003f);
         assert_eq!(fadd_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_2820);
         assert_eq!(fcmp_d(Gpr::new(1), Gpr::new(2)), 0x1e62_2020);
         assert_eq!(fsqrt_d(Gpr::new(0), Gpr::new(1)), 0x1e61_c020);
@@ -996,6 +1063,33 @@ mod tests {
         let function = forge_runtime::lower_source("x + 1").unwrap();
         let error = emit_i64(&function).unwrap_err();
         assert!(error.contains("i64 parameters only"));
+    }
+
+    #[test]
+    fn emits_mixed_i64_f64_parameters_and_conversion() {
+        let function = forge_runtime::lower_source("x + (n & 3)").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        assert_eq!(bytes.len() % 4, 0);
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.iter().any(|word| word & 0xffc0_0000 == 0x8a00_0000));
+        assert!(words.iter().any(|word| word & 0xffc0_0000 == 0x9e40_0000));
+        assert_eq!(words.last(), Some(&0xd65f_03c0));
+    }
+
+    #[test]
+    fn emits_mixed_integer_comparison_branch_to_f64_result() {
+        let function =
+            forge_runtime::lower_source("if (n & 1) > 0 then x + 1.0 else x - 1.0").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.iter().any(|word| *word & 0xffc0_001f == 0xeb00_001f));
+        assert!(words.iter().any(|word| *word & 0x7f00_0000 == 0x5400_0000));
     }
 
     #[cfg(target_arch = "aarch64")]
