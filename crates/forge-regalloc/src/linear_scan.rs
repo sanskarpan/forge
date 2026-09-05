@@ -153,10 +153,39 @@ fn precompute_excluded(
 static EMPTY_EXCLUSION_SET: std::sync::LazyLock<FxHashSet<PhysReg>> =
     std::sync::LazyLock::new(FxHashSet::default);
 
+#[derive(Default)]
+struct FreeRegs(u32);
+
+impl FreeRegs {
+    fn from_pool(pool: &[PhysReg]) -> Self {
+        let mut free = Self::default();
+        for &reg in pool {
+            free.insert(reg);
+        }
+        free
+    }
+
+    fn mask(reg: PhysReg) -> u32 {
+        1u32 << reg.encoding()
+    }
+
+    fn insert(&mut self, reg: PhysReg) {
+        self.0 |= Self::mask(reg);
+    }
+
+    fn remove(&mut self, reg: &PhysReg) {
+        self.0 &= !Self::mask(*reg);
+    }
+
+    fn contains(&self, reg: &PhysReg) -> bool {
+        self.0 & Self::mask(*reg) != 0
+    }
+}
+
 pub struct LinearScan<'a> {
     intervals: Vec<Interval>,
     active: Vec<usize>,
-    free_regs: FxHashSet<PhysReg>,
+    free_regs: FreeRegs,
     assignment: FxHashMap<Value, Location>,
     excluded: FxHashMap<Value, FxHashSet<PhysReg>>,
     allocatable: &'a [PhysReg],
@@ -173,7 +202,7 @@ impl<'a> LinearScan<'a> {
         LinearScan {
             intervals,
             active: Vec::new(),
-            free_regs: allocatable.iter().copied().collect(),
+            free_regs: FreeRegs::from_pool(allocatable),
             assignment: FxHashMap::default(),
             excluded: precompute_excluded(excluded_registers),
             allocatable,
@@ -234,10 +263,16 @@ impl<'a> LinearScan<'a> {
     /// non-excluded register (in `allocatable`'s declared order, for
     /// deterministic output) if neither case applies.
     fn pick_register(&mut self, i: usize, allocatable: &[PhysReg]) -> Option<PhysReg> {
-        let iv = self.intervals[i].clone();
-        let excluded = self.excluded_at(iv.value);
+        // Avoid cloning the whole interval on every scan step. The 1000-value
+        // benchmark exercises this path once per interval, so copying only
+        // the scalar fields removes a measurable hot-path cost without
+        // changing allocation semantics.
+        let value = self.intervals[i].value;
+        let start = self.intervals[i].start;
+        let hint = self.intervals[i].hint;
+        let excluded = self.excluded_at(value);
 
-        if let Some(hinted_value) = iv.hint {
+        if let Some(hinted_value) = hint {
             if let Some(Location::Reg(reg)) = self.assignment.get(&hinted_value) {
                 if self.free_regs.contains(reg) && !excluded.contains(reg) {
                     return Some(*reg);
@@ -249,7 +284,7 @@ impl<'a> LinearScan<'a> {
                 .position(|&j| self.intervals[j].value == hinted_value)
             {
                 let target_end = self.intervals[self.active[pos]].end;
-                if target_end == iv.start {
+                if target_end == start {
                     if let Some(Location::Reg(reg)) = self.assignment.get(&hinted_value).copied() {
                         if !excluded.contains(&reg) {
                             self.active.remove(pos);
@@ -461,7 +496,10 @@ impl<'a> LinearScan<'a> {
 /// active intervals' weights against each other, and re-deriving it
 /// per-comparison would risk the two computations silently drifting.
 pub fn populate_spill_weights(selected: &SelectedFunction, intervals: &mut [Interval]) {
-    let mut use_counts: HashMap<Value, u32> = HashMap::new();
+    if selected.insts.is_empty() {
+        return;
+    }
+    let mut use_counts: FxHashMap<Value, u32> = FxHashMap::default();
     for inst in &selected.insts {
         for used in reads_of(inst) {
             *use_counts.entry(used).or_insert(0) += 1;
@@ -503,13 +541,24 @@ pub fn allocate(
         (RegClass::Gpr, WIN64_SPILL_AWARE_ALLOCATABLE_GPR),
         (RegClass::Xmm, WIN64_SPILL_AWARE_ALLOCATABLE_XMM),
     ];
+    // Partition the owned input once. The previous filter+clone pass ran for
+    // each register class, copying every interval once even though each
+    // interval belongs to exactly one class.
+    let mut class_intervals = [Vec::new(), Vec::new()];
+    for interval in intervals {
+        let class = match interval.reg_class {
+            RegClass::Gpr => 0,
+            RegClass::Xmm => 1,
+        };
+        class_intervals[class].push(interval);
+    }
     for (class, pool) in pools {
-        let class_intervals: Vec<Interval> = intervals
-            .iter()
-            .filter(|iv| iv.reg_class == class)
-            .cloned()
-            .collect();
-        let mut scan = LinearScan::new(class_intervals, excluded_registers, pool, slot_end);
+        let class_index = match class {
+            RegClass::Gpr => 0,
+            RegClass::Xmm => 1,
+        };
+        let intervals = std::mem::take(&mut class_intervals[class_index]);
+        let mut scan = LinearScan::new(intervals, excluded_registers, pool, slot_end);
         scan.run();
         // Destructure rather than a consuming method call after a partial
         // move -- `assignment.extend(scan.assignment)` immediately
