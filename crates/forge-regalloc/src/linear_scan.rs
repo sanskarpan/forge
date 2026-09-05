@@ -471,9 +471,15 @@ pub fn allocate(
 
     let mut assignment = HashMap::new();
     let mut slot_end: Vec<u32> = Vec::new();
+    #[cfg(not(windows))]
     let pools = [
         (RegClass::Gpr, SPILL_AWARE_ALLOCATABLE_GPR),
         (RegClass::Xmm, SPILL_AWARE_ALLOCATABLE_XMM),
+    ];
+    #[cfg(windows)]
+    let pools = [
+        (RegClass::Gpr, WIN64_SPILL_AWARE_ALLOCATABLE_GPR),
+        (RegClass::Xmm, WIN64_SPILL_AWARE_ALLOCATABLE_XMM),
     ];
     for (class, pool) in pools {
         let class_intervals: Vec<Interval> = intervals
@@ -1582,7 +1588,10 @@ mod tests {
                 Location::Reg(_) => None,
             })
             .collect();
+        #[cfg(not(windows))]
         let expected_spills = 20 - SPILL_AWARE_ALLOCATABLE_GPR.len();
+        #[cfg(windows)]
+        let expected_spills = 20 - WIN64_SPILL_AWARE_ALLOCATABLE_GPR.len();
         assert_eq!(
             spilled.len(),
             expected_spills,
