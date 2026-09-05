@@ -12,6 +12,7 @@
       button { cursor: pointer; background: #2c6bed; border-color: #2c6bed; }
       pre { min-height: 2rem; padding: 1rem; background: #0b0e12; border-radius: .35rem; white-space: pre-wrap; }
       .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+      .status { color: #9aa7ba; min-height: 1.5rem; }
     </style>
   </head>
   <body>
@@ -25,14 +26,34 @@
       <label>Arguments (comma separated)<input id="args" value="3,4" /></label>
       <button id="run" type="button">Run</button>
     </div>
+    <p id="status" class="status" aria-live="polite">Ready.</p>
     <pre id="output" aria-live="polite">Ready.</pre>
+    <h2>Emitted WASM bytes</h2>
+    <pre id="hex" aria-live="polite">No compilation yet.</pre>
     <script>
       const output = document.querySelector('#output');
-      document.querySelector('#run').addEventListener('click', async () => {
+      const status = document.querySelector('#status');
+      const hex = document.querySelector('#hex');
+      let debounce;
+
+      function parseArgs() {
+        return document.querySelector('#args').value
+          .split(',')
+          .map(value => value.trim())
+          .filter(Boolean)
+          .map(Number);
+      }
+
+      function bytesToHex(bytes) {
+        return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join(' ');
+      }
+
+      async function runExpression() {
         const source = document.querySelector('#source').value;
-        const args = document.querySelector('#args').value.split(',').filter(Boolean).map(Number);
+        const args = parseArgs();
         const api = globalThis.forgeWasm;
         if (!api) {
+          status.textContent = 'No forge-wasm-api bundle loaded.';
           output.textContent = 'No forge-wasm-api bundle loaded.';
           return;
         }
@@ -40,19 +61,39 @@
           const compile = api.compile_wasm ?? api.compile;
           const run = api.run_wasm ?? api.run;
           if (compile) {
-            const bytes = compile(source);
-            const { instance } = await WebAssembly.instantiate(bytes, {});
+            status.textContent = 'Compiling and instantiating WASM…';
+            const bytes = await compile(source);
+            const byteArray = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+            hex.textContent = bytesToHex(byteArray);
+            const { instance } = await WebAssembly.instantiate(byteArray, {});
             if (typeof instance.exports.eval !== 'function') {
               throw new Error('compiled module does not export eval');
             }
             output.textContent = `WASM: ${instance.exports.eval(...args)}`;
+            status.textContent = 'Compiled successfully.';
           } else if (run) {
+            status.textContent = 'Running portable interpreter…';
             output.textContent = `Interpreter: ${await run(source, args)}`;
+            status.textContent = 'Ran successfully.';
           } else {
             throw new Error('forge-wasm-api exposes neither compile nor run');
           }
         }
-        catch (error) { output.textContent = String(error); }
+        catch (error) {
+          status.textContent = 'Compilation or execution failed.';
+          output.textContent = String(error);
+          hex.textContent = 'No valid module emitted.';
+        }
+      }
+
+      document.querySelector('#run').addEventListener('click', runExpression);
+      document.querySelector('#source').addEventListener('input', () => {
+        clearTimeout(debounce);
+        debounce = setTimeout(runExpression, 200);
+      });
+      document.querySelector('#args').addEventListener('input', () => {
+        clearTimeout(debounce);
+        debounce = setTimeout(runExpression, 200);
       });
     </script>
   </body>
