@@ -108,12 +108,14 @@ pub struct ArrayResult {
     pub used_packed_backend: bool,
 }
 
-/// Evaluates a pure expression over one column per free f64 parameter. Full
-/// chunks use the widest safe packed backend for the host when the lowered
-/// function is a straight-line f64 expression; the scalar interpreter remains
-/// the correctness fallback for control flow, libm calls, and operations whose
-/// hardware NaN/rounding behavior does not exactly match the oracle.
-pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, String> {
+#[derive(Debug, PartialEq)]
+pub struct ReductionResult {
+    pub value: f64,
+    pub plan: ArrayPlan,
+    pub used_packed_backend: bool,
+}
+
+fn prepare_array(source: &str, columns: &[&[f64]]) -> Result<(Function, ArrayPlan), String> {
     let function = forge_runtime::lower_source(source).map_err(|error| error.to_string())?;
     if function.params.len() != columns.len()
         || function.params.iter().any(|(_, ty)| *ty != Ty::F64)
@@ -128,7 +130,17 @@ pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, S
     if columns.iter().any(|column| column.len() != elements) {
         return Err("array columns must have equal lengths".to_string());
     }
-    let plan = ArrayPlan::for_len(elements);
+    Ok((function, ArrayPlan::for_len(elements)))
+}
+
+/// Evaluates a pure expression over one column per free f64 parameter. Full
+/// chunks use the widest safe packed backend for the host when the lowered
+/// function is a straight-line f64 expression; the scalar interpreter remains
+/// the correctness fallback for control flow, libm calls, and operations whose
+/// hardware NaN/rounding behavior does not exactly match the oracle.
+pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, String> {
+    let (function, plan) = prepare_array(source, columns)?;
+    let elements = plan.elements;
     if plan.full_chunks > 0 && plan.width != SimdWidth::Scalar {
         let mut values = Vec::with_capacity(elements);
         let lanes = plan.width.lanes();
@@ -164,6 +176,50 @@ pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, S
     }
     Ok(ArrayResult {
         values,
+        plan,
+        used_packed_backend: false,
+    })
+}
+
+/// Reduces the per-row results of a pure all-f64 expression in source order.
+/// Packed chunks are used for the expression evaluation when available, then
+/// their lanes are accumulated left-to-right so the reduction order is
+/// deterministic. Control flow, libm calls, and unsupported operations use
+/// the scalar interpreter for the complete reduction.
+pub fn reduce_sum(source: &str, columns: &[&[f64]]) -> Result<ReductionResult, String> {
+    let (function, plan) = prepare_array(source, columns)?;
+    if plan.full_chunks > 0 && plan.width != SimdWidth::Scalar {
+        let lanes = plan.width.lanes();
+        let packed_chunks = (0..plan.full_chunks)
+            .map(|chunk| try_evaluate_packed_chunk(&function, columns, chunk * lanes, plan.width))
+            .collect::<Option<Vec<_>>>();
+        if let Some(chunks) = packed_chunks {
+            let mut value = chunks.into_iter().flatten().sum::<f64>();
+            for index in plan.full_chunks * lanes..plan.elements {
+                let args = columns
+                    .iter()
+                    .map(|column| column[index])
+                    .collect::<Vec<_>>();
+                value += evaluate_scalar(source, &args)?;
+            }
+            return Ok(ReductionResult {
+                value,
+                plan,
+                used_packed_backend: true,
+            });
+        }
+    }
+
+    let mut value = 0.0;
+    for index in 0..plan.elements {
+        let args = columns
+            .iter()
+            .map(|column| column[index])
+            .collect::<Vec<_>>();
+        value += evaluate_scalar(source, &args)?;
+    }
+    Ok(ReductionResult {
+        value,
         plan,
         used_packed_backend: false,
     })
@@ -537,6 +593,26 @@ mod tests {
         let input = [0.0, 1.0, 2.0, 3.0];
         let result = evaluate_array("if x < 2.0 then x + 1.0 else x - 1.0", &[&input]).unwrap();
         assert_eq!(result.values, vec![1.0, 2.0, 1.0, 2.0]);
+        assert!(!result.used_packed_backend);
+    }
+
+    #[test]
+    fn sum_reduction_preserves_source_order_with_packed_chunks_and_tail() {
+        let input = (0..11).map(|value| value as f64).collect::<Vec<_>>();
+        let result = reduce_sum("x * x + 1.0", &[&input]).unwrap();
+        let expected = input
+            .iter()
+            .fold(0.0, |sum, value| sum + value * value + 1.0);
+        assert_eq!(result.value.to_bits(), expected.to_bits());
+        assert_eq!(result.plan.elements, input.len());
+        assert!(result.used_packed_backend == (result.plan.full_chunks > 0));
+    }
+
+    #[test]
+    fn sum_reduction_uses_scalar_oracle_for_control_flow() {
+        let input = [0.0, 1.0, 2.0, 3.0];
+        let result = reduce_sum("if x < 2.0 then x + 1.0 else x - 1.0", &[&input]).unwrap();
+        assert_eq!(result.value, 6.0);
         assert!(!result.used_packed_backend);
     }
 }
