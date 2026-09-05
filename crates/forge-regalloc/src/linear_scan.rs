@@ -154,7 +154,7 @@ static EMPTY_EXCLUSION_SET: std::sync::LazyLock<FxHashSet<PhysReg>> =
     std::sync::LazyLock::new(FxHashSet::default);
 
 #[derive(Default)]
-struct FreeRegs(u32);
+struct FreeRegs(u64);
 
 impl FreeRegs {
     fn from_pool(pool: &[PhysReg]) -> Self {
@@ -165,8 +165,8 @@ impl FreeRegs {
         free
     }
 
-    fn mask(reg: PhysReg) -> u32 {
-        1u32 << reg.encoding()
+    fn mask(reg: PhysReg) -> u64 {
+        1u64 << (reg as u8)
     }
 
     fn insert(&mut self, reg: PhysReg) {
