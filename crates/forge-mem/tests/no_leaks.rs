@@ -1,5 +1,7 @@
 // crates/forge-mem/tests/no_leaks.rs
 
+#![cfg(unix)]
+
 use forge_mem::ExecutableBuffer;
 
 /// `getrusage(RUSAGE_SELF).ru_maxrss` is a HIGH-WATER MARK, not a live RSS

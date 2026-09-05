@@ -5,6 +5,7 @@
 //! in the project matters — fix the platform setup before writing another
 //! line of forge.
 
+#[cfg(not(windows))]
 fn main() {
     // SAFETY: sysconf(_SC_PAGESIZE) has no preconditions — it just reads a
     // kernel-reported constant.
@@ -159,4 +160,11 @@ fn main() {
     let result = f(42);
     assert_eq!(result, 42);
     println!("JIT works: f(42) = {}", result);
+}
+
+#[cfg(windows)]
+fn main() {
+    eprintln!(
+        "forge-mem spike is not an execution test on Windows; use the library's VirtualAlloc test path"
+    );
 }
