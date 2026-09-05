@@ -291,4 +291,17 @@ mod tests {
         );
         assert_eq!(evaluate("sqrt(x * x)", &[3.0]).unwrap(), 3.0);
     }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[test]
+    fn win64_jit_executes_register_and_stack_f64_arguments() {
+        let five = compile("a + b + c + d + e").unwrap();
+        assert_eq!(five.call(&[1.0, 2.0, 4.0, 8.0, 16.0]), 31.0);
+
+        let eight = compile("a + b + c + d + e + f + g + h").unwrap();
+        assert_eq!(
+            eight.call(&[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]),
+            255.0
+        );
+    }
 }
