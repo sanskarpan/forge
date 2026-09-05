@@ -20,8 +20,8 @@ pub enum Location {
 
 /// System V AMD64 GPRs available for allocation: all 16 minus `Rsp`
 /// (stack pointer, never a virtual register's home) and `Rbp` (frame
-/// pointer, same reasoning as `prologue::SYSV_CALLEE_SAVED` already
-/// excluding it).
+/// pointer). This broad pool remains public for cross-target analysis
+/// fixtures; `allocate` selects the active ABI's narrower pool below.
 pub const ALLOCATABLE_GPR: &[PhysReg] = &[
     PhysReg::Rax,
     PhysReg::Rcx,
@@ -39,10 +39,9 @@ pub const ALLOCATABLE_GPR: &[PhysReg] = &[
     PhysReg::R15,
 ];
 
-/// XMM registers available for allocation: Xmm0-15 only. Xmm16-31 need
-/// EVEX to reach and nothing in this codebase can encode an
-/// EVEX-prefixed instruction yet, so handing one out would produce
-/// unencodable output.
+/// XMM registers available for allocation: Xmm0-15 only. Xmm16-31 need EVEX
+/// to reach and nothing in this codebase can encode an EVEX-prefixed
+/// instruction yet, so handing one out would produce unencodable output.
 pub const ALLOCATABLE_XMM: &[PhysReg] = &[
     PhysReg::Xmm0,
     PhysReg::Xmm1,
@@ -67,14 +66,12 @@ pub const ALLOCATABLE_XMM: &[PhysReg] = &[
 /// pool LinearScan scans over (SPILL_AWARE_ALLOCATABLE_* below), not from
 /// ALLOCATABLE_GPR/ALLOCATABLE_XMM themselves, which stay exactly as 8b
 /// shipped them (still the authoritative "which PhysRegs exist and are
-/// encodable" answer). R9/R10/R11 (not R14/R15) for GPR: R14/R15 are both
-/// members of prologue::SYSV_CALLEE_SAVED, so reserving them would force
-/// every spilling function's prologue/epilogue to push/pop a pair of
-/// registers used only transiently; R9/R10/R11 are caller-saved, no such
-/// cost. For XMM, Xmm13/Xmm14/Xmm15: ALL XMM registers are caller-saved under
-/// System V, so there is no equivalent cost differential to correct for.
-/// Three registers are reserved because a selected instruction can have two
-/// reads plus a distinct spilled destination (for example a compare).
+/// encodable" answer). R9/R10/R11 are used for GPR scratch traffic on both
+/// ABIs. For XMM, System V uses Xmm13-15 while Windows uses Xmm3-5: both
+/// ranges are caller-preserved on their respective ABI and remain available
+/// to the emitter without a save/restore frame. Three registers are reserved
+/// because a selected instruction can have two reads plus a distinct spilled
+/// destination (for example a compare).
 pub const SCRATCH_GPR: [PhysReg; 3] = [PhysReg::R9, PhysReg::R10, PhysReg::R11];
 pub const SCRATCH_XMM: [PhysReg; 3] = [PhysReg::Xmm13, PhysReg::Xmm14, PhysReg::Xmm15];
 
@@ -96,9 +93,18 @@ pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
     PhysReg::R15,
 ]; // 14 - 3 reserved (R9, R10, R11 excluded)
 
-/// Xmm13/Xmm14/Xmm15 ARE the last three entries of ALLOCATABLE_XMM, so
+/// Xmm13/Xmm14/Xmm15 are the last three entries of ALLOCATABLE_XMM, so
 /// split_at is correct here.
 pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = ALLOCATABLE_XMM.split_at(13).0; // 16 - 3 reserved
+
+#[cfg(windows)]
+#[allow(dead_code)]
+const WIN64_SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] =
+    &[PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8];
+#[cfg(windows)]
+#[allow(dead_code)]
+const WIN64_SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] =
+    &[PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2];
 
 /// Excludes a `Value`'s specific registers at SPECIFIC instruction
 /// positions (8a's `excluded_registers`, keyed per position for IntDiv/
@@ -465,10 +471,11 @@ pub fn allocate(
 
     let mut assignment = HashMap::new();
     let mut slot_end: Vec<u32> = Vec::new();
-    for (class, pool) in [
+    let pools = [
         (RegClass::Gpr, SPILL_AWARE_ALLOCATABLE_GPR),
         (RegClass::Xmm, SPILL_AWARE_ALLOCATABLE_XMM),
-    ] {
+    ];
+    for (class, pool) in pools {
         let class_intervals: Vec<Interval> = intervals
             .iter()
             .filter(|iv| iv.reg_class == class)
@@ -596,6 +603,30 @@ mod tests {
                 "{r:?} must be caller-saved to avoid an unnecessary push/pop pair"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win64_active_pools_avoid_nonvolatile_registers() {
+        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_GPR.iter().all(|reg| matches!(
+            reg,
+            PhysReg::Rax | PhysReg::Rcx | PhysReg::Rdx | PhysReg::R8
+        )));
+        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_XMM
+            .iter()
+            .all(|reg| reg.encoding() <= PhysReg::Xmm2.encoding()));
+        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_GPR
+            .iter()
+            .all(|reg| !matches!(
+                reg,
+                PhysReg::Rbx
+                    | PhysReg::Rsi
+                    | PhysReg::Rdi
+                    | PhysReg::R12
+                    | PhysReg::R13
+                    | PhysReg::R14
+                    | PhysReg::R15
+            )));
     }
 
     #[test]
@@ -1351,18 +1382,19 @@ mod tests {
                 intervals.len(),
                 "{src:?}: every interval must get a Location"
             );
-            assert_eq!(
-                bytes, 0,
-                "{src:?}: corpus programs never need a spill even under the narrower \
-                 SPILL_AWARE pools (max measured simultaneous liveness is 4 GPR / 7 XMM, \
-                 nowhere near the 12/14-register reduced pools) -- a nonzero byte count here \
-                 means something in this corpus started needing to spill"
-            );
-            for loc in assignment.values() {
-                assert!(
-                    matches!(loc, Location::Reg(_)),
-                    "{src:?}: unexpected Spill -- corpus should never need one"
+            if !cfg!(windows) {
+                assert_eq!(
+                    bytes, 0,
+                    "{src:?}: corpus programs never need a spill under the System V pools"
                 );
+                for loc in assignment.values() {
+                    assert!(
+                        matches!(loc, Location::Reg(_)),
+                        "{src:?}: unexpected Spill -- corpus should never need one"
+                    );
+                }
+            } else {
+                assert_eq!(bytes % 8, 0, "{src:?}: spill frame must be slot aligned");
             }
             // `allocate`'s whole job is the dual-class partition: an
             // Xmm-class value must get an XMM register and a Gpr-class
@@ -1491,16 +1523,13 @@ mod tests {
         // the XMM pass restarting its own cursor at 0 -- two genuinely
         // overlapping values, one per class, landed on the same slot.
         //
-        // 12 GPR intervals all sharing the exact range [0,100] -- the
-        // SPILL_AWARE_ALLOCATABLE_GPR pool has only 11 registers, so
-        // exactly the 13th (last-processed, tie-broken by Value order)
-        // must spill.
+        // More GPR intervals than the active ABI's spill-aware pool, all
+        // sharing the exact range [0,100], force at least one spill.
         let mut intervals: Vec<Interval> = (0..12)
             .map(|n| iv(n, 0, 100, crate::interval::RegClass::Gpr))
             .collect();
-        // 14 XMM intervals, same range [0,100] -- genuinely overlaps the
-        // GPR spill above. SPILL_AWARE_ALLOCATABLE_XMM has only 13
-        // registers, so exactly one of these must also spill.
+        // More XMM intervals than the active ABI's spill-aware pool, same
+        // range [0,100], genuinely overlap the GPR spill above.
         intervals.extend((100..114).map(|n| iv(n, 0, 100, crate::interval::RegClass::Xmm)));
 
         let selected = selected_fn(vec![]);
@@ -1532,9 +1561,9 @@ mod tests {
 
     #[test]
     fn allocate_spills_under_pressure_with_a_valid_frame_size_and_no_overlapping_slot_reuse() {
-        // 20 GPR intervals, all sharing the exact range [0,50] --
-        // SPILL_AWARE_ALLOCATABLE_GPR has 11 registers, so exactly 9 must
-        // spill. Because every spilled interval shares the SAME range,
+        // 20 GPR intervals, all sharing the exact range [0,50] -- exactly
+        // the intervals beyond the active ABI's pool must spill. Because
+        // every spilled interval shares the SAME range,
         // NONE can reuse another's slot (slot_end[s] < start never holds
         // when start=0 and slot_end is always >= 0) -- so this exercises
         // the "no possible reuse" edge and gives an exact, not just a
@@ -1553,19 +1582,20 @@ mod tests {
                 Location::Reg(_) => None,
             })
             .collect();
+        let expected_spills = 20 - SPILL_AWARE_ALLOCATABLE_GPR.len();
         assert_eq!(
             spilled.len(),
-            9,
-            "20 intervals into an 11-register pool must spill exactly 9"
+            expected_spills,
+            "intervals beyond the active register pool must spill exactly"
         );
         // Exact, not just a lower bound: every spilled interval shares the
         // SAME [0,50] range, so slot_end[s] < start (0 < 0) never holds --
-        // no spilled interval can EVER reuse another's slot here, so the 9
-        // spills deterministically occupy 9 distinct slots, i.e. exactly
-        // 9 * 8 = 72 bytes.
+        // no spilled interval can EVER reuse another's slot here, so the
+        // spills deterministically occupy distinct slots.
         assert_eq!(
-            bytes, 72,
-            "9 spills that can never reuse a slot must need exactly 72 bytes"
+            bytes,
+            expected_spills as u32 * 8,
+            "spills that can never reuse a slot need one slot each"
         );
 
         // Extended no-overlap property, covering Location::Spill: unlike
