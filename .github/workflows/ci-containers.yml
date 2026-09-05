@@ -52,6 +52,19 @@ jobs:
           docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
           forge-rust-ci:wasm cargo check -p forge-wasm-api
           --target wasm32-unknown-unknown --locked
+      - name: Build optimized web package
+        run: >-
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
+          forge-rust-ci:wasm sh -c
+          'rm -rf /tmp/forge-wasm-package &&
+          wasm-pack build crates/forge-wasm-api --target web --release
+          --out-dir /tmp/forge-wasm-package &&
+          wasm-opt -Oz
+          -o /tmp/forge-wasm-package/forge_wasm_api_bg.opt.wasm
+          /tmp/forge-wasm-package/forge_wasm_api_bg.wasm &&
+          gzip -c /tmp/forge-wasm-package/forge_wasm_api_bg.opt.wasm
+          > /tmp/forge-wasm-package/forge_wasm_api_bg.opt.wasm.gz &&
+          test "$(wc -c < /tmp/forge-wasm-package/forge_wasm_api_bg.opt.wasm.gz)" -lt 1100000'
 
   workbench:
     name: Workbench container
