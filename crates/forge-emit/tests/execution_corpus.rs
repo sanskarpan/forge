@@ -42,7 +42,12 @@ fn float_neg_flips_sign_bit() {
 
     let code = forge_emit::emit_body(&b.f, &selected, &assignment);
     let lines = disassemble(&code);
-    assert!(lines.iter().any(|l| l == "xorpd xmm0,xmm13"));
+    let scratch_xmm = if cfg!(windows) {
+        "xorpd xmm0,xmm3"
+    } else {
+        "xorpd xmm0,xmm13"
+    };
+    assert!(lines.iter().any(|l| l == scratch_xmm));
 
     #[cfg(target_arch = "x86_64")]
     assert_eq!(run_f64(&code), -3.0);
