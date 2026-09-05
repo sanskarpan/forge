@@ -3,6 +3,9 @@ name = "forge-wasm-api"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 forge-wasm = { path = "../forge-wasm" }
 forge-ir = { path = "../forge-ir" }

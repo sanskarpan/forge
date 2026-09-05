@@ -1,7 +1,7 @@
 FROM rust:1.87-bookworm
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && apt-get install --no-install-recommends -y ca-certificates curl binaryen \
     && rm -rf /var/lib/apt/lists/*
 
 # The versioned Rust image provides rustc/cargo but not rustup. Install a
@@ -11,6 +11,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal --default-toolchain 1.87.0 \
     && rustup target add wasm32-unknown-unknown \
     && rm -rf /root/.rustup/downloads /root/.rustup/tmp
+
+# Keep the web packaging toolchain in the same reproducible image as the
+# target check. `wasm-pack` supplies the wasm-bindgen JS glue and `wasm-opt`
+# (from binaryen) performs the release-size optimization pass.
+RUN cargo install wasm-pack --version 0.13.1 --locked \
+    && wasm-pack --version \
+    && wasm-opt --version
 
 ENV PATH="/root/.cargo/bin:/usr/local/cargo/bin:${PATH}"
 
