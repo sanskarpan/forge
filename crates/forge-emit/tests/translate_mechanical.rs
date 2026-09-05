@@ -675,7 +675,7 @@ fn call_libm_emits_aligned_indirect_call() {
         &[],
     );
     let lines = disassemble(asm.code());
-    let stack_bytes = if cfg!(windows) { "40" } else { "8" };
+    let stack_bytes = if cfg!(windows) { "28h" } else { "8" };
     assert!(lines
         .iter()
         .any(|line| line == &format!("sub rsp,{stack_bytes}")));
