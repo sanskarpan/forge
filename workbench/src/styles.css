@@ -43,6 +43,12 @@ button:disabled { cursor: wait; opacity: .65; }
 .panel > :not(.panel-heading) { margin: 14px 17px 17px; }
 .editor-frame { min-height: 250px; border: 1px solid #263753; border-radius: 7px; overflow: auto; }
 .editor-frame .cm-editor { min-height: 250px; }
+.editor-frame .cm-keyword { color: #d6a564; }
+.editor-frame .cm-number { color: #9dc7ff; }
+.editor-frame .cm-variableName { color: #b9e7d1; }
+.editor-frame .cm-operator { color: #d8a9e8; }
+.editor-frame .cm-bool { color: #f09b9b; }
+.editor-frame .cm-error-span { text-decoration: underline wavy #f07886 2px; text-underline-offset: 3px; }
 .editor-footer { display: flex; justify-content: space-between; gap: 10px; color: #687993; font-size: 11px; }
 .editor-footer code { color: #a9c5e8; }
 .split-panel { display: grid; grid-template-columns: minmax(250px, .8fr) minmax(300px, 1.2fr); gap: 14px; }
