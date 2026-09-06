@@ -12,3 +12,6 @@ forge-opt = { path = "../forge-opt" }
 forge-regalloc = { path = "../forge-regalloc" }
 forge-syntax = { path = "../forge-syntax" }
 forge-x64 = { path = "../forge-x64" }
+
+[dev-dependencies]
+proptest.workspace = true
