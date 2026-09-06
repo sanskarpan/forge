@@ -64,7 +64,11 @@ fn forge_min(x: f64, y: f64) -> f64 {
     } else if y < x {
         y
     } else if x == 0.0 && y == 0.0 {
-        -0.0
+        if x.is_sign_negative() || y.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
     } else {
         x
     }
@@ -82,7 +86,11 @@ fn forge_max(x: f64, y: f64) -> f64 {
     } else if y > x {
         y
     } else if x == 0.0 && y == 0.0 {
-        0.0
+        if x.is_sign_negative() && y.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
     } else {
         x
     }
