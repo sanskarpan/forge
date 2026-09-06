@@ -29,8 +29,7 @@ fn run_f64_arg(code: &[u8], arg: f64) -> f64 {
     // SAFETY: the emitter's scalar ABI uses one f64 argument in XMM0 and
     // returns the f64 result in XMM0; the executable mapping stays alive for
     // the duration of this call.
-    let function: unsafe extern "C" fn(f64) -> f64 =
-        unsafe { std::mem::transmute(buf.as_ptr()) };
+    let function: unsafe extern "C" fn(f64) -> f64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     unsafe { function(arg) }
 }
 
