@@ -7,7 +7,7 @@ W^X executable memory, and a hand-written x86-64 encoder/emitter.
 
 The repository also contains portable scalar WASM and AArch64 encoder
 foundations, runtime tiering, SIMD feature/array planning, a CLI, benchmarks,
-and a dependency-free browser shell. The current implementation status and
+and a React/Vite compiler workbench. The current implementation status and
 remaining boundaries are tracked in [CHECKLIST.md](CHECKLIST.md); `SPEC.md` is
 the design reference.
 
@@ -20,6 +20,9 @@ cargo run -p forge-cli -- eval 'x * x + 1' --x 3
 cargo run -p forge-cli -- asm 'x * x + 1'
 cargo run -p forge-cli -- ir 'sqrt(x * x + y * y)'
 cargo run -p forge-cli -- cfg 'if x > 0.0 then x else -x' --dot
+npm ci --prefix workbench
+npm test --prefix workbench
+npm run build --prefix workbench
 ```
 
 The native x86-64 JIT runs when built on x86-64. On other hosts, the runtime
@@ -48,9 +51,10 @@ and [docs/PLATFORMS.md](docs/PLATFORMS.md) for the implementation details.
 
 ## Scope notes
 
-The full AArch64 expression backend and packed SIMD loop/code generation are
+The full AArch64 expression backend and packed SIMD loop code generation are
 not claimed as complete yet. The tested wasm-bindgen artifact/benchmark API
-and dependency-free browser shell are available, while the full React
-workbench remains open. These boundaries are explicit follow-up phases rather
-than hidden runtime fallbacks; the current status table in `CHECKLIST.md` is
-authoritative.
+and React workbench are available; the browser currently exposes real WASM
+artifacts, while native x86-64/AArch64 artifact generation remains an explicit
+API boundary shown as unavailable in the target selector. These boundaries are
+explicit follow-up phases rather than hidden runtime fallbacks; the current
+status table in `CHECKLIST.md` is authoritative.
