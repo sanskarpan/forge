@@ -21,8 +21,8 @@ implemented lower-level work is absent.
 | Runtime | Implemented source lowering, optimization, selection, allocation, verification, native x86-64 JIT, native AArch64 execution for the supported all-f64 subset, interpreter fallback for unsupported targets/operations, and thread-safe interpreter → baseline → optimized tier promotion; native execution is now differentially checked against the interpreter with generated expressions and IEEE special values | `crates/forge-runtime` |
 | Verification stress coverage | Implemented deterministic 500-live-value native spill-frame coverage, including allocation verification, spill reload/store emission, and bit-exact x86-64 execution; randomized valid-IR optimizer/verifier property coverage now exercises 512 generated programs with NaN-aware interpreter equivalence | `crates/forge-emit/tests/execution_corpus.rs`, `crates/forge-opt/tests/differential.rs` |
 | CLI | Implemented documented `eval`, `compile`, `asm`, `ir`, `cfg`, `regalloc`, `bench`, `verify`, `cpuinfo`, and `repl` command surface; the REPL has session bindings/history/inspection commands, terminal-aware color with `NO_COLOR`, AArch64 emission, and tested exit-code classification; `asm --annotate` reports live allocated locations, while `bench` supports warmups, reusable compiled-call timing, and stable JSON reports | `crates/forge-cli` |
-| SIMD | Runtime `CpuFeatures` snapshot, deterministic f64 width selection, packed straight-line f64 array execution on SSE2/AVX2/NEON, exact AVX2+FMA `fma` evaluation when FMA is detected, chunk/tail handling, source-ordered `reduce_sum` over packed chunks, and scalar fallback are implemented; vector IR and AVX-512 masked tails remain open | `crates/forge-simd` |
-| AArch64 | Native target capability API plus tested scalar integer/float/conversion/memory/branch/immediate encoder forms; AAPCS64 scalar f64 expression emission includes arithmetic, NaN-compatible min/max, comparisons, CFG branches, typed phi edge copies, aligned literal pools, CLI output, native ARM execution, and Linux ARM64 QEMU coverage; mixed scalar i64/f64/bool parameter banks, integer operations, scalar comparisons, and i64↔f64 conversions are now emitted for f64-result functions, with integer negation using the architectural XZR register; full ABI frames, libm calls, and broader register allocation remain open | `crates/forge-aarch64` |
+| SIMD | Runtime `CpuFeatures` snapshot, deterministic f64 width selection, packed straight-line f64 array execution on SSE2/AVX2/NEON, exact AVX2+FMA `fma` evaluation when FMA is detected, chunk/tail handling, source-ordered `reduce_sum` over packed chunks, typed straight-line vector IR, and scalar fallback are implemented; stable EVEX packed-double byte forms are implemented separately, while AVX-512 runtime dispatch and masked tails remain open | `crates/forge-simd`, `crates/forge-x64/src/assembler.rs` |
+| AArch64 | Native target capability API plus tested scalar integer/float/conversion/memory/branch/immediate encoder forms; AAPCS64 scalar f64 expression emission includes arithmetic, NaN-compatible min/max, comparisons, CFG branches, typed phi edge copies, aligned literal pools, CLI output, native ARM execution, and Linux ARM64 QEMU coverage; mixed scalar i64/f64/bool parameter banks, integer operations, scalar comparisons, and i64↔f64 conversions are emitted for f64-result functions, with integer negation using the architectural XZR register; temporaries now stay in caller-saved D16..D31/X8..X18 with explicit budget rejection; full stack frames, libm calls, spilling, and broader register allocation remain open | `crates/forge-aarch64` |
 | WASM | Tested typed scalar byte emitter for `f64`, `i64`, and bool values, including arithmetic, comparisons, conditionals, lets, min/max, and fma lowering; structured artifact JSON exposes bytes, hex, parameter types, result type, lowered/optimized IR, and CFG; parse/type diagnostics now include source spans and a serialized AST; `benchmark(source, sizes)` exposes portable baseline timings and results; reproducible `wasm-pack --target web --release` plus `wasm-opt -Oz` packaging is CI-validated under the documented gzip-size boundary; native interval/assembly artifacts remain open because this target is stack-machine WASM | `crates/forge-wasm`, `crates/forge-wasm-api`, `.github/workflows/ci-containers.yml`, `containers/Dockerfile.wasm-ci` |
 | Benchmarks | Reusable compiled-expression benchmark helper exists; allocator Criterion benchmark now measures about 42–43 µs for its 1000-value workload, below the 50 µs target on the validation machine | `crates/forge-bench`, `crates/forge-regalloc/benches` |
 | Workbench | React/Vite/TypeScript workbench now provides CodeMirror expression editing with syntax highlighting and source-span squiggles, 200 ms debounced compilation, shared Zustand artifact state, D3 AST and dagre CFG views, IR stepper/diff, target-aware native interval/assembly panels, WASM bytes, Recharts benchmark samples, tier labels, and x86-64/AArch64/WASM plus scalar/array selectors; WASM is executable in the browser, while x86-64/AArch64 are serialized inspection artifacts and native bytes are never executed in the browser | `workbench/`, `crates/forge-wasm-api`, `containers/Dockerfile.workbench` |
@@ -69,11 +69,20 @@ The remaining open rows are intentional scope boundaries, not silent stubs.
 - PR #185 adds randomized valid-IR optimizer/verifier property coverage with
   512 generated programs and NaN-aware interpreter equivalence; PR #187
   promotes it to `main`.
+- PR #193 adds typed straight-line f64 vector IR consumed by the packed
+  evaluator; PR #195 promotes it to `main`.
+- PR #197 adds stable hand-written EVEX.512 packed-double `vaddpd`, `vmulpd`,
+  and `vfmadd231pd` forms with mask/zeroing fields and iced-x86 round trips;
+  PR #199 promotes it to `main` and resolves the stable-toolchain decision in
+  issue #179. AVX-512 runtime dispatch and masked-tail loops remain open.
+- PR #201 keeps AArch64 temporaries in caller-saved ABI registers and rejects
+  programs beyond the safe volatile-register budget; PR #203 promotes it to
+  `main`.
 - The historical phase checkboxes below remain design-history markers. Open
   scope is tracked explicitly in the table above and in each phase’s notes;
-  this section must not be read as claiming completion of vector IR/AVX-512,
-  full AArch64 ABI/code generation, fuzz/Miri/Valgrind, or other still-open
-  boundaries.
+  this section must not be read as claiming completion of AVX-512 runtime
+  execution/masked tails, full AArch64 ABI/code generation, fuzz/Miri/Valgrind,
+  or other still-open boundaries.
 
 ---
 
