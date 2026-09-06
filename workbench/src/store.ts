@@ -42,10 +42,13 @@ export interface AssemblyInstruction {
 
 export interface CompileArtifact {
   ok: true;
+  target?: string;
   parameter_types: string[];
   result_type: string;
-  wasm_bytes_hex: string;
-  wasm_bytes_len: number;
+  wasm_bytes_hex?: string;
+  wasm_bytes_len?: number;
+  bytes_hex?: string;
+  bytes_len?: number;
   ir_stages: IrStage[];
   cfg: string;
   intervals?: Interval[];

@@ -3,6 +3,7 @@ import { AstNode, BenchmarkResult, CompileArtifact, Diagnostic, Target, useWorkb
 export interface ForgeWasmApi {
   parse_and_check?: (source: string) => string | Promise<string>;
   compile_artifact_json?: (source: string) => string | Promise<string>;
+  compile_target_artifact_json?: (source: string, target: string) => string | Promise<string>;
   compile_wasm?: (source: string) => Uint8Array | number[] | Promise<Uint8Array | number[]>;
   benchmark?: (source: string, sizes: Uint32Array) => string | Promise<string>;
   run_wasm?: (source: string, args: number[]) => number | Promise<number>;
@@ -93,20 +94,31 @@ export async function compileCurrent(source: string, target: Target): Promise<vo
       ast: checked.ast ?? null,
       parameters: checked.parameters ?? [],
       resultType: checked.result_type ?? null,
-      status: target === 'wasm' ? 'Compiling WASM artifact…' : `${target} analysis is not exposed by the current API.`,
+      status: `Compiling ${target} artifact…`,
     });
 
-    if (target !== 'wasm') {
-      commit({ compiling: false, artifact: null, benchmark: null });
+    const artifactCall = wasm.compile_target_artifact_json
+      ? () => wasm.compile_target_artifact_json!(source, target)
+      : target === 'wasm' && wasm.compile_artifact_json
+        ? () => wasm.compile_artifact_json!(source)
+        : undefined;
+    if (!artifactCall) {
+      commit({ compiling: false, artifact: null, benchmark: null, status: `${target} artifacts are not exposed by the current API.` });
       return;
     }
-
-    const artifact = await jsonCall<CompileArtifact>(() => wasm.compile_artifact_json!(source));
+    const artifact = await jsonCall<CompileArtifact>(artifactCall);
     if (!artifact.ok) throw new Error((artifact as unknown as { error?: string }).error ?? 'artifact compilation failed');
     commit({ artifact, compiling: false, status: 'Compiled successfully. WASM export is ready.' });
 
+    if (target !== 'wasm') {
+      commit({ status: `Compiled ${target} inspection artifact successfully. Native bytes are not executed in the browser.`, tier: `inspect ${target}` });
+      return;
+    }
+
     const args = parseArguments(useWorkbench.getState().args);
-    const bytes = hexBytes(artifact.wasm_bytes_hex);
+    const wasmHex = artifact.wasm_bytes_hex ?? artifact.bytes_hex;
+    if (!wasmHex) throw new Error('WASM artifact did not include executable bytes');
+    const bytes = hexBytes(wasmHex);
     const instance = await WebAssembly.instantiate(bytes, {});
     const evaluate = instance.exports.eval;
     if (typeof evaluate !== 'function') throw new Error('compiled module does not export eval');

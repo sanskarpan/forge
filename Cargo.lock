@@ -408,10 +408,14 @@ dependencies = [
 name = "forge-wasm-api"
 version = "0.1.0"
 dependencies = [
+ "forge-aarch64",
+ "forge-emit",
  "forge-ir",
  "forge-opt",
+ "forge-regalloc",
  "forge-syntax",
  "forge-wasm",
+ "forge-x64",
  "js-sys",
  "wasm-bindgen",
 ]

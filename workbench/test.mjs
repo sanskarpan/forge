@@ -16,7 +16,7 @@ for (const marker of ['id="root"', 'src="/src/main.tsx"']) {
 for (const marker of ['EditorView', 'AstPanel', 'IrPanel', 'CfgPanel', 'IntervalPanel', 'AssemblyPanel', 'BenchmarkPanel', 'TargetPanel', 'ResponsiveContainer']) {
   if (!app.includes(marker)) throw new Error(`workbench UI missing ${marker}`);
 }
-for (const marker of ['parse_and_check', 'compile_artifact_json', 'WebAssembly.instantiate', 'benchmark', 'globalThis.forgeWasm']) {
+for (const marker of ['parse_and_check', 'compile_artifact_json', 'compile_target_artifact_json', 'WebAssembly.instantiate', 'benchmark', 'globalThis.forgeWasm']) {
   if (!compiler.includes(marker)) throw new Error(`workbench adapter missing ${marker}`);
 }
 const manifest = JSON.parse(packageJson);

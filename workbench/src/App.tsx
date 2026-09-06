@@ -200,10 +200,11 @@ function IntervalPanel({ intervals }: { intervals?: Interval[] }) {
 }
 
 function AssemblyPanel({ artifact }: { artifact: CompileArtifact | null }) {
-  const bytes = artifact ? hexBytes(artifact.wasm_bytes_hex) : new Uint8Array();
+  const rawHex = artifact?.bytes_hex ?? artifact?.wasm_bytes_hex ?? '';
+  const bytes = artifact ? hexBytes(rawHex) : new Uint8Array();
   const rows = Array.from({ length: Math.ceil(bytes.length / 12) }, (_, index) => bytes.slice(index * 12, index * 12 + 12));
   if (!artifact) return <Empty message="Assembly and bytes appear after compilation." />;
-  return <div><div className="artifact-badge">encoding: {artifact.encoding ?? 'target unavailable'} · {artifact.wasm_bytes_len} bytes</div>
+  return <div><div className="artifact-badge">encoding: {artifact.encoding ?? 'target unavailable'} · {artifact.bytes_len ?? artifact.wasm_bytes_len ?? bytes.length} bytes</div>
     {artifact.asm?.length ? <CodeBlock>{artifact.asm.map((item) => `${String(item.offset ?? 0).padStart(4, '0')}  ${(item.bytes ?? '').padEnd(24)}  ${item.text ?? ''}`).join('\n')}</CodeBlock> : <div className="assembly-empty">Native assembly is not emitted for WASM. Raw module bytes are shown below.</div>}
     <div className="hex-table">{rows.map((row, index) => <div className="hex-row" key={index}><span className="hex-offset">{(index * 12).toString(16).padStart(4, '0')}</span>{Array.from(row, (byte, byteIndex) => <span className="hex-byte" title={`WASM byte ${byteIndex}`}>{byte.toString(16).padStart(2, '0')}</span>)}</div>)}</div>
   </div>;

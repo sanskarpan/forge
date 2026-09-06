@@ -1,5 +1,7 @@
 //! Stable, serialization-friendly API boundary for browser integrations.
 
+use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use wasm_bindgen::prelude::wasm_bindgen;
 
 pub fn run(source: &str, args: &[f64]) -> Result<f64, String> {
@@ -131,11 +133,200 @@ pub fn compile_artifact_json(source: &str) -> String {
     }
 }
 
+/// Compiles a target-specific inspection artifact without allocating
+/// executable memory. This is the browser-facing bridge for the Workbench's
+/// target selector: WASM is emitted as an executable module, while x86-64 and
+/// AArch64 are emitted as inspectable native bytes. Native bytes are never
+/// executed in the browser, and host libm addresses are deliberately rejected
+/// from the wasm32 x86-64 inspection path because a browser cannot embed a
+/// meaningful process-local function pointer in a future JIT call.
+#[wasm_bindgen]
+pub fn compile_target_artifact_json(source: &str, target: &str) -> String {
+    match target {
+        "wasm" => compile_artifact_json(source),
+        "x86_64" => panic_safe_native_artifact(source, "x86_64", native_x64_artifact),
+        "aarch64" => panic_safe_native_artifact(source, "aarch64", native_aarch64_artifact),
+        _ => json_error(&format!("unsupported target `{target}`")),
+    }
+}
+
+fn panic_safe_native_artifact(
+    source: &str,
+    target: &str,
+    build: fn(&str) -> Result<String, String>,
+) -> String {
+    match catch_unwind(AssertUnwindSafe(|| build(source))) {
+        Ok(Ok(json)) => json,
+        Ok(Err(error)) => json_error(&format!("{target} artifact unavailable: {error}")),
+        Err(_) => json_error(&format!(
+            "{target} artifact rejected an unsupported IR shape"
+        )),
+    }
+}
+
+fn native_x64_artifact(source: &str) -> Result<String, String> {
+    let mut function = lower_native_function(source)?;
+    forge_opt::optimize(&mut function);
+    forge_ir::verify::verify(&function).map_err(|error| error.to_string())?;
+    if function
+        .insts
+        .iter()
+        .any(|inst| matches!(inst, forge_ir::Inst::Call { .. }))
+    {
+        return Err(
+            "host libm calls need a native process address and are not serializable in wasm32"
+                .to_string(),
+        );
+    }
+    let selected = forge_x64::select(&function);
+    let intervals = forge_regalloc::build_intervals(&function, &selected);
+    let excluded = forge_regalloc::excluded_registers(&function, &selected);
+    let (assignment, _) = forge_regalloc::allocate(intervals.clone(), &excluded, &selected);
+    forge_regalloc::verify_allocation(&intervals, &assignment)
+        .map_err(|error| error.to_string())?;
+    let bytes = forge_emit::emit_body(&function, &selected, &assignment);
+    let asm = selected
+        .insts
+        .iter()
+        .enumerate()
+        .map(|(index, inst)| {
+            format!(
+                r#"{{"offset":{},"bytes":"","text":{}}}"#,
+                index,
+                json_string(&format!("{inst:?}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let intervals = intervals_json(&intervals, &assignment);
+    let analysis = analysis_core_json(source)?;
+    Ok(format!(
+        r#"{{"ok":true,"target":"x86_64","parameter_types":[{}],"result_type":{},"bytes_hex":{},"bytes_len":{},"wasm_bytes_hex":"","wasm_bytes_len":0,"asm":[{}],"intervals":[{}],"encoding":"x86-64",{}}}"#,
+        parameter_types_json(&function),
+        json_string(&result_type_name(&function)),
+        json_string(&hex_bytes(&bytes)),
+        bytes.len(),
+        asm,
+        intervals,
+        analysis
+    ))
+}
+
+fn native_aarch64_artifact(source: &str) -> Result<String, String> {
+    let mut function = lower_native_function(source)?;
+    forge_opt::optimize(&mut function);
+    forge_ir::verify::verify(&function).map_err(|error| error.to_string())?;
+    let bytes = forge_aarch64::emit_f64(&function)?;
+    let asm = bytes
+        .chunks(4)
+        .enumerate()
+        .filter_map(|(index, word)| {
+            let [b0, b1, b2, b3] = word else {
+                return None;
+            };
+            let bits = u32::from_le_bytes([*b0, *b1, *b2, *b3]);
+            Some(format!(
+                r#"{{"offset":{},"bytes":{},"text":{}}}"#,
+                index * 4,
+                json_string(&hex_bytes(word)),
+                json_string(&format!("word 0x{bits:08x}"))
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let analysis = analysis_core_json(source)?;
+    Ok(format!(
+        r#"{{"ok":true,"target":"aarch64","parameter_types":[{}],"result_type":{},"bytes_hex":{},"bytes_len":{},"wasm_bytes_hex":"","wasm_bytes_len":0,"asm":[{}],"intervals":[],"encoding":"aarch64",{}}}"#,
+        parameter_types_json(&function),
+        json_string(&result_type_name(&function)),
+        json_string(&hex_bytes(&bytes)),
+        bytes.len(),
+        asm,
+        analysis
+    ))
+}
+
+fn lower_native_function(source: &str) -> Result<forge_ir::Function, String> {
+    let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
+    if !lex_diags.is_empty() {
+        return Err(format!("lexing failed: {lex_diags:?}"));
+    }
+    let (ast, parse_diags) = forge_syntax::parser::parse(&tokens);
+    if !parse_diags.is_empty() {
+        return Err(format!("parsing failed: {parse_diags:?}"));
+    }
+    let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
+        .map_err(|diags| format!("type checking failed: {diags:?}"))?;
+    let function = forge_ir::lower::lower(&typed);
+    forge_ir::verify::verify(&function).map_err(|error| error.to_string())?;
+    Ok(function)
+}
+
+fn parameter_types_json(function: &forge_ir::Function) -> String {
+    function
+        .params
+        .iter()
+        .map(|(_, ty)| json_string(&format!("{ty:?}").to_lowercase()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn result_type_name(function: &forge_ir::Function) -> String {
+    function
+        .types
+        .last()
+        .map(|ty| format!("{ty:?}").to_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn intervals_json(
+    intervals: &[forge_regalloc::Interval],
+    assignment: &HashMap<forge_ir::Value, forge_regalloc::Location>,
+) -> String {
+    intervals
+        .iter()
+        .map(|interval| {
+            let location = assignment
+                .get(&interval.value)
+                .map(|location| format!("{location:?}"))
+                .unwrap_or_else(|| "unassigned".to_string());
+            format!(
+                r#"{{"value":"v{}","start":{},"end":{},"class":{},"location":{}}}"#,
+                interval.value.0,
+                interval.start,
+                interval.end,
+                json_string(&format!("{:?}", interval.reg_class).to_lowercase()),
+                json_string(&location)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn json_error(error: &str) -> String {
+    format!(r#"{{"ok":false,"error":{}}}"#, json_string(error))
+}
+
 /// Produces the target-independent analysis fields used by the workbench.
 /// WASM is a stack machine, so register intervals and native assembly are
 /// represented as empty arrays with an explicit encoding marker; the lowered
 /// and optimized IR plus CFG remain real artifacts from the compiler itself.
 fn analysis_json(source: &str) -> Result<String, String> {
+    let analysis = analysis_core_json(source)?;
+    Ok(format!(
+        r#"{analysis},"intervals":[],"asm":[],"encoding":"wasm-stack""#
+    ))
+}
+
+fn analysis_core_json(source: &str) -> Result<String, String> {
     let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
     if !lex_diags.is_empty() {
         return Err(format!("lexing failed: {lex_diags:?}"));
@@ -162,7 +353,7 @@ fn analysis_json(source: &str) -> Result<String, String> {
     );
     let cfg = cfg_dot(&optimized);
     Ok(format!(
-        r#""ir_stages":{ir_stages},"cfg":{},"intervals":[],"asm":[],"encoding":"wasm-stack""#,
+        r#""ir_stages":{ir_stages},"cfg":{}"#,
         json_string(&cfg)
     ))
 }
@@ -393,5 +584,35 @@ mod tests {
         assert!(report.contains(r#""backend":"portable-interpreter"#));
         assert!(report.contains(r#""size":0,"calls":0"#));
         assert!(report.contains(r#""size":2,"calls":2"#));
+    }
+
+    #[test]
+    fn target_artifacts_include_real_native_bytes_and_metadata() {
+        let x86 = compile_target_artifact_json("x * x + 1.0", "x86_64");
+        assert!(x86.contains(r#""ok":true"#));
+        assert!(x86.contains(r#""target":"x86_64"#));
+        assert!(x86.contains(r#""encoding":"x86-64"#));
+        assert!(x86.contains(r#""bytes_len":"#));
+        assert!(x86.contains(r#""intervals":["#));
+        assert!(x86.contains(r#""asm":["#));
+        assert_eq!(x86.matches(r#""encoding":"#).count(), 1);
+
+        let arm = compile_target_artifact_json("x + 1.0", "aarch64");
+        assert!(arm.contains(r#""ok":true"#));
+        assert!(arm.contains(r#""target":"aarch64"#));
+        assert!(arm.contains(r#""encoding":"aarch64"#));
+        assert!(arm.contains(r#""asm":["#));
+        assert_eq!(arm.matches(r#""encoding":"#).count(), 1);
+    }
+
+    #[test]
+    fn target_artifacts_reject_process_local_libm_and_unknown_targets() {
+        let libm = compile_target_artifact_json("sin(x)", "x86_64");
+        assert!(libm.contains(r#""ok":false"#));
+        assert!(libm.contains("host libm calls"));
+
+        let unknown = compile_target_artifact_json("x", "riscv64");
+        assert!(unknown.contains(r#""ok":false"#));
+        assert!(unknown.contains("unsupported target"));
     }
 }
