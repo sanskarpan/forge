@@ -53,8 +53,9 @@ and [docs/PLATFORMS.md](docs/PLATFORMS.md) for the implementation details.
 
 The full AArch64 expression backend and packed SIMD loop code generation are
 not claimed as complete yet. The tested wasm-bindgen artifact/benchmark API
-and React workbench are available; the browser currently exposes real WASM
-artifacts, while native x86-64/AArch64 artifact generation remains an explicit
-API boundary shown as unavailable in the target selector. These boundaries are
-explicit follow-up phases rather than hidden runtime fallbacks; the current
-status table in `CHECKLIST.md` is authoritative.
+and React workbench are available; the browser executes real WASM artifacts
+and receives serialized x86-64/AArch64 inspection artifacts for supported
+expressions. Native bytes are never executed in the browser, and expressions
+requiring process-local libm addresses remain an explicit unavailable case.
+These boundaries are explicit follow-up phases rather than hidden runtime
+fallbacks; the current status table in `CHECKLIST.md` is authoritative.
