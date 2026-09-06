@@ -11,20 +11,20 @@ use forge_ir::interp::RtValue;
 use forge_runtime::{evaluate, interpret_source, lower_source};
 use proptest::prelude::*;
 
-fn assert_same(expected: RtValue, actual: f64, source: &str) {
+fn assert_same(expected: RtValue, actual: f64, source: &str, args: &[f64]) {
     let RtValue::F64(expected) = expected else {
         panic!("differential source returned a non-f64 value: {source:?}");
     };
     if expected.is_nan() || actual.is_nan() {
         assert!(
             expected.is_nan() && actual.is_nan(),
-            "NaN mismatch for {source:?}: interpreter={expected:?}, jit={actual:?}"
+            "NaN mismatch for {source:?} with args={args:?}: interpreter={expected:?}, jit={actual:?}"
         );
     } else {
         assert_eq!(
             expected.to_bits(),
             actual.to_bits(),
-            "bit mismatch for {source:?}: interpreter={expected:?}, jit={actual:?}"
+            "bit mismatch for {source:?} with args={args:?}: interpreter={expected:?}, jit={actual:?}"
         );
     }
 }
@@ -78,7 +78,7 @@ proptest! {
         let expected = interpret_source(&source, &args).unwrap();
         let raw_args = args.iter().map(|value| value.as_f64()).collect::<Vec<_>>();
         let actual = evaluate(&source, &raw_args).unwrap();
-        assert_same(expected, actual, &source);
+        assert_same(expected, actual, &source, &raw_args);
     }
 }
 
@@ -109,7 +109,7 @@ fn jit_preserves_special_values_and_signed_zeroes() {
         for input in inputs {
             let expected = interpret_source(source, &[RtValue::F64(input)]).unwrap();
             let actual = evaluate(source, &[input]).unwrap();
-            assert_same(expected, actual, source);
+            assert_same(expected, actual, source, &[input]);
         }
     }
 }
