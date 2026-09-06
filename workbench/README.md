@@ -1,18 +1,34 @@
 # Forge workbench
 
-This repository ships a dependency-free browser shell so it can be served and
-smoke-tested without downloading a JavaScript dependency tree. A WASM build
-should expose `window.forgeWasm` with `compile_wasm(source)` (or `compile`),
-`compile_artifact_json(source)`, `parse_and_check(source)`, and
-`benchmark(source, sizes)`. The shell then
-instantiates the emitted module, reports the result, and renders:
+The workbench is a React/Vite application that runs the real compiler boundary
+when a `forge-wasm-api` web bundle is loaded as `globalThis.forgeWasm`. It is
+deliberately artifact-driven: one debounced compile updates every panel from
+the same response, so the AST, IR, CFG, bytes, and benchmark cannot silently
+describe different source revisions.
 
-- source diagnostics with primary spans and a checked AST;
-- lowered and optimized textual IR plus a CFG DOT representation;
-- WASM signature metadata and raw bytes;
-- browser timing samples for repeated calls to the compiled export, alongside
-  the portable interpreter benchmark baseline returned by `benchmark`.
+The UI includes:
 
-`run_wasm(source, args)` (or `run`) remains a portable interpreter fallback
-when a bundle cannot emit a module. Start it with `npm run dev` and open
-`http://localhost:4173`.
+- CodeMirror source editing with a 200 ms debounce and scalar/array mode;
+- source diagnostics, checked AST spans, and a D3 AST tree;
+- lowered/optimized textual IR with a selectable stepper and side-by-side diff;
+- a dagre-laid-out CFG with its DOT source;
+- register intervals/pressure metadata when a native artifact supplies it;
+- synchronized raw bytes and native assembly when available, with an explicit
+  WASM stack-machine state otherwise;
+- a Recharts benchmark view and tier/backend label;
+- x86-64, AArch64, WASM, and array-mode selectors with honest unavailable
+  states for targets not exposed by the current browser API.
+
+Install and run it locally:
+
+```sh
+npm ci
+npm test
+npm run build
+npm run dev
+```
+
+Then open `http://localhost:5173`. Without a generated wasm-bindgen bundle the
+application still renders the complete observatory and reports the missing API
+as a visible status; it never invents native artifacts. The CI container runs
+all three commands, including the production build.
