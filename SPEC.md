@@ -121,7 +121,7 @@ Deliberately minimal: `f64`, `i64`, `bool`, plus `vec<f64, N>` / `vec<i64, N>` i
 
 - `sqrt`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `trunc` → **single instructions** (`vsqrtsd`, `vandpd`, `vminsd`, `vroundsd`)
 - `sin`, `cos`, `exp`, `log`, `pow` → **calls into libm**, which forces the project to handle a real call sequence: caller-saved spilling, stack alignment, and the difference between the System V and Win64 ABIs
-- `fma` → scalar `vfmadd231sd` when x86 FMA3 is available; on x86 without FMA3 the runtime uses the interpreter fallback so the result remains exact relative to Forge's defined semantics. Packed AVX2+FMA uses the corresponding vector instruction; AArch64 has a native `fmadd` path. Stable EVEX forms are encoded separately, while AVX-512 runtime dispatch and masked tails remain open.
+- `fma` → scalar `vfmadd231sd` when x86 FMA3 is available; on x86 without FMA3 the runtime uses the interpreter fallback so the result remains exact relative to Forge's defined semantics. Packed AVX2+FMA and AVX-512F+FMA use the corresponding vector instructions; AVX-512F array tails use k-masked zeroing loads/stores; AArch64 has a native `fmadd` path. Stable EVEX byte forms are encoded separately and round-trip tested.
 
 ### Operators & precedence
 
@@ -1266,9 +1266,9 @@ Array mode is where the JIT stops being a curiosity and starts being 8× faster 
 /// Runtime feature detection — you cannot compile AVX-512 into a binary that
 /// must run on older CPUs, so the JIT picks its width when it compiles.
 /// This is the intended JIT advantage over AOT. The current runtime selects
-/// SSE2/AVX2/NEON paths; AVX-512 runtime dispatch remains a follow-up because
-/// stable Rust does not expose the required AVX-512 target-feature surface in
-/// this project.
+/// SSE2/AVX2/AVX-512F/NEON paths. The AVX-512F path uses stable inline
+/// assembly and is entered only after runtime feature detection confirms the
+/// instruction set is available.
 pub struct CpuFeatures {
     pub sse2: bool, pub sse41: bool,
     pub avx: bool, pub avx2: bool, pub fma: bool,
@@ -1292,10 +1292,13 @@ impl CpuFeatures {
 
 ### Vectorizer
 
-The current packed implementation supports SSE2, AVX2, and NEON widths with
-scalar tail handling. EVEX byte encoders exist and are round-trip tested, but
-they are not yet selected by the runtime vectorizer; AVX-512 masked-tail
-execution therefore remains an explicit scope boundary.
+The current packed implementation supports SSE2, AVX2, AVX-512F, and NEON
+widths. SSE2, AVX2, and NEON use scalar epilogues for incomplete chunks;
+AVX-512F uses stable inline assembly with k-masked zeroing loads/stores for
+the tail. The separate EVEX byte encoders remain round-trip tested; the
+runtime AVX-512F path is implemented in `forge-simd` because the packed
+evaluator operates on runtime-detected CPU features rather than compile-time
+target-feature specialization.
 
 ```rust
 /// The expression is already a pure dataflow DAG over element i, so
@@ -1304,7 +1307,7 @@ execution therefore remains an explicit scope boundary.
 ///
 /// Three things must be handled:
 ///   1. TAIL: N % width leftover elements. Either a scalar epilogue, or a
-///      masked store (AVX-512 k-registers make this free).
+///      k-masked load/store (AVX-512 k-registers provide this path).
 ///   2. ALIGNMENT: unaligned loads (vmovupd) are nearly free on modern CPUs,
 ///      so we don't require alignment — but we do emit vmovapd when we can
 ///      prove 32/64-byte alignment, and the workbench shows the difference.
