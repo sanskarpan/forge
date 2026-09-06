@@ -136,22 +136,26 @@ pub fn evaluate(source: &str, args: &[f64]) -> Result<f64, CompileError> {
         }
         return Ok(compile(source)?.call(args));
     }
-    let function = lower_source(source)?;
-    #[cfg(target_arch = "aarch64")]
-    if function.types.last() == Some(&forge_ir::Ty::F64) {
-        // Keep the portable interpreter as the fallback for operations that
-        // the current AArch64 emitter has not implemented yet (libm calls,
-        // integer conversions, and so on). Supported scalar f64 expressions
-        // execute through the same W^X buffer API used by the x86 runtime.
-        if let Ok(bytes) = forge_aarch64::emit_f64(&function) {
-            let mut buffer = ExecutableBuffer::new(bytes.len())?;
-            buffer.write(|dst| dst[..bytes.len()].copy_from_slice(&bytes));
-            buffer.make_executable()?;
-            let compiled = CompiledExpr::from_buffer(buffer, args.len());
-            return Ok(compiled.call_args(args));
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let function = lower_source(source)?;
+        #[cfg(target_arch = "aarch64")]
+        if function.types.last() == Some(&forge_ir::Ty::F64) {
+            // Keep the portable interpreter as the fallback for operations
+            // that the current AArch64 emitter has not implemented yet (libm
+            // calls, integer conversions, and so on). Supported scalar f64
+            // expressions execute through the same W^X buffer API used by
+            // the x86 runtime.
+            if let Ok(bytes) = forge_aarch64::emit_f64(&function) {
+                let mut buffer = ExecutableBuffer::new(bytes.len())?;
+                buffer.write(|dst| dst[..bytes.len()].copy_from_slice(&bytes));
+                buffer.make_executable()?;
+                let compiled = CompiledExpr::from_buffer(buffer, args.len());
+                return Ok(compiled.call_args(args));
+            }
         }
+        return interpret_f64_function(&function, args);
     }
-    interpret_f64_function(&function, args)
 }
 
 /// A compiled x86-64 scalar expression and its source-level arity.
