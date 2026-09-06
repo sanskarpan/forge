@@ -1,5 +1,11 @@
 # forge Phase 7a MachineInst + Baseline Instruction Selection Implementation Plan
 
+> Historical implementation plan. The scalar x86 FMA decomposition described
+> below was superseded by PR #278, which added real `FloatFma`/`vfmadd231sd`
+> emission with an exact non-FMA interpreter fallback. The plan remains useful
+> as an implementation record; current completion and open boundaries are
+> tracked in `CHECKLIST.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the `MachineInst` enum and a baseline tree-tiling selector (`select(&Function) -> SelectedFunction`) in `forge-x64`, lowering every `forge_ir::Inst` variant except `Call` (explicitly deferred to Phase 7e) and `Rem` on `f64` operands (explicitly deferred — no native x86 instruction, no libm route yet) into `MachineInst`s over virtual registers (`forge_ir::Value`, reused directly).
