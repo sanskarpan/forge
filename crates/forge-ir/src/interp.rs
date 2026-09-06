@@ -39,10 +39,11 @@ fn get(vals: &[Option<RtValue>], v: Value) -> RtValue {
 }
 
 /// The language contract is stronger than the platform-dependent tie choice
-/// permitted by Rust's `f64::min`/`max`: an equal signed-zero min is -0.0 and
-/// an equal signed-zero max is +0.0. Keeping these helpers explicit makes the
-/// reference interpreter deterministic across the native test matrix and
-/// gives code generators a stable bit-exact target.
+/// permitted by Rust's `f64::min`/`max`: equal zero ties use bitwise sign-OR
+/// for min and sign-AND for max. Thus min(-0,+0) is -0, min(+0,+0) is +0,
+/// max(-0,+0) is +0, and max(-0,-0) is -0. Keeping these helpers explicit
+/// makes the reference interpreter deterministic across the native test
+/// matrix and gives code generators a stable bit-exact target.
 fn forge_min(x: f64, y: f64) -> f64 {
     if x.is_nan() {
         return y;
@@ -55,7 +56,11 @@ fn forge_min(x: f64, y: f64) -> f64 {
     } else if y < x {
         y
     } else if x == 0.0 && y == 0.0 {
-        -0.0
+        if x.is_sign_negative() || y.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
     } else {
         x
     }
@@ -73,7 +78,11 @@ fn forge_max(x: f64, y: f64) -> f64 {
     } else if y > x {
         y
     } else if x == 0.0 && y == 0.0 {
-        0.0
+        if x.is_sign_negative() && y.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
     } else {
         x
     }
