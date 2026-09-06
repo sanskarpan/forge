@@ -3,7 +3,7 @@
 FROM rust:1.87-bookworm
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates curl make \
+    && apt-get install --no-install-recommends -y ca-certificates curl make nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # The versioned Rust image contains rustc/cargo but does not install the
