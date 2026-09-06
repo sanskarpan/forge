@@ -2,6 +2,110 @@
 
 use forge_ir::{Function, Inst, Terminator, Ty, Value};
 
+/// The typed, lane-wise IR consumed by the packed evaluator. Values reuse the
+/// scalar IR's SSA indices so the vector program can be inspected alongside
+/// the scalar pipeline without a second value-numbering scheme.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VectorInst {
+    SplatF64(u64),
+    Param {
+        index: u32,
+    },
+    Move(Value),
+    Add(Value, Value),
+    Sub(Value, Value),
+    Mul(Value, Value),
+    Div(Value, Value),
+    Neg(Value),
+    Sqrt(Value),
+    Abs(Value),
+    Fma {
+        a: Value,
+        b: Value,
+        c: Value,
+    },
+    VecLoad {
+        base: Value,
+        offset: i32,
+        lanes: u8,
+    },
+    VecStore {
+        base: Value,
+        offset: i32,
+        value: Value,
+        lanes: u8,
+    },
+    VecReduce {
+        op: ReduceOp,
+        vec: Value,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceOp {
+    Sum,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorFunction {
+    pub lanes: u8,
+    pub insts: Vec<(Value, VectorInst)>,
+    pub result: Value,
+}
+
+/// Lowers the supported straight-line scalar subset into typed vector IR.
+/// Control flow, calls, integer/boolean values, and memory operations are
+/// rejected explicitly until their vector semantics and loop ABI exist.
+pub fn lower_f64_vector(function: &Function, lanes: u8) -> Result<VectorFunction, String> {
+    if !matches!(lanes, 2 | 4 | 8) {
+        return Err(format!("unsupported f64 vector width: {lanes}"));
+    }
+    let Some(block) = (function.blocks.len() == 1).then(|| &function.blocks[0]) else {
+        return Err("vector lowering requires one straight-line block".to_string());
+    };
+    let Some(Terminator::Return(result)) = block.term.as_ref() else {
+        return Err("vector lowering requires a return terminator".to_string());
+    };
+
+    let mut insts = Vec::with_capacity(block.insts.len());
+    for &value in &block.insts {
+        let scalar = function
+            .insts
+            .get(value.0 as usize)
+            .ok_or_else(|| format!("block references missing instruction {value:?}"))?;
+        let vector = match scalar {
+            Inst::ConstF64(bits) => VectorInst::SplatF64(*bits),
+            Inst::ConstI64(number) => VectorInst::SplatF64((*number as f64).to_bits()),
+            Inst::Param { index, ty: Ty::F64 } => VectorInst::Param { index: *index },
+            Inst::Add(lhs, rhs) => VectorInst::Add(*lhs, *rhs),
+            Inst::Sub(lhs, rhs) => VectorInst::Sub(*lhs, *rhs),
+            Inst::Mul(lhs, rhs) => VectorInst::Mul(*lhs, *rhs),
+            Inst::Div(lhs, rhs) => VectorInst::Div(*lhs, *rhs),
+            Inst::Neg(operand) => VectorInst::Neg(*operand),
+            Inst::Sqrt(operand) => VectorInst::Sqrt(*operand),
+            Inst::Abs(operand) => VectorInst::Abs(*operand),
+            Inst::Fma { a, b, c } => VectorInst::Fma {
+                a: *a,
+                b: *b,
+                c: *c,
+            },
+            Inst::IToF(operand) => VectorInst::Move(*operand),
+            Inst::Param { .. } => return Err("vector lowering requires f64 parameters".to_string()),
+            _ => {
+                return Err(format!(
+                    "scalar instruction is not vectorizable: {scalar:?}"
+                ))
+            }
+        };
+        insts.push((value, vector));
+    }
+    Ok(VectorFunction {
+        lanes,
+        insts,
+        result: *result,
+    })
+}
+
 fn evaluate_scalar(source: &str, args: &[f64]) -> Result<f64, String> {
     let values = args
         .iter()
@@ -103,8 +207,8 @@ impl ArrayPlan {
 pub struct ArrayResult {
     pub values: Vec<f64>,
     pub plan: ArrayPlan,
-    /// False until packed vector IR and encoders land. Keeping this explicit
-    /// prevents callers from mistaking the correct scalar fallback for SIMD.
+    /// True only when the typed vector IR and a host ISA implementation
+    /// successfully evaluate all full chunks.
     pub used_packed_backend: bool,
 }
 
@@ -256,88 +360,55 @@ unsafe fn evaluate_packed<V: PackedOps>(
     columns: &[&[f64]],
     start: usize,
 ) -> Result<Vec<f64>, ()> {
-    if function.blocks.len() != 1
-        || !matches!(
-            function.blocks[0].term.as_ref(),
-            Some(Terminator::Return(_))
-        )
-    {
-        return Err(());
-    }
+    let vector = lower_f64_vector(function, V::LANES as u8).map_err(|_| ())?;
     let mut values = vec![None; function.insts.len()];
-    for &value in &function.blocks[0].insts {
-        let result = match &function.insts[value.0 as usize] {
-            Inst::ConstF64(bits) => V::splat(f64::from_bits(*bits)),
-            // An integer constant can only reach an all-f64 expression via
-            // IToF. Representing it as f64 here preserves that conversion.
-            Inst::ConstI64(value) => V::splat(*value as f64),
-            Inst::ConstBool(value) => V::splat(if *value { 1.0 } else { 0.0 }),
-            Inst::Param { index, ty: Ty::F64 } => {
-                let column = columns.get(*index as usize).ok_or(())?;
+    for (value, inst) in vector.insts {
+        let result = match inst {
+            VectorInst::SplatF64(bits) => V::splat(f64::from_bits(bits)),
+            VectorInst::Param { index } => {
+                let column = columns.get(index as usize).ok_or(())?;
                 if start + V::LANES > column.len() {
                     return Err(());
                 }
                 V::load(column[start..].as_ptr())
             }
-            Inst::Param { .. } => return Err(()),
-            Inst::Add(lhs, rhs) => V::add(
-                get_packed::<V>(&values, *lhs)?,
-                get_packed::<V>(&values, *rhs)?,
+            VectorInst::Move(value) => get_packed::<V>(&values, value)?,
+            VectorInst::Add(lhs, rhs) => V::add(
+                get_packed::<V>(&values, lhs)?,
+                get_packed::<V>(&values, rhs)?,
             ),
-            Inst::Sub(lhs, rhs) => V::sub(
-                get_packed::<V>(&values, *lhs)?,
-                get_packed::<V>(&values, *rhs)?,
+            VectorInst::Sub(lhs, rhs) => V::sub(
+                get_packed::<V>(&values, lhs)?,
+                get_packed::<V>(&values, rhs)?,
             ),
-            Inst::Mul(lhs, rhs) => V::mul(
-                get_packed::<V>(&values, *lhs)?,
-                get_packed::<V>(&values, *rhs)?,
+            VectorInst::Mul(lhs, rhs) => V::mul(
+                get_packed::<V>(&values, lhs)?,
+                get_packed::<V>(&values, rhs)?,
             ),
-            Inst::Div(lhs, rhs) => V::div(
-                get_packed::<V>(&values, *lhs)?,
-                get_packed::<V>(&values, *rhs)?,
+            VectorInst::Div(lhs, rhs) => V::div(
+                get_packed::<V>(&values, lhs)?,
+                get_packed::<V>(&values, rhs)?,
             ),
-            Inst::Neg(value) => V::sub(V::splat(0.0), get_packed::<V>(&values, *value)?),
-            Inst::Sqrt(value) => V::sqrt(get_packed::<V>(&values, *value)?),
-            Inst::Abs(value) => V::abs(get_packed::<V>(&values, *value)?),
-            Inst::IToF(value) => get_packed::<V>(&values, *value)?,
-            Inst::Fma { a, b, c } => {
+            VectorInst::Neg(value) => V::sub(V::splat(0.0), get_packed::<V>(&values, value)?),
+            VectorInst::Sqrt(value) => V::sqrt(get_packed::<V>(&values, value)?),
+            VectorInst::Abs(value) => V::abs(get_packed::<V>(&values, value)?),
+            VectorInst::Fma { a, b, c } => {
                 if !V::HAS_FMA {
                     return Err(());
                 }
                 V::fma(
-                    get_packed::<V>(&values, *a)?,
-                    get_packed::<V>(&values, *b)?,
-                    get_packed::<V>(&values, *c)?,
+                    get_packed::<V>(&values, a)?,
+                    get_packed::<V>(&values, b)?,
+                    get_packed::<V>(&values, c)?,
                 )
             }
-            // These operations are deliberately rejected instead of being
-            // approximated: their scalar oracle semantics are not guaranteed
-            // by the corresponding packed instruction on every ISA.
-            Inst::Rem(..)
-            | Inst::And(..)
-            | Inst::Or(..)
-            | Inst::Xor(..)
-            | Inst::Not(..)
-            | Inst::Shl(..)
-            | Inst::Shr(..)
-            | Inst::Sar(..)
-            | Inst::Cmp { .. }
-            | Inst::Min(..)
-            | Inst::Max(..)
-            | Inst::Floor(..)
-            | Inst::Ceil(..)
-            | Inst::Round(..)
-            | Inst::Trunc(..)
-            | Inst::Call { .. }
-            | Inst::FToI(..)
-            | Inst::Phi { .. } => return Err(()),
+            VectorInst::VecLoad { .. }
+            | VectorInst::VecStore { .. }
+            | VectorInst::VecReduce { .. } => return Err(()),
         };
         values[value.0 as usize] = Some(result);
     }
-    let result = match function.blocks[0].term.as_ref() {
-        Some(Terminator::Return(value)) => get_packed::<V>(&values, *value)?,
-        _ => return Err(()),
-    };
+    let result = get_packed::<V>(&values, vector.result)?;
     let mut output = vec![0.0; V::LANES];
     V::store(result, output.as_mut_ptr());
     Ok(output)
@@ -722,5 +793,34 @@ mod tests {
                 && CpuFeatures::detect().avx2
                 && CpuFeatures::detect().fma
         );
+    }
+
+    #[test]
+    fn lower_f64_vector_builds_typed_lane_ir_for_the_packed_backend() {
+        let function = forge_runtime::lower_source("fma(x, 2.0, y) + sqrt(abs(x))").unwrap();
+        let vector = lower_f64_vector(&function, 4).unwrap();
+        assert_eq!(vector.lanes, 4);
+        assert!(vector
+            .insts
+            .iter()
+            .any(|(_, inst)| matches!(inst, VectorInst::Param { index: 0 })));
+        assert!(vector
+            .insts
+            .iter()
+            .any(|(_, inst)| matches!(inst, VectorInst::Fma { .. })));
+        assert!(vector
+            .insts
+            .iter()
+            .any(|(_, inst)| matches!(inst, VectorInst::Sqrt(_))));
+    }
+
+    #[test]
+    fn vector_lowering_rejects_unsupported_widths_and_control_flow() {
+        let straight_line = forge_runtime::lower_source("x + 1.0").unwrap();
+        assert!(lower_f64_vector(&straight_line, 3).is_err());
+
+        let control_flow = forge_runtime::lower_source("if x < 0.0 then x else -x").unwrap();
+        let error = lower_f64_vector(&control_flow, 2).unwrap_err();
+        assert!(error.contains("straight-line"));
     }
 }
