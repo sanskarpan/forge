@@ -192,6 +192,65 @@ fn scalar_fma_executes_with_single_rounding() {
     assert_eq!(actual.to_bits(), expected.to_bits());
 }
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn spilled_scalar_fma_reuses_addend_scratch_for_its_destination() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    b.f.params = vec![
+        ("a".to_string(), Ty::F64),
+        ("b".to_string(), Ty::F64),
+        ("c".to_string(), Ty::F64),
+    ];
+    let a = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let bb = b.emit(
+        entry,
+        Inst::Param {
+            index: 1,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let c = b.emit(
+        entry,
+        Inst::Param {
+            index: 2,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let result = b.emit(entry, Inst::Fma { a, b: bb, c }, Ty::F64, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(result));
+
+    let selected = forge_x64::select(&b.f);
+    let assignment: HashMap<Value, Location> = [
+        (a, Location::Spill(0)),
+        (bb, Location::Spill(1)),
+        (c, Location::Spill(2)),
+        (result, Location::Spill(3)),
+    ]
+    .into_iter()
+    .collect();
+    let code = forge_emit::emit_body(&b.f, &selected, &assignment);
+
+    let args = [1.25, 2.5, -3.75];
+    assert_eq!(
+        run_f64_three(&code, args),
+        args[0].mul_add(args[1], args[2])
+    );
+}
+
 #[test]
 fn float_neg_flips_sign_bit() {
     let mut b = Builder::new();
