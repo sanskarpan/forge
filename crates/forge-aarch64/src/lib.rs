@@ -368,11 +368,16 @@ pub fn fmsub_d(dst: Gpr, lhs: Gpr, rhs: Gpr, subtrahend: Gpr) -> u32 {
 }
 
 pub fn fmin_d(dst: Gpr, lhs: Gpr, rhs: Gpr) -> u32 {
-    rr(0x1e60_5800, dst, lhs, rhs)
+    // Forge's language-level min ignores a NaN when the other operand is a
+    // number, matching the interpreter. AArch64's FMIN propagates NaNs;
+    // FMINNM is the matching "numeric minimum" operation.
+    rr(0x1e60_7800, dst, lhs, rhs)
 }
 
 pub fn fmax_d(dst: Gpr, lhs: Gpr, rhs: Gpr) -> u32 {
-    rr(0x1e60_4800, dst, lhs, rhs)
+    // See fmin_d: use the numeric form so native execution preserves the
+    // interpreter's NaN behavior.
+    rr(0x1e60_6800, dst, lhs, rhs)
 }
 
 pub fn fcvtzs(dst: Gpr, src: Gpr) -> u32 {
@@ -995,8 +1000,8 @@ mod tests {
         assert_eq!(and_reg(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x8a02_0020);
         assert_eq!(cmp_reg(Gpr::new(1), Gpr::new(2)), 0xeb02_003f);
         assert_eq!(fadd_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_2820);
-        assert_eq!(fmin_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_5820);
-        assert_eq!(fmax_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_4820);
+        assert_eq!(fmin_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_7820);
+        assert_eq!(fmax_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_6820);
         assert_eq!(fcmp_d(Gpr::new(1), Gpr::new(2)), 0x1e62_2020);
         assert_eq!(fsqrt_d(Gpr::new(0), Gpr::new(1)), 0x1e61_c020);
         assert_eq!(
@@ -1070,10 +1075,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(min_words
             .iter()
-            .any(|word| word & 0xffe0_fc00 == 0x1e60_5800));
+            .any(|word| word & 0xffe0_fc00 == 0x1e60_7800));
         assert!(max_words
             .iter()
-            .any(|word| word & 0xffe0_fc00 == 0x1e60_4800));
+            .any(|word| word & 0xffe0_fc00 == 0x1e60_6800));
     }
 
     #[test]
@@ -1082,6 +1087,22 @@ mod tests {
         asm.sub_reg(Gpr::new(8), XZR, Gpr::new(0));
         assert_eq!(asm.words(), &[sub_reg(Gpr::new(8), XZR, Gpr::new(0))]);
         assert_eq!(XZR.index(), 31);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn native_min_max_match_interpreter_nan_semantics() {
+        let min = forge_runtime::lower_source("min(x, 1.0)").unwrap();
+        let max = forge_runtime::lower_source("max(x, 1.0)").unwrap();
+        let run = |function: &Function| {
+            let bytes = emit_f64(function).unwrap();
+            let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+            buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+            buffer.make_executable().unwrap();
+            forge_mem::CompiledExpr::from_buffer(buffer, 1).call_args(&[f64::NAN])
+        };
+        assert_eq!(run(&min).to_bits(), 1.0f64.to_bits());
+        assert_eq!(run(&max).to_bits(), 1.0f64.to_bits());
     }
 
     #[test]
