@@ -134,7 +134,7 @@ pub fn evaluate(source: &str, args: &[f64]) -> Result<f64, CompileError> {
             // those semantics instead of emitting an illegal FMA3 opcode.
             return interpret_f64_function(&function, args);
         }
-        return Ok(compile(source)?.call(args));
+        Ok(compile(source)?.call(args))
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -154,7 +154,7 @@ pub fn evaluate(source: &str, args: &[f64]) -> Result<f64, CompileError> {
                 return Ok(compiled.call_args(args));
             }
         }
-        return interpret_f64_function(&function, args);
+        interpret_f64_function(&function, args)
     }
 }
 
