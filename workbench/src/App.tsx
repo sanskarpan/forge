@@ -157,14 +157,14 @@ function IrPanel({ artifact }: { artifact: CompileArtifact | null }) {
 function CfgPanel({ cfg }: { cfg: string | undefined }) {
   const graph = useMemo(() => {
     const result = new dagre.graphlib.Graph().setGraph({ rankdir: 'LR', nodesep: 28, ranksep: 70 }).setDefaultEdgeLabel(() => ({}));
-    for (const match of cfg?.matchAll(/block(\d+) \[label="([^\"]*)/g) ?? []) result.setNode(`block${match[1]}`, { label: match[2].replaceAll('\\n', ' · '), width: 150, height: 42 });
+    for (const match of cfg?.matchAll(/block(\d+) \[label="([^\"]*)/g) ?? []) result.setNode(`block${match[1]}`, { label: match[2].replace(/\\n/g, ' · '), width: 150, height: 42 });
     for (const match of cfg?.matchAll(/block(\d+) -> block(\d+)(?: \[label="([^"]*)")?/g) ?? []) result.setEdge(`block${match[1]}`, `block${match[2]}`, { label: match[3] ?? '' });
     dagre.layout(result);
     return result;
   }, [cfg]);
   if (!cfg) return <Empty message="CFG appears after compilation." />;
-  const width = Math.max(600, graph.graph().width + 40);
-  const height = Math.max(120, graph.graph().height + 40);
+  const width = Math.max(600, (graph.graph().width ?? 0) + 40);
+  const height = Math.max(120, (graph.graph().height ?? 0) + 40);
   return <div className="cfg-wrap"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="control flow graph">
     <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#62d6a7" /></marker></defs>
     {graph.edges().map((edge, index) => { const points = graph.edge(edge).points; return <g key={index}><path className="cfg-edge" markerEnd="url(#arrow)" d={points.map((point, pointIndex) => `${pointIndex ? 'L' : 'M'}${point.x + 20},${point.y + 20}`).join(' ')} /><text className="cfg-edge-label" x={points[Math.floor(points.length / 2)].x + 24} y={points[Math.floor(points.length / 2)].y + 14}>{graph.edge(edge).label}</text></g>; })}
