@@ -196,6 +196,14 @@ pub enum MachineInst {
         lhs: Value,
         rhs: Value,
     },
+    /// FMA3 scalar operation. The final emitter places `c` in `dst` and
+    /// emits `vfmadd231sd dst, a, b` when the host supports FMA.
+    FloatFma {
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
+        addend: Value,
+    },
     FloatSqrt {
         dst: Value,
         src: Value,
@@ -311,7 +319,7 @@ pub struct SelectedFunction {
     /// same RPO order `insts` itself was built in. Lets later passes
     /// (Phase 8's liveness analysis) reconstruct block boundaries --
     /// `insts` alone has no boundary markers, and the IR-instruction-to-
-    /// MachineInst count isn't 1:1 (Fma emits 2, Phi/suppressed lea
+    /// MachineInst count isn't 1:1 (Phi/suppressed lea
     /// operands emit 0), so only `select()`'s own walk can record this
     /// correctly. A block's end is the NEXT ENTRY'S start (by list
     /// position, not by searching for a larger value -- a block that
@@ -327,7 +335,6 @@ struct Selector<'a> {
     func: &'a Function,
     insts: Vec<MachineInst>,
     synthetic_types: HashMap<Value, Ty>,
-    next_value: u32,
     fully_fusable_scaled_indices: std::collections::HashSet<Value>,
     pool: ConstantPool,
     diamond_fusions: HashMap<Block, DiamondFusion>,
@@ -335,24 +342,13 @@ struct Selector<'a> {
 
 impl<'a> Selector<'a> {
     /// Looks up a Value's Ty whether it's a real IR value (func.types) or
-    /// a synthetic temp this selector minted (synthetic_types). Value
-    /// numbering is append-only across this codebase's whole optimizer
-    /// pipeline (verified: no pass compacts or renumbers `f.insts`), so
-    /// `next_value` seeded from `func.insts.len()` never collides with a
-    /// real Value, and this dispatch on index is safe.
+    /// a synthetic temp this selector minted (synthetic_types).
     fn ty_of(&self, v: Value) -> Ty {
         if (v.0 as usize) < self.func.types.len() {
             self.func.types[v.0 as usize]
         } else {
             self.synthetic_types[&v]
         }
-    }
-
-    fn fresh(&mut self, ty: Ty) -> Value {
-        let v = Value(self.next_value);
-        self.next_value += 1;
-        self.synthetic_types.insert(v, ty);
-        v
     }
 
     /// Deliberately has NO wildcard (`_ =>`) arm -- same exhaustiveness
@@ -492,15 +488,13 @@ impl<'a> Selector<'a> {
                 let mask_pool = self.pool.intern(0x7FFF_FFFF_FFFF_FFFFu64);
                 self.insts.push(MachineInst::FloatAbs { dst, src: *a, mask_pool });
             }
-            // NOT bit-identical to a real hardware FMA (that's a single
-            // rounding; this is two -- multiply rounds once, then add
-            // rounds again). Correct interim behavior until AVX/FMA3
-            // lands (Phase 6's VEX/AVX subsection, not yet built) --
-            // documented loudly rather than silently approximated.
             Inst::Fma { a, b, c } => {
-                let mul_tmp = self.fresh(Ty::F64);
-                self.insts.push(MachineInst::FloatMul { dst: mul_tmp, lhs: *a, rhs: *b });
-                self.insts.push(MachineInst::FloatAdd { dst, lhs: mul_tmp, rhs: *c });
+                self.insts.push(MachineInst::FloatFma {
+                    dst,
+                    lhs: *a,
+                    rhs: *b,
+                    addend: *c,
+                });
             }
 
             Inst::Call { func, args } => {
@@ -879,7 +873,6 @@ pub fn select(func: &Function) -> SelectedFunction {
         func,
         insts: Vec::new(),
         synthetic_types: HashMap::new(),
-        next_value: func.insts.len() as u32,
         fully_fusable_scaled_indices,
         pool: ConstantPool::default(),
         diamond_fusions,
@@ -1010,6 +1003,11 @@ pub fn compute_coalescing_hints(insts: &[MachineInst]) -> HashMap<Value, Value> 
             | MachineInst::FloatMin { dst, lhs, .. }
             | MachineInst::FloatMax { dst, lhs, .. } => {
                 hints.insert(*dst, *lhs);
+            }
+            MachineInst::FloatFma { dst, addend, .. } => {
+                // vfmadd231sd destructively accumulates into dst, so keeping
+                // the addend in that register avoids a pre-instruction copy.
+                hints.insert(*dst, *addend);
             }
             MachineInst::IntCmov { dst, then_val, .. } => {
                 hints.insert(*dst, *then_val);
