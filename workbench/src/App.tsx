@@ -1,4 +1,6 @@
 import { EditorState } from '@codemirror/state';
+import { StreamLanguage } from '@codemirror/language';
+import { Decoration } from '@codemirror/view';
 import { EditorView } from '@codemirror/view';
 import dagre from 'dagre';
 import * as d3 from 'd3';
@@ -12,6 +14,20 @@ const targets: Array<{ id: Target; label: string; detail: string }> = [
   { id: 'x86_64', label: 'x86-64', detail: 'native bytes when the native API is exposed' },
   { id: 'aarch64', label: 'AArch64', detail: 'AAPCS64 analysis when the native API is exposed' },
 ];
+
+const expressionLanguage = StreamLanguage.define({
+  startState: () => ({}),
+  token(stream) {
+    if (stream.eatSpace()) return null;
+    if (stream.match(/\b(if|then|else|let|in)\b/)) return 'keyword';
+    if (stream.match(/\b(true|false)\b/)) return 'bool';
+    if (stream.match(/\b(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\b/)) return 'number';
+    if (stream.match(/[A-Za-z_][A-Za-z_0-9]*/)) return 'variableName';
+    if (stream.match(/(?:==|!=|<=|>=|&&|\|\||<<|>>|[+\-*/%<>&|^!~()])/)) return 'operator';
+    stream.next();
+    return null;
+  },
+});
 
 function Panel({ title, eyebrow, children, wide = false }: { title: string; eyebrow?: string; children: React.ReactNode; wide?: boolean }) {
   return <section className={`panel ${wide ? 'panel-wide' : ''}`}>
@@ -27,7 +43,7 @@ function CodeBlock({ children, className = '' }: { children: React.ReactNode; cl
   return <pre className={`code-block ${className}`}>{children}</pre>;
 }
 
-function SourceEditor() {
+function SourceEditor({ diagnostics }: { diagnostics: Diagnostic[] }) {
   const source = useWorkbench((state) => state.source);
   const setSource = useWorkbench((state) => state.setSource);
   const host = useRef<HTMLDivElement>(null);
@@ -38,9 +54,14 @@ function SourceEditor() {
 
   useEffect(() => {
     if (!host.current) return;
+    const errorRanges = diagnostics.flatMap((diagnostic) => diagnostic.primary ? [diagnostic.primary] : [])
+      .filter((span) => span.start >= 0 && span.end > span.start && span.end <= source.length)
+      .map((span) => Decoration.mark({ class: 'cm-error-span' }).range(span.start, span.end));
     const state = EditorState.create({
       doc: source,
       extensions: [
+        expressionLanguage,
+        EditorView.decorations.of(Decoration.set(errorRanges, true)),
         EditorView.lineWrapping,
         EditorView.theme({
           '&': { backgroundColor: '#0b111d', color: '#dbe7ff', fontSize: '15px' },
@@ -56,7 +77,7 @@ function SourceEditor() {
     const editor = new EditorView({ state, parent: host.current });
     view.current = editor;
     return () => { editor.destroy(); view.current = undefined; };
-  }, []);
+  }, [diagnostics]);
 
   useEffect(() => {
     const editor = view.current;
@@ -214,7 +235,7 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [state.source, state.target]);
   return <div className="app-shell"><Header /><main className="workspace">
-    <div className="editor-column"><Panel title="Expression editor" eyebrow="01 · input"><SourceEditor /><div className="editor-footer"><span>Source spans stay linked to every artifact.</span><span>Tip: try <code>if x &lt; 0 then abs(x) else x</code></span></div></Panel><Panel title="Diagnostics" eyebrow="frontend boundary"><DiagnosticsPanel diagnostics={state.diagnostics} error={state.error} /></Panel></div>
+    <div className="editor-column"><Panel title="Expression editor" eyebrow="01 · input"><SourceEditor diagnostics={state.diagnostics} /><div className="editor-footer"><span>Source spans stay linked to every artifact.</span><span>Tip: try <code>if x &lt; 0 then abs(x) else x</code></span></div></Panel><Panel title="Diagnostics" eyebrow="frontend boundary"><DiagnosticsPanel diagnostics={state.diagnostics} error={state.error} /></Panel></div>
     <div className="artifact-column"><Panel title="AST → SSA IR" eyebrow="02 · structure" wide><div className="split-panel"><AstPanel ast={state.ast} /><IrPanel artifact={state.artifact} /></div></Panel><Panel title="Control-flow graph" eyebrow="03 · control flow"><CfgPanel cfg={state.artifact?.cfg} /></Panel><div className="two-up"><Panel title="Register allocation" eyebrow="04 · liveness"><IntervalPanel intervals={state.artifact?.intervals} /></Panel><Panel title="Assembly + hex" eyebrow="05 · emission"><AssemblyPanel artifact={state.artifact} /></Panel></div><Panel title="Benchmark & tiering" eyebrow="06 · runtime"><BenchmarkPanel benchmark={state.benchmark} /></Panel><Panel title="Target selector" eyebrow="07 · regeneration"><TargetPanel /></Panel></div>
   </main><footer className="app-footer"><span>FORGE / live compiler observatory</span><span>target: {state.target} · mode: {state.mode} · API: {globalThis.forgeWasm ? 'connected' : 'not loaded'}</span></footer></div>;
 }
