@@ -349,6 +349,7 @@ fn sse_minmax_select(
         asm.movsd_reg_reg(dst_r, lhs_r);
     }
     let unordered = asm.new_label();
+    let finish = asm.new_label();
     asm.ucomisd_reg_reg(lhs_r, rhs_r);
     asm.jcc(ConditionCode::Parity, unordered);
     sse_minmax(
@@ -362,9 +363,10 @@ fn sse_minmax_select(
             forge_x64::MinMaxOp::Max => SseOp::Max,
         },
     );
-    asm.jmp(unordered);
+    asm.jmp(finish);
     asm.bind(unordered);
     asm.movsd_reg_reg(dst_r, rhs_r);
+    asm.bind(finish);
 }
 
 /// `idiv_reg`'s divisor operand must not itself be Rax/Rdx: `cqo` has already
