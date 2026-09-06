@@ -38,6 +38,47 @@ fn get(vals: &[Option<RtValue>], v: Value) -> RtValue {
     vals[v.0 as usize].expect("undefined value")
 }
 
+/// The language contract is stronger than the platform-dependent tie choice
+/// permitted by Rust's `f64::min`/`max`: an equal signed-zero min is -0.0 and
+/// an equal signed-zero max is +0.0. Keeping these helpers explicit makes the
+/// reference interpreter deterministic across the native test matrix and
+/// gives code generators a stable bit-exact target.
+fn forge_min(x: f64, y: f64) -> f64 {
+    if x.is_nan() {
+        return y;
+    }
+    if y.is_nan() {
+        return x;
+    }
+    if x < y {
+        x
+    } else if y < x {
+        y
+    } else if x == 0.0 && y == 0.0 {
+        -0.0
+    } else {
+        x
+    }
+}
+
+fn forge_max(x: f64, y: f64) -> f64 {
+    if x.is_nan() {
+        return y;
+    }
+    if y.is_nan() {
+        return x;
+    }
+    if x > y {
+        x
+    } else if y > x {
+        y
+    } else if x == 0.0 && y == 0.0 {
+        0.0
+    } else {
+        x
+    }
+}
+
 /// The correctness oracle for the entire project. Must implement IEEE-754
 /// semantics EXACTLY — NaN propagation, signed zeros, infinities, subnormals.
 /// No shortcuts. Every future differential test compares the JIT to this,
@@ -95,16 +136,14 @@ pub fn interpret(f: &Function, args: &[RtValue]) -> RtValue {
                 Inst::Ceil(a) => RtValue::F64(get(&vals, *a).as_f64().ceil()),
                 Inst::Round(a) => RtValue::F64(get(&vals, *a).as_f64().round()),
                 Inst::Trunc(a) => RtValue::F64(get(&vals, *a).as_f64().trunc()),
-                // CAREFUL: f64::min/max have DIFFERENT NaN semantics from
-                // x86's minsd/maxsd (Rust returns the non-NaN operand; minsd
-                // returns its second operand if either is NaN). We pick
-                // Rust's semantics here — codegen must later emit an extra
-                // compare rather than a bare minsd to match.
+                // CAREFUL: min/max have explicit Forge NaN and signed-zero
+                // semantics, rather than delegating to target-dependent
+                // floating-point intrinsics.
                 Inst::Min(a, b) => {
-                    RtValue::F64(get(&vals, *a).as_f64().min(get(&vals, *b).as_f64()))
+                    RtValue::F64(forge_min(get(&vals, *a).as_f64(), get(&vals, *b).as_f64()))
                 }
                 Inst::Max(a, b) => {
-                    RtValue::F64(get(&vals, *a).as_f64().max(get(&vals, *b).as_f64()))
+                    RtValue::F64(forge_max(get(&vals, *a).as_f64(), get(&vals, *b).as_f64()))
                 }
                 Inst::Fma { a, b, c } => RtValue::F64(
                     get(&vals, *a)
@@ -370,6 +409,15 @@ mod tests {
         assert_eq!(r3, RtValue::F64(1.0));
         let r4 = run("max(x, y)", &[RtValue::F64(1.0), RtValue::F64(f64::NAN)]);
         assert_eq!(r4, RtValue::F64(1.0));
+    }
+
+    #[test]
+    fn min_max_use_deterministic_signed_zero_ties() {
+        for (source, expected) in [("min(x, y)", -0.0f64), ("max(x, y)", 0.0f64)] {
+            let result = run(source, &[RtValue::F64(-0.0), RtValue::F64(0.0)]);
+            assert_eq!(result, RtValue::F64(expected));
+            assert_eq!(result.as_f64().to_bits(), expected.to_bits());
+        }
     }
 
     #[test]
