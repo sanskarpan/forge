@@ -13,6 +13,7 @@ declare global {
 }
 
 const sizes = new Uint32Array([1, 10, 100, 1_000, 10_000]);
+let compileGeneration = 0;
 
 function api(): ForgeWasmApi | undefined {
   return globalThis.forgeWasm;
@@ -60,18 +61,22 @@ async function browserBenchmark(evaluate: (...args: number[]) => number, args: n
 }
 
 export async function compileCurrent(source: string, target: Target): Promise<void> {
+  const generation = ++compileGeneration;
   const state = useWorkbench.getState();
-  state.setCompilation({ compiling: true, status: 'Parsing and compiling…', error: null, diagnostics: [] });
+  const commit = (value: Parameters<typeof state.setCompilation>[0]) => {
+    if (generation === compileGeneration) state.setCompilation(value);
+  };
+  commit({ compiling: true, status: 'Parsing and compiling…', error: null, diagnostics: [] });
   const wasm = api();
   if (!wasm) {
-    state.setCompilation({ compiling: false, status: 'No forge-wasm-api bundle loaded.', error: 'Load the generated wasm-bindgen web bundle as window.forgeWasm.' });
+    commit({ compiling: false, status: 'No forge-wasm-api bundle loaded.', error: 'Load the generated wasm-bindgen web bundle as window.forgeWasm.' });
     return;
   }
 
   try {
     const checked = await jsonCall<{ ok: boolean; stage?: string; ast?: AstNode; parameters?: Array<{ name: string; type: string }>; result_type?: string; diagnostics?: Diagnostic[] }>(() => wasm.parse_and_check!(source));
     if (!checked.ok) {
-      state.setCompilation({
+      commit({
         compiling: false,
         status: `Source ${checked.stage ?? 'validation'} failed.`,
         diagnostics: diagnosticsFrom(checked),
@@ -84,7 +89,7 @@ export async function compileCurrent(source: string, target: Target): Promise<vo
       return;
     }
 
-    state.setCompilation({
+    commit({
       ast: checked.ast ?? null,
       parameters: checked.parameters ?? [],
       resultType: checked.result_type ?? null,
@@ -92,13 +97,13 @@ export async function compileCurrent(source: string, target: Target): Promise<vo
     });
 
     if (target !== 'wasm') {
-      state.setCompilation({ compiling: false, artifact: null, benchmark: null });
+      commit({ compiling: false, artifact: null, benchmark: null });
       return;
     }
 
     const artifact = await jsonCall<CompileArtifact>(() => wasm.compile_artifact_json!(source));
     if (!artifact.ok) throw new Error((artifact as unknown as { error?: string }).error ?? 'artifact compilation failed');
-    state.setCompilation({ artifact, compiling: false, status: 'Compiled successfully. WASM export is ready.' });
+    commit({ artifact, compiling: false, status: 'Compiled successfully. WASM export is ready.' });
 
     const args = parseArguments(useWorkbench.getState().args);
     const bytes = hexBytes(artifact.wasm_bytes_hex);
@@ -107,13 +112,13 @@ export async function compileCurrent(source: string, target: Target): Promise<vo
     if (typeof evaluate !== 'function') throw new Error('compiled module does not export eval');
     const invoke = (...values: number[]) => Number((evaluate as (...values: number[]) => number)(...values));
     const result = invoke(...args);
-    state.setCompilation({ status: `Compiled successfully. Result: ${String(result)}`, tier: 'baseline WASM' });
+    commit({ status: `Compiled successfully. Result: ${String(result)}`, tier: 'baseline WASM' });
     const benchmark = wasm.benchmark
       ? await jsonCall<BenchmarkResult>(() => wasm.benchmark!(source, sizes))
       : await browserBenchmark(invoke, args);
-    state.setCompilation({ benchmark });
+    commit({ benchmark });
   } catch (error) {
-    state.setCompilation({
+    commit({
       compiling: false,
       status: 'Compilation or execution failed.',
       error: error instanceof Error ? error.message : String(error),
