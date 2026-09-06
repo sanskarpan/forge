@@ -921,6 +921,21 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
         return Err("AArch64 i64 emitter requires an i64 result".to_string());
     }
 
+    let non_param_count = function
+        .blocks
+        .iter()
+        .flat_map(|block| block.insts.iter())
+        .filter(|value| {
+            !matches!(
+                function.insts.get(value.0 as usize),
+                Some(Inst::Param { .. })
+            )
+        })
+        .count();
+    if non_param_count > 21 {
+        return emit_i64_with_stack_spills(function, *result);
+    }
+
     let mut registers = HashMap::<Value, Gpr>::new();
     let mut next_volatile = 8u8;
     let mut next_saved = 19u8;
@@ -1023,6 +1038,157 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
         }
         asm.add_imm(SP, SP, frame_bytes, false);
     }
+    asm.ret();
+    Ok(asm.bytes())
+}
+
+#[derive(Clone, Copy)]
+enum I64Location {
+    Register(Gpr),
+    Stack(u16),
+}
+
+/// Emits the straight-line i64 subset with every non-parameter value in a
+/// stack slot. This deliberately simple spill path provides a correctness
+/// fallback once the compact register-preserving path runs out of registers;
+/// control-flow phi spilling and a general live-range allocator remain
+/// separate work.
+fn emit_i64_with_stack_spills(function: &Function, result: Value) -> Result<Vec<u8>, String> {
+    let mut locations = HashMap::<Value, I64Location>::new();
+    let mut next_slot = 24u16;
+    for block in &function.blocks {
+        for &value in &block.insts {
+            let Some(inst) = function.insts.get(value.0 as usize) else {
+                return Err(format!("block references missing instruction {value:?}"));
+            };
+            let location = match inst {
+                Inst::Param { index, ty: Ty::I64 } => {
+                    if *index as usize >= function.params.len() || *index >= 8 {
+                        return Err("AArch64 i64 emitter supports at most 8 parameters".to_string());
+                    }
+                    I64Location::Register(Gpr::new(*index as u8))
+                }
+                Inst::Param { .. } => {
+                    return Err("AArch64 i64 emitter requires i64 parameters only".to_string())
+                }
+                _ => {
+                    let slot = next_slot;
+                    next_slot = next_slot
+                        .checked_add(8)
+                        .ok_or_else(|| "AArch64 i64 spill frame is too large".to_string())?;
+                    I64Location::Stack(slot)
+                }
+            };
+            locations.insert(value, location);
+        }
+    }
+
+    let frame_bytes = u16::try_from((usize::from(next_slot) + 15) & !15)
+        .map_err(|_| "AArch64 i64 spill frame is too large".to_string())?;
+    let location_of = |value: Value| {
+        locations
+            .get(&value)
+            .copied()
+            .ok_or_else(|| format!("missing AArch64 location for value {value:?}"))
+    };
+    let mut asm = Assembler::new();
+    asm.sub_imm(SP, SP, frame_bytes, false);
+    for (register, offset) in [(Gpr::new(28), 0), (Gpr::new(29), 8), (Gpr::new(30), 16)] {
+        asm.str(register, SP, offset);
+    }
+
+    let load = |asm: &mut Assembler, value: Value, scratch: Gpr| -> Result<(), String> {
+        match location_of(value)? {
+            I64Location::Register(register) => {
+                if register != scratch {
+                    asm.orr_reg(scratch, XZR, register);
+                }
+            }
+            I64Location::Stack(offset) => asm.ldr(scratch, SP, offset),
+        }
+        Ok(())
+    };
+    let store = |asm: &mut Assembler, value: Value, source: Gpr| -> Result<(), String> {
+        match location_of(value)? {
+            I64Location::Register(register) => {
+                if register != source {
+                    asm.orr_reg(register, XZR, source);
+                }
+            }
+            I64Location::Stack(offset) => asm.str(source, SP, offset),
+        }
+        Ok(())
+    };
+
+    for &value in &function.blocks[0].insts {
+        match function.insts.get(value.0 as usize) {
+            Some(Inst::ConstI64(number)) => {
+                emit_i64_constant(&mut asm, Gpr::new(28), *number as u64);
+                store(&mut asm, value, Gpr::new(28))?;
+            }
+            Some(Inst::Param { .. }) => {}
+            Some(Inst::Add(lhs, rhs))
+            | Some(Inst::Sub(lhs, rhs))
+            | Some(Inst::Mul(lhs, rhs))
+            | Some(Inst::Div(lhs, rhs))
+            | Some(Inst::And(lhs, rhs))
+            | Some(Inst::Or(lhs, rhs))
+            | Some(Inst::Xor(lhs, rhs))
+            | Some(Inst::Shl(lhs, rhs))
+            | Some(Inst::Shr(lhs, rhs))
+            | Some(Inst::Sar(lhs, rhs)) => {
+                load(&mut asm, *lhs, Gpr::new(28))?;
+                load(&mut asm, *rhs, Gpr::new(29))?;
+                let output = match function.insts.get(value.0 as usize) {
+                    Some(Inst::Add(..)) => add_reg(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    Some(Inst::Sub(..)) => sub_reg(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    Some(Inst::Mul(..)) => mul(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    Some(Inst::Div(..)) => sdiv(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    Some(Inst::And(..)) => and_reg(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    Some(Inst::Or(..)) => orr_reg(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    Some(Inst::Xor(..)) => eor_reg(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    Some(Inst::Shl(..)) => lsl(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    Some(Inst::Shr(..)) => lsr(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    Some(Inst::Sar(..)) => asr(Gpr::new(28), Gpr::new(28), Gpr::new(29)),
+                    _ => unreachable!(),
+                };
+                asm.words.push(output);
+                store(&mut asm, value, Gpr::new(28))?;
+            }
+            Some(Inst::Rem(lhs, rhs)) => {
+                load(&mut asm, *lhs, Gpr::new(28))?;
+                load(&mut asm, *rhs, Gpr::new(29))?;
+                asm.sdiv(Gpr::new(30), Gpr::new(28), Gpr::new(29));
+                asm.msub(Gpr::new(28), Gpr::new(30), Gpr::new(29), Gpr::new(28));
+                store(&mut asm, value, Gpr::new(28))?;
+            }
+            Some(Inst::Neg(operand)) => {
+                load(&mut asm, *operand, Gpr::new(28))?;
+                asm.sub_reg(Gpr::new(28), XZR, Gpr::new(28));
+                store(&mut asm, value, Gpr::new(28))?;
+            }
+            Some(Inst::Not(operand)) => {
+                load(&mut asm, *operand, Gpr::new(28))?;
+                emit_i64_constant(&mut asm, Gpr::new(29), u64::MAX);
+                asm.eor_reg(Gpr::new(28), Gpr::new(29), Gpr::new(28));
+                store(&mut asm, value, Gpr::new(28))?;
+            }
+            Some(inst) => return Err(format!("AArch64 i64 emitter does not support {inst:?}")),
+            None => return Err(format!("missing instruction for value {value:?}")),
+        }
+    }
+
+    match location_of(result)? {
+        I64Location::Register(register) if register != Gpr::new(0) => {
+            asm.orr_reg(Gpr::new(0), XZR, register);
+        }
+        I64Location::Stack(offset) => asm.ldr(Gpr::new(0), SP, offset),
+        I64Location::Register(_) => {}
+    }
+    for (register, offset) in [(Gpr::new(30), 16), (Gpr::new(29), 8), (Gpr::new(28), 0)] {
+        asm.ldr(register, SP, offset);
+    }
+    asm.add_imm(SP, SP, frame_bytes, false);
     asm.ret();
     Ok(asm.bytes())
 }
@@ -1329,6 +1495,25 @@ mod tests {
         assert_eq!(words.last(), Some(&0xd65f_03c0));
     }
 
+    #[test]
+    fn i64_emitter_spills_excess_temporaries_to_stack_slots() {
+        let source = (1..=10)
+            .map(|mask| format!("(n & {mask})"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_i64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.iter().any(|word| *word == str_(Gpr::new(28), SP, 24)));
+        assert!(words.iter().any(|word| *word == ldr(Gpr::new(29), SP, 24)));
+        assert!(words.iter().any(|word| *word == ldr(Gpr::new(28), SP, 0)));
+        assert!(words.iter().any(|word| *word == str_(Gpr::new(30), SP, 16)));
+        assert_eq!(words.last(), Some(&0xd65f_03c0));
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn executes_i64_function_with_a_callee_saved_temporary_frame() {
@@ -1346,6 +1531,25 @@ mod tests {
         let function: unsafe extern "C" fn(i64) -> i64 =
             unsafe { std::mem::transmute(buffer.as_ptr()) };
         assert_eq!(unsafe { function(3) }, 9);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_i64_function_with_stack_spills() {
+        let source = (1..=10)
+            .map(|mask| format!("(n & {mask})"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_i64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        // SAFETY: the emitted body follows the AAPCS64 fn(i64) -> i64
+        // convention, and the executable buffer remains alive for the call.
+        let function: unsafe extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        assert_eq!(unsafe { function(3) }, 15);
     }
 
     #[test]
