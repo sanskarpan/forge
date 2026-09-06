@@ -121,7 +121,7 @@ Deliberately minimal: `f64`, `i64`, `bool`, plus `vec<f64, N>` / `vec<i64, N>` i
 
 - `sqrt`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `trunc` → **single instructions** (`vsqrtsd`, `vandpd`, `vminsd`, `vroundsd`)
 - `sin`, `cos`, `exp`, `log`, `pow` → **calls into libm**, which forces the project to handle a real call sequence: caller-saved spilling, stack alignment, and the difference between the System V and Win64 ABIs
-- `fma` → `vfmadd213sd` when FMA is available, otherwise `mul` + `add` (and the workbench shows the precision difference)
+- `fma` → scalar `vfmadd231sd` when x86 FMA3 is available; on x86 without FMA3 the runtime uses the interpreter fallback so the result remains exact relative to Forge's defined semantics. Packed AVX2+FMA uses the corresponding vector instruction; AArch64 has a native `fmadd` path. Stable EVEX forms are encoded separately, while AVX-512 runtime dispatch and masked tails remain open.
 
 ### Operators & precedence
 
@@ -1265,7 +1265,10 @@ Array mode is where the JIT stops being a curiosity and starts being 8× faster 
 ```rust
 /// Runtime feature detection — you cannot compile AVX-512 into a binary that
 /// must run on older CPUs, so the JIT picks its width when it compiles.
-/// This is a genuine advantage of JIT over AOT and worth demonstrating.
+/// This is the intended JIT advantage over AOT. The current runtime selects
+/// SSE2/AVX2/NEON paths; AVX-512 runtime dispatch remains a follow-up because
+/// stable Rust does not expose the required AVX-512 target-feature surface in
+/// this project.
 pub struct CpuFeatures {
     pub sse2: bool, pub sse41: bool,
     pub avx: bool, pub avx2: bool, pub fma: bool,
@@ -1288,6 +1291,11 @@ impl CpuFeatures {
 ```
 
 ### Vectorizer
+
+The current packed implementation supports SSE2, AVX2, and NEON widths with
+scalar tail handling. EVEX byte encoders exist and are round-trip tested, but
+they are not yet selected by the runtime vectorizer; AVX-512 masked-tail
+execution therefore remains an explicit scope boundary.
 
 ```rust
 /// The expression is already a pure dataflow DAG over element i, so
@@ -1534,7 +1542,9 @@ forge/
 1. **Semantic equivalence.** For every expression and every input, the JIT produces bit-identical results to the interpreter (fast-math excepted, where divergence is bounded and documented).
 2. **Optimization safety.** `-O0`, `-O1`, `-O2` all produce identical results without fast-math.
 3. **Encoding correctness.** Every emitted instruction disassembles to exactly the mnemonic and operands intended.
-4. **Cross-architecture agreement.** x86-64, AArch64, and WASM produce identical results.
+4. **Cross-architecture agreement.** Supported x86-64, AArch64, and WASM
+   programs are specified to produce identical results; the end-to-end
+   three-backend differential harness remains an explicit verification item.
 5. **Register allocation soundness.** No two values live at the same point are assigned the same register. Verified by an independent checker, not by the allocator itself.
 6. **ABI compliance.** Generated functions are callable from C, preserve all callee-saved registers, maintain 16-byte stack alignment at every `call`, and honor Win64 shadow space.
 7. **W^X maintained.** No page is ever simultaneously writable and executable, on any platform.

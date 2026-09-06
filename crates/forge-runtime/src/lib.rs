@@ -78,6 +78,41 @@ pub fn lower_source(source: &str) -> Result<Function, CompileError> {
     Ok(function)
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn function_contains_fma(function: &Function) -> bool {
+    function
+        .insts
+        .iter()
+        .any(|inst| matches!(inst, forge_ir::Inst::Fma { .. }))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn host_supports_scalar_fma() -> bool {
+    is_x86_feature_detected!("fma")
+}
+
+fn interpret_f64_function(function: &Function, args: &[f64]) -> Result<f64, CompileError> {
+    if function.params.len() != args.len()
+        || function
+            .params
+            .iter()
+            .any(|(_, ty)| *ty != forge_ir::Ty::F64)
+    {
+        return Err(CompileError::UnsupportedTarget(
+            "portable fallback accepts all-f64 functions only",
+        ));
+    }
+    match forge_ir::interp::interpret(
+        function,
+        &args.iter().copied().map(RtValue::F64).collect::<Vec<_>>(),
+    ) {
+        RtValue::F64(value) => Ok(value),
+        _ => Err(CompileError::UnsupportedTarget(
+            "expression does not return f64",
+        )),
+    }
+}
+
 /// Interprets source using the reference interpreter. This is available on
 /// every target and is the portable fallback used by the WASM facade.
 pub fn interpret_source(source: &str, args: &[RtValue]) -> Result<RtValue, CompileError> {
@@ -90,42 +125,36 @@ pub fn interpret_source(source: &str, args: &[RtValue]) -> Result<RtValue, Compi
 /// other hosts. This keeps the public runtime usable on the repository's
 /// AArch64 development machines while preserving the native JIT path.
 pub fn evaluate(source: &str, args: &[f64]) -> Result<f64, CompileError> {
-    if cfg!(target_arch = "x86_64") {
-        return Ok(compile(source)?.call(args));
-    }
-    let function = lower_source(source)?;
-    if function.params.len() != args.len()
-        || function
-            .params
-            .iter()
-            .any(|(_, ty)| *ty != forge_ir::Ty::F64)
+    #[cfg(target_arch = "x86_64")]
     {
-        return Err(CompileError::UnsupportedTarget(
-            "portable fallback accepts all-f64 functions only",
-        ));
-    }
-    #[cfg(target_arch = "aarch64")]
-    if function.types.last() == Some(&forge_ir::Ty::F64) {
-        // Keep the portable interpreter as the fallback for operations that
-        // the current AArch64 emitter has not implemented yet (libm calls,
-        // integer conversions, and so on). Supported scalar f64 expressions
-        // execute through the same W^X buffer API used by the x86 runtime.
-        if let Ok(bytes) = forge_aarch64::emit_f64(&function) {
-            let mut buffer = ExecutableBuffer::new(bytes.len())?;
-            buffer.write(|dst| dst[..bytes.len()].copy_from_slice(&bytes));
-            buffer.make_executable()?;
-            let compiled = CompiledExpr::from_buffer(buffer, args.len());
-            return Ok(compiled.call_args(args));
+        let function = lower_source(source)?;
+        if function_contains_fma(&function) && !host_supports_scalar_fma() {
+            // Scalar FMA has observable single-rounding semantics. Running
+            // the verified reference interpreter on non-FMA hosts preserves
+            // those semantics instead of emitting an illegal FMA3 opcode.
+            return interpret_f64_function(&function, args);
         }
+        Ok(compile(source)?.call(args))
     }
-    match forge_ir::interp::interpret(
-        &function,
-        &args.iter().copied().map(RtValue::F64).collect::<Vec<_>>(),
-    ) {
-        RtValue::F64(value) => Ok(value),
-        _ => Err(CompileError::UnsupportedTarget(
-            "expression does not return f64",
-        )),
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let function = lower_source(source)?;
+        #[cfg(target_arch = "aarch64")]
+        if function.types.last() == Some(&forge_ir::Ty::F64) {
+            // Keep the portable interpreter as the fallback for operations
+            // that the current AArch64 emitter has not implemented yet (libm
+            // calls, integer conversions, and so on). Supported scalar f64
+            // expressions execute through the same W^X buffer API used by
+            // the x86 runtime.
+            if let Ok(bytes) = forge_aarch64::emit_f64(&function) {
+                let mut buffer = ExecutableBuffer::new(bytes.len())?;
+                buffer.write(|dst| dst[..bytes.len()].copy_from_slice(&bytes));
+                buffer.make_executable()?;
+                let compiled = CompiledExpr::from_buffer(buffer, args.len());
+                return Ok(compiled.call_args(args));
+            }
+        }
+        interpret_f64_function(&function, args)
     }
 }
 
@@ -152,6 +181,12 @@ pub fn compile_artifacts_with_optimization(
     let mut function = lower_source(source)?;
     if optimize {
         forge_opt::optimize(&mut function);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if function_contains_fma(&function) && !host_supports_scalar_fma() {
+        return Err(CompileError::UnsupportedTarget(
+            "scalar FMA requires FMA3 on the native JIT path",
+        ));
     }
     forge_ir::verify::verify(&function).map_err(CompileError::Ir)?;
     let selected = forge_x64::select(&function);
@@ -276,6 +311,14 @@ mod tests {
                 .sum::<usize>()
         };
         assert!(live_count(&optimized.function) < live_count(&baseline.function));
+    }
+
+    #[test]
+    fn function_contains_fma_only_for_fma_expressions() {
+        assert!(!function_contains_fma(&lower_source("x * y + z").unwrap()));
+        assert!(function_contains_fma(
+            &lower_source("fma(x, y, z)").unwrap()
+        ));
     }
 
     #[cfg(target_arch = "x86_64")]

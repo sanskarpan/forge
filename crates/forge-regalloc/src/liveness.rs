@@ -25,7 +25,11 @@ pub fn reads_of(inst: &MachineInst) -> Vec<Value> {
         | MachineInst::FloatMul { lhs, rhs, .. }
         | MachineInst::FloatDiv { lhs, rhs, .. }
         | MachineInst::FloatMin { lhs, rhs, .. }
-        | MachineInst::FloatMax { lhs, rhs, .. } => vec![*lhs, *rhs],
+        | MachineInst::FloatMax { lhs, rhs, .. }
+        | MachineInst::FloatMinMaxSelect { lhs, rhs, .. } => vec![*lhs, *rhs],
+        MachineInst::FloatFma {
+            lhs, rhs, addend, ..
+        } => vec![*lhs, *rhs, *addend],
         MachineInst::IntNeg { src, .. }
         | MachineInst::Not { src, .. }
         | MachineInst::FloatSqrt { src, .. }
@@ -82,9 +86,11 @@ pub fn def_of(inst: &MachineInst) -> Option<Value> {
         | MachineInst::FloatSub { dst, .. }
         | MachineInst::FloatMul { dst, .. }
         | MachineInst::FloatDiv { dst, .. }
+        | MachineInst::FloatFma { dst, .. }
         | MachineInst::FloatSqrt { dst, .. }
         | MachineInst::FloatMin { dst, .. }
         | MachineInst::FloatMax { dst, .. }
+        | MachineInst::FloatMinMaxSelect { dst, .. }
         | MachineInst::FloatRound { dst, .. }
         | MachineInst::FloatAbs { dst, .. }
         | MachineInst::FloatNeg { dst, .. }
@@ -328,8 +334,8 @@ mod tests {
             selected
                 .insts
                 .iter()
-                .any(|i| matches!(i, MachineInst::FloatMax { .. })),
-            "expected the diamond to fuse into a FloatMax"
+                .any(|i| matches!(i, MachineInst::FloatMinMaxSelect { .. })),
+            "expected the diamond to fuse into a NaN-safe FloatMinMaxSelect"
         );
 
         // `c` is the pass-through: the FloatAdd combining it with the

@@ -380,27 +380,33 @@ fn float_binops_use_the_matching_sse_op() {
         assert_eq!(disassemble(asm.code()), vec![expected.to_string()]);
     }
 
-    for (inst, op) in [
+    for (inst, op, tie_op) in [
         (
             forge_x64::MachineInst::FloatMin { dst, lhs, rhs },
             "minsd xmm0,xmm2",
+            "orpd xmm0,xmm2",
         ),
         (
             forge_x64::MachineInst::FloatMax { dst, lhs, rhs },
             "maxsd xmm0,xmm2",
+            "andpd xmm0,xmm2",
         ),
     ] {
         let mut asm = Assembler::new();
         forge_emit::translate_inst(&mut asm, &inst, &loc, &[]);
         let actual = disassemble(asm.code());
-        assert_eq!(actual.len(), 7);
+        assert_eq!(actual.len(), 11);
         assert_eq!(actual[0], "ucomisd xmm0,xmm0");
         assert!(actual[1].starts_with("jp near "));
         assert_eq!(actual[2], "ucomisd xmm2,xmm2");
         assert!(actual[3].starts_with("jp near "));
-        assert_eq!(actual[4], op);
-        assert!(actual[5].starts_with("jmp "));
-        assert_eq!(actual[6], "movsd xmm0,xmm2");
+        assert_eq!(actual[4], "ucomisd xmm0,xmm2");
+        assert!(actual[5].starts_with("je near "));
+        assert_eq!(actual[6], op);
+        assert!(actual[7].starts_with("jmp "));
+        assert_eq!(actual[8], tie_op);
+        assert!(actual[9].starts_with("jmp "));
+        assert_eq!(actual[10], "movsd xmm0,xmm2");
     }
 }
 

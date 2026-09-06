@@ -69,6 +69,69 @@ fn arb_f64_expr() -> impl Strategy<Value = String> {
     })
 }
 
+#[derive(Clone, Copy)]
+struct StressRng(u64);
+
+impl StressRng {
+    fn next(&mut self) -> u64 {
+        // A fixed, local generator keeps this stress test reproducible without
+        // adding a runtime dependency or relying on proptest's case scheduler.
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+
+    fn input(&mut self) -> f64 {
+        match self.next() % 12 {
+            0 => 0.0,
+            1 => -0.0,
+            2 => f64::INFINITY,
+            3 => f64::NEG_INFINITY,
+            4 => f64::NAN,
+            5 => f64::MIN_POSITIVE,
+            6 => -f64::MIN_POSITIVE,
+            7 => f64::MAX,
+            8 => f64::MIN,
+            _ => f64::from_bits(self.next()),
+        }
+    }
+}
+
+fn stress_expr(rng: &mut StressRng, depth: u8) -> String {
+    if depth == 0 {
+        return match rng.next() % 8 {
+            0 => "x".to_string(),
+            1 => "y".to_string(),
+            2 => "0.0".to_string(),
+            3 => "-0.0".to_string(),
+            4 => "0.5".to_string(),
+            5 => "1.0".to_string(),
+            6 => "2.0".to_string(),
+            _ => "3.0".to_string(),
+        };
+    }
+
+    let left = stress_expr(rng, depth - 1);
+    match rng.next() % 10 {
+        0 => format!("({left} + {})", stress_expr(rng, depth - 1)),
+        1 => format!("({left} - {})", stress_expr(rng, depth - 1)),
+        2 => format!("({left} * {})", stress_expr(rng, depth - 1)),
+        3 => format!("({left} / (abs({}) + 1.0))", stress_expr(rng, depth - 1)),
+        4 => format!("abs({left})"),
+        5 => format!("sqrt(abs({left}))"),
+        6 => format!("min({left}, {})", stress_expr(rng, depth - 1)),
+        7 => format!("max({left}, {})", stress_expr(rng, depth - 1)),
+        8 => format!(
+            "if (({left}) < 0.0) then ({}) else ({})",
+            stress_expr(rng, depth - 1),
+            stress_expr(rng, depth - 1)
+        ),
+        _ => format!("(fma({left}, 2.0, {}))", stress_expr(rng, depth - 1)),
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -111,5 +174,51 @@ fn jit_preserves_special_values_and_signed_zeroes() {
             let actual = evaluate(source, &[input]).unwrap();
             assert_same(expected, actual, source, &[input]);
         }
+    }
+}
+
+#[test]
+fn fused_float_diamond_preserves_unordered_else_value() {
+    let source = "if ((((-0.0 * 1.0) * (3.0 * y))) < 0.0) then (abs((-0.0 * 1.0))) else (((3.0 * y) * min(-0.0, 1.0)))";
+    let args = [-f64::MAX];
+    let expected = interpret_source(source, &[RtValue::F64(args[0])]).unwrap();
+    let actual = evaluate(source, &args).unwrap();
+    assert_same(expected, actual, source, &args);
+    assert!(actual.is_nan());
+}
+
+#[test]
+fn nested_min_preserves_signed_zero_after_fma() {
+    let source = "min(min(min(-0.0, 1.0), (3.0 * y)), (fma(abs(-0.0), 2.0, max(x, 0.0))))";
+    let args = [f64::from_bits(1), 0.0];
+    let expected =
+        interpret_source(source, &[RtValue::F64(args[0]), RtValue::F64(args[1])]).unwrap();
+    let actual = evaluate(source, &args).unwrap();
+    assert_same(expected, actual, source, &args);
+}
+
+#[test]
+fn compiles_and_executes_100000_reproducible_random_expressions() {
+    const CASES: usize = 100_000;
+    let mut rng = StressRng(0x5eed_cafe_d00d_f00d);
+
+    for iteration in 0..CASES {
+        let source = stress_expr(&mut rng, 3);
+        let function = lower_source(&source).unwrap_or_else(|error| {
+            panic!("generated expression failed to lower at {iteration}: {source:?}: {error:?}")
+        });
+        let raw_args = (0..function.params.len())
+            .map(|_| rng.input())
+            .collect::<Vec<_>>();
+        let interpreter_args = raw_args
+            .iter()
+            .copied()
+            .map(RtValue::F64)
+            .collect::<Vec<_>>();
+        let expected = forge_ir::interp::interpret(&function, &interpreter_args);
+        let actual = evaluate(&source, &raw_args).unwrap_or_else(|error| {
+            panic!("generated expression failed to execute at {iteration}: {source:?}: {error}")
+        });
+        assert_same(expected, actual, &source, &raw_args);
     }
 }
