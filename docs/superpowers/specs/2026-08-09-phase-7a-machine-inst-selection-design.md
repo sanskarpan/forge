@@ -1,7 +1,7 @@
 # Design: forge Phase 7a — `MachineInst` + Baseline Instruction Selection
 
-**Status:** Approved for planning
-**Scope:** The first sub-slice of CHECKLIST.md Phase 7 ("Instruction Selection & Prologue," 22 tasks) — the `MachineInst` enum and a baseline tree-tiling (one-IR-node-to-one-or-few-MachineInst) selector, covering every `forge_ir::Inst` variant except `Phi` (explicitly deferred to Phase 8, see below), `Call` (deferred to 7e — needs real ABI machinery), `Fma` (lowered as `Mul` then `Add` until AVX/FMA3 lands, out of scope until Phase 6's VEX/AVX subsection is built), and `Rem` on `f64` operands specifically (deferred — see "Float `Rem` is out of scope" below; `Rem` on `i64` operands is in scope and behaves like every other integer binary op).
+**Status:** Approved for planning; historical snapshot
+**Scope:** The first sub-slice of CHECKLIST.md Phase 7 ("Instruction Selection & Prologue," 22 tasks) — the `MachineInst` enum and a baseline tree-tiling (one-IR-node-to-one-or-few-MachineInst) selector, covering every `forge_ir::Inst` variant except `Phi` (explicitly deferred to Phase 8, see below), `Call` (deferred to 7e — needs real ABI machinery), and `Rem` on `f64` operands specifically (deferred — see "Float `Rem` is out of scope" below; `Rem` on `i64` operands is in scope and behaves like every other integer binary op). The plan's temporary `Fma` decomposition was superseded by PR #278: final x86 emission now uses `vfmadd231sd` on FMA3-capable hosts and an exact interpreter fallback when FMA3 is unavailable.
 
 **Float `Rem` is out of scope for this slice.** `forge_ir::Inst::Rem` is shared between `i64` and `f64` operands exactly like `Add`/`Sub`/`Mul`/`Div` (confirmed against `crates/forge-syntax/src/typeck.rs`'s `check_binary`, which type-checks `Rem` identically to `Add`/`Sub`/`Mul`/`Div`, and `crates/forge-ir/src/interp.rs`, whose oracle implements real IEEE `x % y` float remainder via Rust's native `%` operator) — `x % y` on floats is a real, exercised language feature, not dead code. But x86 has no native float-remainder instruction, and forge's `LibFunc` enum (`Sin`/`Cos`/`Tan`/`Exp`/`Log`/`Pow`) has no `Fmod` entry to route through the eventual libm call sequence either — correctly implementing this needs either a new `LibFunc::Fmod` variant (parser + typeck + IR + libm wiring, real cross-crate work well beyond this slice) or a software reduction sequence precise enough to stay bit-identical to Rust's `%` across the full f64 range (a naive `x - trunc(x/y)*y` decomposition, unlike `Fma`'s Mul-then-Add approximation, can diverge arbitrarily for large `x/y` ratios due to catastrophic cancellation — this is a correctness risk, not a bounded/documented precision difference like `Fma`'s, and SPEC.md §18's bit-identical-to-interpreter property doesn't carve out an exception for it). Selecting `Inst::Rem` with `f64` operands panics with a clear "not yet implemented" message, exactly like `Call`.
 **Out of scope (deferred):** addressing-mode folding, `lea` synthesis, `Select`→`cmov`/blend diamond-pattern conversion (all 7b — genuine multi-node tree-tiling, not baseline 1:1 lowering), the constant pool and RIP-relative-loaded sign-mask constants (7c — 7a's `Abs`/`Neg` work correctly today by materializing the sign mask into a scratch GPR + `movq_gpr_to_xmm` inline, per 6e's `andpd_reg_reg`/`xorpd_reg_reg` doc comments; 7c is a later optimization, not a correctness gap), prologue/epilogue/ABI frame plumbing (7d), the libm call sequence (7e), actual register allocation (Phase 8), and the final MachineInst-to-bytes emission step that resolves two-address copies and calls `Assembler` methods (built once Phase 8 exists and real `PhysReg` assignments are known — see "Two-address fixup" below).
@@ -118,7 +118,7 @@ FloatNeg { dst, src, mask_tmp }:
 
 Both `mask_tmp`'s `LoadImmI64` is a normal `MachineInst` in the selected sequence (its `Value` is synthetic — added to `SelectedFunction::synthetic_types` as `Ty::I64`); the `movq_gpr_to_xmm`+`andpd`/`xorpd` pair is NOT modeled as separate `MachineInst`s here — `FloatAbs`/`FloatNeg` carry `mask_tmp` as a field precisely so the (post-Phase-8) emission step can synthesize that exact 2-instruction sequence once it knows `mask_tmp`'s and `dst`'s real registers. This keeps `MachineInst` a 1:1 semantic match with "compute abs/neg of this value" while still giving emission everything it needs.
 
-### `Fma` lowering (decomposition, documented as temporary)
+### `Fma` lowering (historical decomposition; superseded for final x86 emission)
 
 ```
 Fma { a, b, c } with dst == the Fma's own Value:
@@ -126,7 +126,12 @@ Fma { a, b, c } with dst == the Fma's own Value:
     FloatAdd { dst: dst, lhs: mul_tmp, rhs: c }
 ```
 
-Not bit-identical to a real hardware FMA (two roundings instead of one) — CHECKLIST.md's own FMA bullets (`vfmadd213sd`/`vfmadd231sd`, FMA3) live entirely under Phase 6's "VEX/AVX" subsection (🟡, deferred, no consumer built yet), so this decomposition is the correct interim behavior, not a shortcut being silently taken. Document this loudly in the code, not just this doc.
+Not bit-identical to a real hardware FMA (two roundings instead of one). This
+was the correct interim behavior when this design was written, but it is no
+longer the final x86 path: PR #278 added `MachineInst::FloatFma` and emits
+`vfmadd231sd` when FMA3 is available, with an exact interpreter fallback on
+non-FMA x86. The baseline decomposition remains relevant only to this
+historical Phase 7a design and its original golden tests.
 
 ### `Call`/`Phi` — explicitly unimplemented in 7a
 
