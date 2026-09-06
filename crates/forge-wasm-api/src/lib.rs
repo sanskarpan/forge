@@ -199,7 +199,7 @@ fn native_x64_artifact(source: &str) -> Result<String, String> {
         .collect::<Vec<_>>()
         .join(",");
     let intervals = intervals_json(&intervals, &assignment);
-    let analysis = analysis_json(source)?;
+    let analysis = analysis_core_json(source)?;
     Ok(format!(
         r#"{{"ok":true,"target":"x86_64","parameter_types":[{}],"result_type":{},"bytes_hex":{},"bytes_len":{},"wasm_bytes_hex":"","wasm_bytes_len":0,"asm":[{}],"intervals":[{}],"encoding":"x86-64",{}}}"#,
         parameter_types_json(&function),
@@ -218,20 +218,23 @@ fn native_aarch64_artifact(source: &str) -> Result<String, String> {
     forge_ir::verify::verify(&function).map_err(|error| error.to_string())?;
     let bytes = forge_aarch64::emit_f64(&function)?;
     let asm = bytes
-        .chunks_exact(4)
+        .chunks(4)
         .enumerate()
-        .map(|(index, word)| {
-            let bits = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-            format!(
+        .filter_map(|(index, word)| {
+            let [b0, b1, b2, b3] = word else {
+                return None;
+            };
+            let bits = u32::from_le_bytes([*b0, *b1, *b2, *b3]);
+            Some(format!(
                 r#"{{"offset":{},"bytes":{},"text":{}}}"#,
                 index * 4,
                 json_string(&hex_bytes(word)),
                 json_string(&format!("word 0x{bits:08x}"))
-            )
+            ))
         })
         .collect::<Vec<_>>()
         .join(",");
-    let analysis = analysis_json(source)?;
+    let analysis = analysis_core_json(source)?;
     Ok(format!(
         r#"{{"ok":true,"target":"aarch64","parameter_types":[{}],"result_type":{},"bytes_hex":{},"bytes_len":{},"wasm_bytes_hex":"","wasm_bytes_len":0,"asm":[{}],"intervals":[],"encoding":"aarch64",{}}}"#,
         parameter_types_json(&function),
@@ -317,6 +320,13 @@ fn json_error(error: &str) -> String {
 /// represented as empty arrays with an explicit encoding marker; the lowered
 /// and optimized IR plus CFG remain real artifacts from the compiler itself.
 fn analysis_json(source: &str) -> Result<String, String> {
+    let analysis = analysis_core_json(source)?;
+    Ok(format!(
+        r#"{analysis},"intervals":[],"asm":[],"encoding":"wasm-stack""#
+    ))
+}
+
+fn analysis_core_json(source: &str) -> Result<String, String> {
     let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
     if !lex_diags.is_empty() {
         return Err(format!("lexing failed: {lex_diags:?}"));
@@ -343,7 +353,7 @@ fn analysis_json(source: &str) -> Result<String, String> {
     );
     let cfg = cfg_dot(&optimized);
     Ok(format!(
-        r#""ir_stages":{ir_stages},"cfg":{},"intervals":[],"asm":[],"encoding":"wasm-stack""#,
+        r#""ir_stages":{ir_stages},"cfg":{}"#,
         json_string(&cfg)
     ))
 }
@@ -585,12 +595,14 @@ mod tests {
         assert!(x86.contains(r#""bytes_len":"#));
         assert!(x86.contains(r#""intervals":["#));
         assert!(x86.contains(r#""asm":["#));
+        assert_eq!(x86.matches(r#""encoding":"#).count(), 1);
 
         let arm = compile_target_artifact_json("x + 1.0", "aarch64");
         assert!(arm.contains(r#""ok":true"#));
         assert!(arm.contains(r#""target":"aarch64"#));
         assert!(arm.contains(r#""encoding":"aarch64"#));
         assert!(arm.contains(r#""asm":["#));
+        assert_eq!(arm.matches(r#""encoding":"#).count(), 1);
     }
 
     #[test]
