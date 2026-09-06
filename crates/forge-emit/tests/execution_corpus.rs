@@ -33,6 +33,23 @@ fn run_f64_arg(code: &[u8], arg: f64) -> f64 {
     unsafe { function(arg) }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn scalar_minmax_preserves_left_operand_on_equal_signed_zero() {
+    let negative_zero = (-0.0f64).to_bits();
+    let positive_zero = 0.0f64.to_bits();
+
+    for (source, args, expected) in [
+        ("min(x, y)", [-0.0, 0.0], negative_zero),
+        ("min(x, y)", [0.0, -0.0], positive_zero),
+        ("max(x, y)", [-0.0, 0.0], negative_zero),
+        ("max(x, y)", [0.0, -0.0], positive_zero),
+    ] {
+        let actual = forge_runtime::evaluate(source, &args).unwrap();
+        assert_eq!(actual.to_bits(), expected, "source={source}, args={args:?}");
+    }
+}
+
 #[test]
 fn float_neg_flips_sign_bit() {
     let mut b = Builder::new();
