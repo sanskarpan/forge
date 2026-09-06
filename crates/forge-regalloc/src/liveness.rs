@@ -26,6 +26,9 @@ pub fn reads_of(inst: &MachineInst) -> Vec<Value> {
         | MachineInst::FloatDiv { lhs, rhs, .. }
         | MachineInst::FloatMin { lhs, rhs, .. }
         | MachineInst::FloatMax { lhs, rhs, .. } => vec![*lhs, *rhs],
+        MachineInst::FloatFma {
+            lhs, rhs, addend, ..
+        } => vec![*lhs, *rhs, *addend],
         MachineInst::IntNeg { src, .. }
         | MachineInst::Not { src, .. }
         | MachineInst::FloatSqrt { src, .. }
@@ -82,6 +85,7 @@ pub fn def_of(inst: &MachineInst) -> Option<Value> {
         | MachineInst::FloatSub { dst, .. }
         | MachineInst::FloatMul { dst, .. }
         | MachineInst::FloatDiv { dst, .. }
+        | MachineInst::FloatFma { dst, .. }
         | MachineInst::FloatSqrt { dst, .. }
         | MachineInst::FloatMin { dst, .. }
         | MachineInst::FloatMax { dst, .. }
