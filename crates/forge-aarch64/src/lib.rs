@@ -14,6 +14,15 @@ impl Gpr {
         Self(index)
     }
 
+    /// Constructs a register number for an AArch64 floating-point register.
+    /// D0..D31 have 32 architectural registers, while the integer X register
+    /// namespace reserves number 31 for SP/XZR and is therefore handled by
+    /// [`Gpr::new`] plus the named constants below.
+    pub const fn new_d(index: u8) -> Self {
+        assert!(index < 32, "AArch64 D register must be D0..D31");
+        Self(index)
+    }
+
     pub const fn index(self) -> u8 {
         self.0
     }
@@ -168,6 +177,18 @@ impl Assembler {
 
     pub fn str(&mut self, src: Gpr, base: Gpr, offset_bytes: u16) {
         self.words.push(str_(src, base, offset_bytes));
+    }
+
+    /// Emits `ldr Dd, [Xn, #offset]` for an unsigned, eight-byte-scaled
+    /// scalar-double stack slot.
+    pub fn ldr_d(&mut self, dst: Gpr, base: Gpr, offset_bytes: u16) {
+        self.words.push(ldr_d(dst, base, offset_bytes));
+    }
+
+    /// Emits `str Dd, [Xn, #offset]` for an unsigned, eight-byte-scaled
+    /// scalar-double stack slot.
+    pub fn str_d(&mut self, src: Gpr, base: Gpr, offset_bytes: u16) {
+        self.words.push(str_d(src, base, offset_bytes));
     }
 
     pub fn movz(&mut self, dst: Gpr, imm: u16, shift: u8) {
@@ -404,6 +425,22 @@ pub fn str_(src: Gpr, base: Gpr, offset_bytes: u16) -> u32 {
         | u32::from(src.index())
 }
 
+pub fn ldr_d(dst: Gpr, base: Gpr, offset_bytes: u16) -> u32 {
+    assert!(offset_bytes.is_multiple_of(8) && offset_bytes / 8 < 4096);
+    0xfd40_0000
+        | (u32::from(offset_bytes / 8) << 10)
+        | (u32::from(base.index()) << 5)
+        | u32::from(dst.index())
+}
+
+pub fn str_d(src: Gpr, base: Gpr, offset_bytes: u16) -> u32 {
+    assert!(offset_bytes.is_multiple_of(8) && offset_bytes / 8 < 4096);
+    0xfd00_0000
+        | (u32::from(offset_bytes / 8) << 10)
+        | (u32::from(base.index()) << 5)
+        | u32::from(src.index())
+}
+
 pub fn movz(dst: Gpr, imm: u16, shift: u8) -> u32 {
     assert!(shift.is_multiple_of(16) && shift <= 48);
     0xd280_0000 | (u32::from(shift / 16) << 21) | (u32::from(imm) << 5) | u32::from(dst.index())
@@ -538,9 +575,9 @@ pub fn is_native_target() -> bool {
 /// banks. Temporaries use the corresponding register number in their class;
 /// constants are loaded from an aligned literal pool or materialized with
 /// MOVZ/MOVK. Branch edges materialize typed SSA φ values before transfer.
-/// Temporaries use caller-saved D16..D31 or X8..X18 registers in their class;
-/// programs beyond these volatile-register budgets are rejected until stack
-/// frames and real spill/reload support are added.
+/// Temporaries use caller-saved D16..D31 or X8..X18 registers first. If those
+/// are exhausted, the emitter allocates D8..D15 or X19..X28 and preserves the
+/// selected callee-saved registers in a 16-byte-aligned stack frame.
 pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
     if function.blocks.is_empty() {
         return Err("AArch64 emitter requires at least one block".to_string());
@@ -552,6 +589,10 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
     let mut registers = HashMap::<Value, Gpr>::new();
     let mut next_float_temporary = 16u8;
     let mut next_integer_temporary = 8u8;
+    let mut next_saved_float = 8u8;
+    let mut next_saved_integer = 19u8;
+    let mut saved_float = Vec::<Gpr>::new();
+    let mut saved_integer = Vec::<Gpr>::new();
     for block in &function.blocks {
         for &value in &block.insts {
             let Some(inst) = function.insts.get(value.0 as usize) else {
@@ -578,25 +619,37 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                 }
                 _ => match function.types.get(value.0 as usize) {
                     Some(Ty::F64) => {
-                        let index = next_float_temporary;
-                        next_float_temporary = next_float_temporary
-                            .checked_add(1)
-                            .filter(|next| *next <= 31)
-                            .ok_or_else(|| {
-                                "AArch64 emitter ran out of caller-saved D-register temporaries"
-                                    .to_string()
-                            })?;
-                        Gpr::new(index)
+                        let index = if next_float_temporary <= 31 {
+                            let index = next_float_temporary;
+                            next_float_temporary += 1;
+                            index
+                        } else if next_saved_float <= 15 {
+                            let index = next_saved_float;
+                            next_saved_float += 1;
+                            saved_float.push(Gpr::new_d(index));
+                            index
+                        } else {
+                            return Err(
+                                "AArch64 emitter ran out of D-register temporaries".to_string()
+                            );
+                        };
+                        Gpr::new_d(index)
                     }
                     Some(Ty::I64 | Ty::Bool) => {
-                        let index = next_integer_temporary;
-                        next_integer_temporary = next_integer_temporary
-                            .checked_add(1)
-                            .filter(|next| *next <= 18)
-                            .ok_or_else(|| {
-                                "AArch64 emitter ran out of caller-saved X-register temporaries"
-                                    .to_string()
-                            })?;
+                        let index = if next_integer_temporary <= 18 {
+                            let index = next_integer_temporary;
+                            next_integer_temporary += 1;
+                            index
+                        } else if next_saved_integer <= 28 {
+                            let index = next_saved_integer;
+                            next_saved_integer += 1;
+                            saved_integer.push(Gpr::new(index));
+                            index
+                        } else {
+                            return Err(
+                                "AArch64 emitter ran out of X-register temporaries".to_string()
+                            );
+                        };
                         Gpr::new(index)
                     }
                     None => return Err(format!("value {value:?} has no AArch64 IR type")),
@@ -616,6 +669,30 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
     let mut pool = Vec::<u64>::new();
     let mut pool_indices = HashMap::<u64, usize>::new();
     let mut literal_loads = Vec::<(usize, usize, Gpr)>::new();
+
+    let mut saved_float_slots = Vec::<(Gpr, u16)>::new();
+    let mut saved_integer_slots = Vec::<(Gpr, u16)>::new();
+    let mut next_slot = 0u16;
+    for &register in &saved_float {
+        saved_float_slots.push((register, next_slot));
+        next_slot += 8;
+    }
+    for &register in &saved_integer {
+        saved_integer_slots.push((register, next_slot));
+        next_slot += 8;
+    }
+    let frame_bytes = u16::try_from((usize::from(next_slot) + 15) & !15)
+        .map_err(|_| "AArch64 stack frame is too large".to_string())?;
+
+    if frame_bytes != 0 {
+        asm.sub_imm(SP, SP, frame_bytes, false);
+        for &(register, offset) in &saved_float_slots {
+            asm.str_d(register, SP, offset);
+        }
+        for &(register, offset) in &saved_integer_slots {
+            asm.str(register, SP, offset);
+        }
+    }
 
     let mut block_offsets = vec![None; function.blocks.len()];
     let mut branch_fixups = Vec::<(usize, usize, Option<Condition>)>::new();
@@ -759,6 +836,15 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                 if result_register != Gpr::new(0) {
                     asm.fmov_d(Gpr::new(0), result_register);
                 }
+                if frame_bytes != 0 {
+                    for &(register, offset) in saved_integer_slots.iter().rev() {
+                        asm.ldr(register, SP, offset);
+                    }
+                    for &(register, offset) in saved_float_slots.iter().rev() {
+                        asm.ldr_d(register, SP, offset);
+                    }
+                    asm.add_imm(SP, SP, frame_bytes, false);
+                }
                 asm.ret();
             }
             Some(Terminator::Jump(target)) => {
@@ -836,6 +922,9 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
     }
 
     let mut registers = HashMap::<Value, Gpr>::new();
+    let mut next_volatile = 8u8;
+    let mut next_saved = 19u8;
+    let mut saved = Vec::<Gpr>::new();
     for block in &function.blocks {
         for &value in &block.insts {
             let Some(inst) = function.insts.get(value.0 as usize) else {
@@ -852,13 +941,20 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
                     return Err("AArch64 i64 emitter requires i64 parameters only".to_string())
                 }
                 _ => {
-                    let index = u8::try_from(value.0)
-                        .ok()
-                        .and_then(|index| index.checked_add(8))
-                        .filter(|index| *index < 31)
-                        .ok_or_else(|| {
+                    let index = if next_volatile <= 18 {
+                        let index = next_volatile;
+                        next_volatile += 1;
+                        index
+                    } else if next_saved <= 28 {
+                        let index = next_saved;
+                        next_saved += 1;
+                        saved.push(Gpr::new(index));
+                        index
+                    } else {
+                        return Err(
                             "AArch64 i64 emitter ran out of X-register temporaries".to_string()
-                        })?;
+                        );
+                    };
                     Gpr::new(index)
                 }
             };
@@ -873,6 +969,18 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
             .ok_or_else(|| format!("missing AArch64 register for value {value:?}"))
     };
     let mut asm = Assembler::new();
+    let mut saved_slots = Vec::<(Gpr, u16)>::new();
+    for (slot, &register) in saved.iter().enumerate() {
+        saved_slots.push((register, u16::try_from(slot * 8).unwrap()));
+    }
+    let frame_bytes = u16::try_from((saved_slots.len() * 8 + 15) & !15)
+        .map_err(|_| "AArch64 i64 stack frame is too large".to_string())?;
+    if frame_bytes != 0 {
+        asm.sub_imm(SP, SP, frame_bytes, false);
+        for &(register, offset) in &saved_slots {
+            asm.str(register, SP, offset);
+        }
+    }
     for &value in &function.blocks[0].insts {
         let dst = registers[&value];
         match function.insts.get(value.0 as usize) {
@@ -908,6 +1016,12 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
     if result_register != Gpr::new(0) {
         // ORR Xd, XZR, Xm is the architectural MOV register alias.
         asm.orr_reg(Gpr::new(0), XZR, result_register);
+    }
+    if frame_bytes != 0 {
+        for &(register, offset) in saved_slots.iter().rev() {
+            asm.ldr(register, SP, offset);
+        }
+        asm.add_imm(SP, SP, frame_bytes, false);
     }
     asm.ret();
     Ok(asm.bytes())
@@ -1035,6 +1149,8 @@ mod tests {
         assert_eq!(encode_branch_cond(Condition::Ne, 8), 0x5400_0041);
         assert_eq!(ldr(Gpr::new(0), Gpr::new(1), 16), 0xf940_0820);
         assert_eq!(str_(Gpr::new(0), Gpr::new(1), 16), 0xf900_0820);
+        assert_eq!(ldr_d(Gpr::new(0), Gpr::new(1), 16), 0xfd40_0820);
+        assert_eq!(str_d(Gpr::new(0), Gpr::new(1), 16), 0xfd00_0820);
         assert_eq!(movz(Gpr::new(0), 0x1234, 16), 0xd2a2_4680);
     }
 
@@ -1137,11 +1253,18 @@ mod tests {
     }
 
     #[test]
-    fn scalar_emitter_rejects_more_volatile_temporaries_than_the_abi_budget() {
+    fn scalar_emitter_uses_a_frame_before_rejecting_excess_temporaries() {
         let source = std::iter::repeat_n("x", 18).collect::<Vec<_>>().join(" + ");
         let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        assert!(bytes.chunks(4).any(
+            |chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == str_d(Gpr::new(8), SP, 0)
+        ));
+
+        let source = std::iter::repeat_n("x", 26).collect::<Vec<_>>().join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
         let error = emit_f64(&function).unwrap_err();
-        assert!(error.contains("caller-saved D-register temporaries"));
+        assert!(error.contains("D-register temporaries"));
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1181,6 +1304,48 @@ mod tests {
         assert!(words.iter().any(|word| word & 0xffc0_0000 == 0x9ac0_0000));
         assert!(words.iter().any(|word| word & 0xffc0_0000 == 0x9b00_0000));
         assert_eq!(words.last(), Some(&0xd65f_03c0));
+    }
+
+    #[test]
+    fn i64_emitter_preserves_callee_saved_temporaries_in_a_frame() {
+        let source = (1..=6)
+            .map(|mask| format!("(n & {mask})"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_i64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.iter().any(|word| *word == str_(Gpr::new(19), SP, 0)));
+        assert!(words.iter().any(|word| *word == ldr(Gpr::new(19), SP, 0)));
+        assert!(words
+            .iter()
+            .any(|word| *word == encode_add_sub_imm(true, SP, SP, 48, false)));
+        assert!(words
+            .iter()
+            .any(|word| *word == encode_add_sub_imm(false, SP, SP, 48, false)));
+        assert_eq!(words.last(), Some(&0xd65f_03c0));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_i64_function_with_a_callee_saved_temporary_frame() {
+        let source = (1..=6)
+            .map(|mask| format!("(n & {mask})"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_i64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        // SAFETY: the emitted body follows the AAPCS64 fn(i64) -> i64
+        // convention, and the executable buffer remains alive for the call.
+        let function: unsafe extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        assert_eq!(unsafe { function(3) }, 9);
     }
 
     #[test]
@@ -1253,5 +1418,18 @@ mod tests {
         let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
         assert_eq!(compiled.call_args(&[3.0]), 3.0);
         assert_eq!(compiled.call_args(&[-3.0]), 3.0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_aarch64_function_with_a_callee_saved_temporary_frame() {
+        let source = std::iter::repeat_n("x", 18).collect::<Vec<_>>().join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
+        assert_eq!(compiled.call_args(&[3.0]), 54.0);
     }
 }
