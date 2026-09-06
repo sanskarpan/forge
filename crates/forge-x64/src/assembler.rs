@@ -577,6 +577,115 @@ impl Assembler {
 }
 
 impl Assembler {
+    /// Emits the EVEX prefix for a 512-bit packed-double register operation.
+    ///
+    /// This is deliberately encoded by hand instead of using Rust target
+    /// features: stable Rust 1.87 still rejects `avx512f`/`avx512dq` as
+    /// unstable target features. The bytes are therefore safe to carry in an
+    /// inspection artifact and can be selected at runtime only after CPUID
+    /// proves the host supports AVX-512F. The third operand is currently
+    /// limited to ZMM0..ZMM15 because EVEX's ModRM.rm form has no fifth
+    /// register bit; ZMM16..ZMM31 remain available in the destination and
+    /// vvvv operands.
+    fn evex_pd_prefix(
+        &mut self,
+        map: u8,
+        dst: PhysReg,
+        src1: PhysReg,
+        src2: PhysReg,
+        mask: u8,
+        zeroing: bool,
+    ) {
+        assert!(dst.encoding() < 32, "EVEX destination must be ZMM0..ZMM31");
+        assert!(src1.encoding() < 32, "EVEX vvvv source must be ZMM0..ZMM31");
+        assert!(
+            src2.encoding() < 16,
+            "EVEX ModRM source must be ZMM0..ZMM15"
+        );
+        assert!(mask < 8, "EVEX opmask must be K0..K7");
+
+        // EVEX P0 is the inverted extension-bit byte. The low nibble is the
+        // 0F opcode map; R2 extends ModRM.reg to ZMM16..31, while the normal
+        // R/B bits extend the low register fields to ZMM8..15.
+        let flags = u32::from(src2.encoding() >= 8)
+            | (u32::from(dst.encoding() >= 8) << 2)
+            | (u32::from(dst.encoding() >= 16) << 9);
+        assert!(
+            (1..=3).contains(&map),
+            "EVEX opcode map must be 0F, 0F38, or 0F3A"
+        );
+        let p0 = (u32::from(map) | ((flags & 7) << 5) | ((flags >> 5) & 0x10)) ^ 0xf0;
+        self.code.push(0x62);
+        self.code.push(p0 as u8);
+
+        // EVEX.512.66.0F.W1: W=1, pp=66, and vvvv is stored inverted.
+        let p1 = 0x85 | ((!src1.encoding() & 0x0f) << 3);
+        self.code.push(p1);
+
+        // LL'=10 selects 512 bits. V' is the fifth vvvv bit, z requests
+        // zeroing masking, and aaa names the opmask register. Bit 3 is
+        // inverted in EVEX, like the other vvvv bits.
+        let mut p2 = 0x40 | mask;
+        if src1.encoding() >= 16 {
+            p2 |= 0x08;
+        }
+        if zeroing {
+            p2 |= 0x80;
+        }
+        self.code.push(p2 ^ 0x08);
+    }
+
+    fn evex_pd_rrr(
+        &mut self,
+        opcode: u8,
+        dst: PhysReg,
+        src1: PhysReg,
+        src2: PhysReg,
+        mask: u8,
+        zeroing: bool,
+    ) {
+        let map = if opcode == 0xb8 { 2 } else { 1 };
+        self.evex_pd_prefix(map, dst, src1, src2, mask, zeroing);
+        self.code.push(opcode);
+        self.modrm_reg(dst.encoding(), src2.encoding());
+    }
+
+    /// `vaddpd zmm_dst {k_mask}{z}, zmm_src1, zmm_src2`.
+    pub fn vaddpd_zmm(
+        &mut self,
+        dst: PhysReg,
+        src1: PhysReg,
+        src2: PhysReg,
+        mask: u8,
+        zeroing: bool,
+    ) {
+        self.evex_pd_rrr(0x58, dst, src1, src2, mask, zeroing);
+    }
+
+    /// `vmulpd zmm_dst {k_mask}{z}, zmm_src1, zmm_src2`.
+    pub fn vmulpd_zmm(
+        &mut self,
+        dst: PhysReg,
+        src1: PhysReg,
+        src2: PhysReg,
+        mask: u8,
+        zeroing: bool,
+    ) {
+        self.evex_pd_rrr(0x59, dst, src1, src2, mask, zeroing);
+    }
+
+    /// `vfmadd231pd zmm_dst {k_mask}{z}, zmm_src1, zmm_src2`.
+    pub fn vfmadd231pd_zmm(
+        &mut self,
+        dst: PhysReg,
+        src1: PhysReg,
+        src2: PhysReg,
+        mask: u8,
+        zeroing: bool,
+    ) {
+        self.evex_pd_rrr(0xb8, dst, src1, src2, mask, zeroing);
+    }
+
     /// `movsd dst, src` -- F2 0F 10 /r, load direction (reg=dst, rm=src).
     /// REX.W is always false -- unused/undefined for this opcode. The
     /// mandatory `0xF2` legacy prefix is emitted BEFORE the REX prefix --
@@ -1143,5 +1252,41 @@ mod tests {
         asm.emit_u64(0x0102030405060708u64);
         let tail = &asm.code()[before_len..];
         assert_eq!(tail, &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn evex_packed_double_register_forms_round_trip_through_iced() {
+        use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
+
+        let mut asm = Assembler::new();
+        asm.vaddpd_zmm(PhysReg::Xmm31, PhysReg::Xmm30, PhysReg::Xmm15, 0, false);
+        asm.vmulpd_zmm(PhysReg::Xmm8, PhysReg::Xmm16, PhysReg::Xmm7, 3, true);
+        asm.vfmadd231pd_zmm(PhysReg::Xmm2, PhysReg::Xmm1, PhysReg::Xmm3, 1, false);
+
+        let mut decoder = Decoder::with_ip(64, asm.code(), 0, DecoderOptions::NONE);
+        let mut formatter = NasmFormatter::new();
+        let mut instruction = iced_x86::Instruction::default();
+        let mut text = Vec::new();
+        while decoder.can_decode() {
+            decoder.decode_out(&mut instruction);
+            let mut line = String::new();
+            formatter.format(&instruction, &mut line);
+            text.push(line);
+        }
+        assert_eq!(
+            text,
+            vec![
+                "vaddpd zmm31,zmm30,zmm15",
+                "vmulpd zmm8{k3}{z},zmm16,zmm7",
+                "vfmadd231pd zmm2{k1},zmm1,zmm3",
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "EVEX ModRM source must be ZMM0..ZMM15")]
+    fn evex_rejects_unrepresentable_high_modrm_source() {
+        let mut asm = Assembler::new();
+        asm.vaddpd_zmm(PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm16, 0, false);
     }
 }
