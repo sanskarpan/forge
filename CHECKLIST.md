@@ -19,6 +19,7 @@ implemented lower-level work is absent.
 | Variable shifts | Implemented with allocator constraints for RCX/CL, an emission fallback move, and preservation of unrelated live RCX values | `forge-regalloc::excluded_registers`, emitter/layout tests |
 | Float remainder | Explicitly unsupported and rejected during x86 instruction selection; no approximation is emitted | `forge-x64/src/machine_inst/mod.rs` |
 | Runtime | Implemented source lowering, optimization, selection, allocation, verification, native x86-64 JIT, native AArch64 execution for the supported all-f64 subset, interpreter fallback for unsupported targets/operations, and thread-safe interpreter → baseline → optimized tier promotion; native execution is now differentially checked against the interpreter with generated expressions and IEEE special values | `crates/forge-runtime` |
+| Verification stress coverage | Implemented deterministic 500-live-value native spill-frame coverage, including allocation verification, spill reload/store emission, and bit-exact x86-64 execution; randomized valid-IR optimizer/verifier property coverage now exercises 512 generated programs with NaN-aware interpreter equivalence | `crates/forge-emit/tests/execution_corpus.rs`, `crates/forge-opt/tests/differential.rs` |
 | CLI | Implemented documented `eval`, `compile`, `asm`, `ir`, `cfg`, `regalloc`, `bench`, `verify`, `cpuinfo`, and `repl` command surface; the REPL has session bindings/history/inspection commands, terminal-aware color with `NO_COLOR`, AArch64 emission, and tested exit-code classification; `asm --annotate` reports live allocated locations, while `bench` supports warmups, reusable compiled-call timing, and stable JSON reports | `crates/forge-cli` |
 | SIMD | Runtime `CpuFeatures` snapshot, deterministic f64 width selection, packed straight-line f64 array execution on SSE2/AVX2/NEON, exact AVX2+FMA `fma` evaluation when FMA is detected, chunk/tail handling, source-ordered `reduce_sum` over packed chunks, and scalar fallback are implemented; vector IR and AVX-512 masked tails remain open | `crates/forge-simd` |
 | AArch64 | Native target capability API plus tested scalar integer/float/conversion/memory/branch/immediate encoder forms; AAPCS64 scalar f64 expression emission includes arithmetic, NaN-compatible min/max, comparisons, CFG branches, typed phi edge copies, aligned literal pools, CLI output, native ARM execution, and Linux ARM64 QEMU coverage; mixed scalar i64/f64/bool parameter banks, integer operations, scalar comparisons, and i64↔f64 conversions are now emitted for f64-result functions, with integer negation using the architectural XZR register; full ABI frames, libm calls, and broader register allocation remain open | `crates/forge-aarch64` |
@@ -62,6 +63,12 @@ The remaining open rows are intentional scope boundaries, not silent stubs.
   register intervals for x86-64, and fixed-width AArch64 instruction words;
   unsupported process-local libm calls return an explicit error instead of an
   unserializable function pointer. PR #172 promotes this boundary to `main`.
+- PR #181 adds a 500-live-value spill-frame execution regression covering
+  heavy allocation pressure, reload/store traffic, and bit-exact native output;
+  PR #183 promotes it to `main`.
+- PR #185 adds randomized valid-IR optimizer/verifier property coverage with
+  512 generated programs and NaN-aware interpreter equivalence; PR #187
+  promotes it to `main`.
 - The historical phase checkboxes below remain design-history markers. Open
   scope is tracked explicitly in the table above and in each phase’s notes;
   this section must not be read as claiming completion of vector IR/AVX-512,
