@@ -18,7 +18,7 @@ implemented lower-level work is absent.
 | Fixed-register allocation conflict | Implemented: non-fixed active victims spill; overlapping fixed intervals fail explicitly | `forge-regalloc` linear-scan tests |
 | Variable shifts | Implemented with allocator constraints for RCX/CL, an emission fallback move, and preservation of unrelated live RCX values | `forge-regalloc::excluded_registers`, emitter/layout tests |
 | Float remainder | Explicitly unsupported and rejected during x86 instruction selection; no approximation is emitted | `forge-x64/src/machine_inst/mod.rs` |
-| Runtime | Implemented source lowering, optimization, selection, allocation, verification, native x86-64 JIT, native AArch64 execution for the supported all-f64 subset, interpreter fallback for unsupported targets/operations, and thread-safe interpreter → baseline → optimized tier promotion | `crates/forge-runtime` |
+| Runtime | Implemented source lowering, optimization, selection, allocation, verification, native x86-64 JIT, native AArch64 execution for the supported all-f64 subset, interpreter fallback for unsupported targets/operations, and thread-safe interpreter → baseline → optimized tier promotion; native execution is now differentially checked against the interpreter with generated expressions and IEEE special values | `crates/forge-runtime` |
 | CLI | Implemented documented `eval`, `compile`, `asm`, `ir`, `cfg`, `regalloc`, `bench`, `verify`, `cpuinfo`, and `repl` command surface; the REPL has session bindings/history/inspection commands, terminal-aware color with `NO_COLOR`, AArch64 emission, and tested exit-code classification; `asm --annotate` reports live allocated locations, while `bench` supports warmups, reusable compiled-call timing, and stable JSON reports | `crates/forge-cli` |
 | SIMD | Runtime `CpuFeatures` snapshot, deterministic f64 width selection, packed straight-line f64 array execution on SSE2/AVX2/NEON, exact AVX2+FMA `fma` evaluation when FMA is detected, chunk/tail handling, source-ordered `reduce_sum` over packed chunks, and scalar fallback are implemented; vector IR and AVX-512 masked tails remain open | `crates/forge-simd` |
 | AArch64 | Native target capability API plus tested scalar integer/float/conversion/memory/branch/immediate encoder forms; AAPCS64 scalar f64 expression emission includes arithmetic, comparisons, CFG branches, typed phi edge copies, aligned literal pools, CLI output, native ARM execution, and Linux ARM64 QEMU coverage; mixed scalar i64/f64/bool parameter banks, integer operations, scalar comparisons, and i64↔f64 conversions are now emitted for f64-result functions; full ABI frames, libm calls, and broader register allocation remain open | `crates/forge-aarch64` |
@@ -39,6 +39,9 @@ The remaining open rows are intentional scope boundaries, not silent stubs.
 - PR #130 adds an end-to-end depth-100 runtime regression. These changes are
   validated through the repository’s full Linux x86-64, emulated ARM64, WASM,
   Workbench, build/lint, and native Windows lanes as their PRs merge.
+- PR #144 adds native-runtime differential property coverage, and fixes a real
+  spilled `FloatAbs` scratch-register clobber found by the new Windows lane;
+  the feature PR and its promotion PR both pass the complete matrix.
 - PR #136 adds an exact AVX2+FMA packed path for `fma`, with scalar fallback
   when FMA is unavailable; PR #138 adds mixed scalar AArch64 emission for
   separate AAPCS64 integer and floating parameter banks. Both are covered by
