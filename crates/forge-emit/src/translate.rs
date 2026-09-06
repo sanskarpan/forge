@@ -318,13 +318,21 @@ fn sse_minmax(
     asm.jcc(ConditionCode::Parity, lhs_nan);
     asm.ucomisd_reg_reg(rhs_r, rhs_r);
     asm.jcc(ConditionCode::Parity, done);
-    // Rust's f64::min/max preserve the left operand for equal ordered
-    // values, including +0.0/-0.0. minsd/maxsd are allowed to select the
-    // source operand on that tie, so skip the instruction when the operands
-    // compare equal and retain the initial lhs copy in dst_r.
+    // Rust's f64::min/max normalize equal signed-zero ties: min returns
+    // -0.0 and max returns +0.0 regardless of operand order. For all other
+    // equal, non-NaN values the bitwise operation is a no-op, so use OR for
+    // min and AND for max instead of relying on minsd/maxsd's tie choice.
     asm.ucomisd_reg_reg(lhs_r, rhs_r);
-    asm.jcc(ConditionCode::Equal, done);
+    let equal = asm.new_label();
+    asm.jcc(ConditionCode::Equal, equal);
     asm.sse_reg_reg(op, dst_r, rhs_r);
+    asm.jmp(done);
+    asm.bind(equal);
+    match op {
+        SseOp::Min => asm.orpd_reg_reg(dst_r, rhs_r),
+        SseOp::Max => asm.andpd_reg_reg(dst_r, rhs_r),
+        _ => unreachable!("sse_minmax only accepts min/max operations"),
+    }
     asm.jmp(done);
     asm.bind(lhs_nan);
     asm.movsd_reg_reg(dst_r, rhs_r);
