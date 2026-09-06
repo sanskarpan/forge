@@ -1027,9 +1027,16 @@ impl Assembler {
             "VEX scalar ModRM source must be XMM0..XMM15"
         );
         self.code.push(0xC4);
-        // VEX.R/X/B are inverted and all three registers are in the low
-        // range here; m-mmmm=00010 selects the 0F 38 opcode map.
-        self.code.push(0xE2);
+        // VEX.R/X/B are inverted; m-mmmm=00010 selects the 0F 38 opcode
+        // map. The three-byte VEX form can encode XMM0..15 through R/B.
+        let mut vex_p2 = 0xE2;
+        if dst.encoding() >= 8 {
+            vex_p2 &= !0x80;
+        }
+        if src2.encoding() >= 8 {
+            vex_p2 &= !0x20;
+        }
+        self.code.push(vex_p2);
         // W=1 selects scalar double precision, inverted vvvv selects src1,
         // L=0, and pp=01 selects 66.
         self.code.push(0x80 | ((!src1.encoding() & 0x0F) << 3) | 0x01);
@@ -1327,6 +1334,24 @@ mod tests {
         formatter.format(&instruction, &mut text);
 
         assert_eq!(text, "vfmadd231sd xmm4,xmm2,xmm3");
+        assert!(!decoder.can_decode());
+    }
+
+    #[test]
+    fn scalar_fma_high_register_form_round_trips_through_iced() {
+        use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
+
+        let mut asm = Assembler::new();
+        asm.vfmadd231sd(PhysReg::Xmm12, PhysReg::Xmm2, PhysReg::Xmm11);
+
+        let mut decoder = Decoder::with_ip(64, asm.code(), 0, DecoderOptions::NONE);
+        let mut formatter = NasmFormatter::new();
+        let mut instruction = iced_x86::Instruction::default();
+        decoder.decode_out(&mut instruction);
+        let mut text = String::new();
+        formatter.format(&instruction, &mut text);
+
+        assert_eq!(text, "vfmadd231sd xmm12,xmm2,xmm11");
         assert!(!decoder.can_decode());
     }
 
