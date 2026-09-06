@@ -303,6 +303,12 @@ fn sse_minmax(
     asm.jcc(ConditionCode::Parity, lhs_nan);
     asm.ucomisd_reg_reg(rhs_r, rhs_r);
     asm.jcc(ConditionCode::Parity, done);
+    // Rust's f64::min/max preserve the left operand for equal ordered
+    // values, including +0.0/-0.0. minsd/maxsd are allowed to select the
+    // source operand on that tie, so skip the instruction when the operands
+    // compare equal and retain the initial lhs copy in dst_r.
+    asm.ucomisd_reg_reg(lhs_r, rhs_r);
+    asm.jcc(ConditionCode::Equal, done);
     asm.sse_reg_reg(op, dst_r, rhs_r);
     asm.jmp(done);
     asm.bind(lhs_nan);

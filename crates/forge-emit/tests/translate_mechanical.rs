@@ -393,14 +393,16 @@ fn float_binops_use_the_matching_sse_op() {
         let mut asm = Assembler::new();
         forge_emit::translate_inst(&mut asm, &inst, &loc, &[]);
         let actual = disassemble(asm.code());
-        assert_eq!(actual.len(), 7);
+        assert_eq!(actual.len(), 9);
         assert_eq!(actual[0], "ucomisd xmm0,xmm0");
         assert!(actual[1].starts_with("jp near "));
         assert_eq!(actual[2], "ucomisd xmm2,xmm2");
         assert!(actual[3].starts_with("jp near "));
-        assert_eq!(actual[4], op);
-        assert!(actual[5].starts_with("jmp "));
-        assert_eq!(actual[6], "movsd xmm0,xmm2");
+        assert_eq!(actual[4], "ucomisd xmm0,xmm2");
+        assert!(actual[5].starts_with("je near "));
+        assert_eq!(actual[6], op);
+        assert!(actual[7].starts_with("jmp "));
+        assert_eq!(actual[8], "movsd xmm0,xmm2");
     }
 }
 

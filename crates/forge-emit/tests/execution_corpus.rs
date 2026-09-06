@@ -33,6 +33,93 @@ fn run_f64_arg(code: &[u8], arg: f64) -> f64 {
     unsafe { function(arg) }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn run_f64_two(code: &[u8], args: [f64; 2]) -> f64 {
+    let mut buf = forge_mem::ExecutableBuffer::new(code.len().max(64)).unwrap();
+    buf.write(|mem| mem[..code.len()].copy_from_slice(code));
+    buf.make_executable().unwrap();
+    let compiled = forge_mem::CompiledExpr::from_buffer(buf, 2);
+    compiled.call_args(&args)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn scalar_minmax_preserves_left_operand_on_equal_signed_zero() {
+    fn emit_minmax(op: fn(Value, Value) -> Inst) -> Vec<u8> {
+        let mut b = Builder::new();
+        let entry = b.create_block();
+        b.seal_block(entry);
+        b.f.params = vec![("x".to_string(), Ty::F64), ("y".to_string(), Ty::F64)];
+        let x = b.emit(
+            entry,
+            Inst::Param {
+                index: 0,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let y = b.emit(
+            entry,
+            Inst::Param {
+                index: 1,
+                ty: Ty::F64,
+            },
+            Ty::F64,
+            dummy_span(),
+        );
+        let result = b.emit(entry, op(x, y), Ty::F64, dummy_span());
+        b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(result));
+
+        let selected = forge_x64::select(&b.f);
+        let assignment: HashMap<Value, Location> = [
+            (x, Location::Reg(PhysReg::Xmm0)),
+            (y, Location::Reg(PhysReg::Xmm1)),
+            (result, Location::Reg(PhysReg::Xmm0)),
+        ]
+        .into_iter()
+        .collect();
+        forge_emit::emit_body(&b.f, &selected, &assignment)
+    }
+
+    let negative_zero = (-0.0f64).to_bits();
+    let positive_zero = 0.0f64.to_bits();
+
+    for (name, op, args, expected) in [
+        (
+            "min",
+            Inst::Min as fn(Value, Value) -> Inst,
+            [-0.0, 0.0],
+            negative_zero,
+        ),
+        (
+            "min",
+            Inst::Min as fn(Value, Value) -> Inst,
+            [0.0, -0.0],
+            positive_zero,
+        ),
+        (
+            "max",
+            Inst::Max as fn(Value, Value) -> Inst,
+            [-0.0, 0.0],
+            negative_zero,
+        ),
+        (
+            "max",
+            Inst::Max as fn(Value, Value) -> Inst,
+            [0.0, -0.0],
+            positive_zero,
+        ),
+    ] {
+        let actual = run_f64_two(&emit_minmax(op), args);
+        assert_eq!(
+            actual.to_bits(),
+            expected,
+            "operation={name}, args={args:?}"
+        );
+    }
+}
+
 #[test]
 fn float_neg_flips_sign_bit() {
     let mut b = Builder::new();
