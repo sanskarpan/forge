@@ -205,3 +205,53 @@ fn three_spilled_operands_use_the_reserved_scratch_set() {
         "expected third scratch register in {lines:?}"
     );
 }
+
+#[test]
+fn spilled_float_mask_uses_a_distinct_mask_scratch_register() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    b.f.params.push(("x".to_string(), Ty::F64));
+    let input = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let absolute = b.emit(entry, Inst::Abs(input), Ty::F64, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(absolute));
+
+    let selected = forge_x64::select(&b.f);
+    let assignment: HashMap<Value, Location> = [
+        (input, Location::Reg(PhysReg::Xmm0)),
+        (absolute, Location::Spill(0)),
+    ]
+    .into_iter()
+    .collect();
+
+    let code = forge_emit::emit_body(&b.f, &selected, &assignment);
+    let lines = disassemble(&code);
+    let value_scratch = if cfg!(windows) { "xmm3" } else { "xmm13" };
+    let mask_scratch = if cfg!(windows) { "xmm4" } else { "xmm14" };
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == &format!("movsd {value_scratch},xmm0")),
+        "expected spilled value reload in {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with(&format!("movsd {mask_scratch},"))),
+        "expected mask load in a distinct scratch register: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == &format!("andpd {value_scratch},{mask_scratch}")),
+        "expected abs to combine the value and mask scratch registers: {lines:?}"
+    );
+}
