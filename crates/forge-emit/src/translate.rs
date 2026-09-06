@@ -25,6 +25,20 @@ fn sse_binop(
     rhs: Value,
 ) {
     let (dst_r, lhs_r, rhs_r) = (loc(dst), loc(lhs), loc(rhs));
+    // The allocator normally honors the dst->lhs coalescing hint, but a
+    // constrained ABI can still produce dst == rhs. Preserve rhs before the
+    // two-address copy of lhs overwrites that register.
+    let rhs_r = if dst_r == rhs_r {
+        let scratch = forge_regalloc::SCRATCH_XMM
+            .iter()
+            .copied()
+            .find(|candidate| *candidate != dst_r && *candidate != lhs_r)
+            .expect("float minmax alias requires a scratch XMM register");
+        asm.movsd_reg_reg(scratch, rhs_r);
+        scratch
+    } else {
+        rhs_r
+    };
     if dst_r != lhs_r {
         asm.movsd_reg_reg(dst_r, lhs_r);
     }
@@ -353,9 +367,6 @@ fn sse_minmax_select(
     op: forge_x64::MinMaxOp,
 ) {
     let (dst_r, lhs_r, rhs_r) = (loc(dst), loc(lhs), loc(rhs));
-    if dst_r != lhs_r {
-        asm.movsd_reg_reg(dst_r, lhs_r);
-    }
     let unordered = asm.new_label();
     let finish = asm.new_label();
     asm.ucomisd_reg_reg(lhs_r, rhs_r);
