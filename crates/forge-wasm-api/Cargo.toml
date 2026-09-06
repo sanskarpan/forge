@@ -7,10 +7,14 @@ edition.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+forge-aarch64 = { path = "../forge-aarch64" }
+forge-emit = { path = "../forge-emit" }
 forge-wasm = { path = "../forge-wasm" }
 forge-ir = { path = "../forge-ir" }
 forge-opt = { path = "../forge-opt" }
+forge-regalloc = { path = "../forge-regalloc" }
 forge-syntax = { path = "../forge-syntax" }
+forge-x64 = { path = "../forge-x64" }
 wasm-bindgen = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
