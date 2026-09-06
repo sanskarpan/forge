@@ -637,9 +637,8 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         return emit_f64_with_stack_spills(function);
     }
 
-    let mixed_stack_spill_f64 = function.blocks.len() == 1
-        && matches!(function.blocks[0].term, Some(Terminator::Return(_)))
-        && function.blocks[0].insts.iter().all(|value| {
+    let mixed_stack_spill_f64 = function.blocks.iter().all(|block| {
+        let instructions_supported = block.insts.iter().all(|value| {
             matches!(
                 function.insts.get(value.0 as usize),
                 Some(
@@ -660,11 +659,26 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                         | Inst::Shl(_, _)
                         | Inst::Shr(_, _)
                         | Inst::Sar(_, _)
+                        | Inst::Cmp { .. }
                         | Inst::IToF(_)
                         | Inst::FToI(_)
+                        | Inst::Phi { .. }
                 )
             )
         });
+        let terminator_supported = match block.term.as_ref() {
+            Some(Terminator::Return(result)) => {
+                function.types.get(result.0 as usize) == Some(&Ty::F64)
+            }
+            Some(Terminator::Jump(_)) => true,
+            Some(Terminator::Branch { cond, .. }) => {
+                matches!(function.insts.get(cond.0 as usize), Some(Inst::Cmp { .. }))
+                    && function.types.get(cond.0 as usize) == Some(&Ty::Bool)
+            }
+            None => false,
+        };
+        instructions_supported && terminator_supported
+    });
     if mixed_stack_spill_f64 && non_param_count > 24 {
         return emit_mixed_f64_with_stack_spills(function);
     }
@@ -1270,62 +1284,69 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
     Ok(asm.bytes())
 }
 
-/// Emits a high-pressure straight-line mixed scalar function with all
-/// non-parameter values in typed stack slots. X28..X30 are preserved because
-/// they are used as integer scratch registers; D29..D31 remain caller-saved
-/// AAPCS64 scratch registers. Control flow, comparisons, calls/libm, and
-/// general live-range allocation remain separate work.
+/// Emits a high-pressure mixed scalar function with all non-parameter values
+/// in typed stack slots. X28..X30 are preserved because they are used as
+/// integer scratch registers; D29..D31 remain caller-saved AAPCS64 scratch
+/// registers. Structured CFGs are supported by storing typed phi values on
+/// incoming edges and re-evaluating direct comparisons before branches.
+/// Calls/libm and general live-range allocation remain separate work.
 fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
-    let Some(block) = function.blocks.first() else {
-        return Err("AArch64 emitter requires at least one block".to_string());
-    };
-    let Some(Terminator::Return(result)) = block.term.as_ref() else {
-        return Err("AArch64 mixed spill emitter requires a return terminator".to_string());
-    };
-    if function.types.get(result.0 as usize) != Some(&Ty::F64) {
-        return Err("AArch64 mixed spill emitter requires an f64 result".to_string());
-    }
-
     let mut locations = HashMap::<Value, MixedLocation>::new();
     let mut next_slot = 24u16;
-    for &value in &block.insts {
-        let Some(inst) = function.insts.get(value.0 as usize) else {
-            return Err(format!("block references missing instruction {value:?}"));
-        };
-        let location = match inst {
-            Inst::Param { index, ty } => {
-                let index = *index as usize;
-                if index >= function.params.len() {
-                    return Err(format!("parameter index {index} is out of range"));
+    for block in &function.blocks {
+        for &value in &block.insts {
+            let Some(inst) = function.insts.get(value.0 as usize) else {
+                return Err(format!("block references missing instruction {value:?}"));
+            };
+            let location = match inst {
+                Inst::Param { index, ty } => {
+                    let index = *index as usize;
+                    let Some((_, declared_ty)) = function.params.get(index) else {
+                        return Err(format!("parameter index {index} is out of range"));
+                    };
+                    if declared_ty != ty || function.types.get(value.0 as usize) != Some(ty) {
+                        return Err(format!("parameter {index} has inconsistent IR type"));
+                    }
+                    let ordinal = function.params[..index]
+                        .iter()
+                        .filter(|(_, candidate)| candidate == ty)
+                        .count();
+                    if ordinal >= 8 {
+                        return Err(format!(
+                            "AArch64 mixed spill emitter supports at most 8 {ty:?} parameters"
+                        ));
+                    }
+                    MixedLocation::Register(match ty {
+                        Ty::F64 => Gpr::new_d(ordinal as u8),
+                        Ty::I64 | Ty::Bool => Gpr::new(ordinal as u8),
+                    })
                 }
-                let ordinal = function.params[..index]
-                    .iter()
-                    .filter(|(_, candidate)| candidate == ty)
-                    .count();
-                if ordinal >= 8 {
-                    return Err(format!(
-                        "AArch64 mixed spill emitter supports at most 8 {ty:?} parameters"
-                    ));
+                Inst::Cmp { .. } => {
+                    if function.types.get(value.0 as usize) != Some(&Ty::Bool) {
+                        return Err(format!("comparison {value:?} does not produce bool"));
+                    }
+                    // A comparison is represented by condition flags at a
+                    // branch and therefore has no materialized stack value.
+                    continue;
                 }
-                MixedLocation::Register(Gpr::new(ordinal as u8))
-            }
-            Inst::Cmp { .. } | Inst::Phi { .. } | Inst::Call { .. } => {
-                return Err(
-                    "AArch64 mixed spill emitter does not support control or calls".to_string(),
-                )
-            }
-            _ => {
-                if function.types.get(value.0 as usize).is_none() {
-                    return Err(format!("value {value:?} has no AArch64 IR type"));
+                Inst::Call { .. } => {
+                    return Err(
+                        "AArch64 mixed spill emitter does not support calls or libm".to_string()
+                    )
                 }
-                let slot = next_slot;
-                next_slot = next_slot
-                    .checked_add(8)
-                    .ok_or_else(|| "AArch64 mixed spill frame is too large".to_string())?;
-                MixedLocation::Stack(slot)
-            }
-        };
-        locations.insert(value, location);
+                _ => {
+                    if function.types.get(value.0 as usize).is_none() {
+                        return Err(format!("value {value:?} has no AArch64 IR type"));
+                    }
+                    let slot = next_slot;
+                    next_slot = next_slot
+                        .checked_add(8)
+                        .ok_or_else(|| "AArch64 mixed spill frame is too large".to_string())?;
+                    MixedLocation::Stack(slot)
+                }
+            };
+            locations.insert(value, location);
+        }
     }
 
     let frame_bytes = u16::try_from((usize::from(next_slot) + 15) & !15)
@@ -1405,162 +1426,221 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
     let mut pool = Vec::<u64>::new();
     let mut pool_indices = HashMap::<u64, usize>::new();
     let mut literal_loads = Vec::<(usize, usize, Gpr)>::new();
-    for &value in &block.insts {
-        let Some(inst) = function.insts.get(value.0 as usize) else {
-            return Err(format!("missing instruction for value {value:?}"));
-        };
-        match inst {
-            Inst::ConstF64(bits) => {
-                let pool_index = match pool_indices.get(bits) {
-                    Some(index) => *index,
-                    None => {
-                        let index = pool.len();
-                        pool.push(*bits);
-                        pool_indices.insert(*bits, index);
-                        index
-                    }
-                };
-                let instruction_index = asm.words.len();
-                asm.ldr_literal_d(float_a, 0);
-                literal_loads.push((instruction_index, pool_index, float_a));
-                store_f64(&mut asm, value, float_a)?;
-            }
-            Inst::ConstI64(number) => {
-                emit_i64_constant(&mut asm, int_a, *number as u64);
-                store_int(&mut asm, value, int_a)?;
-            }
-            Inst::ConstBool(boolean) => {
-                emit_i64_constant(&mut asm, int_a, u64::from(*boolean));
-                store_int(&mut asm, value, int_a)?;
-            }
-            Inst::Param { .. } => {}
-            Inst::Add(lhs, rhs)
-            | Inst::Sub(lhs, rhs)
-            | Inst::Mul(lhs, rhs)
-            | Inst::Div(lhs, rhs) => match function.types.get(value.0 as usize) {
-                Some(Ty::F64) => {
-                    load_f64(&mut asm, *lhs, float_a)?;
-                    load_f64(&mut asm, *rhs, float_b)?;
-                    match inst {
-                        Inst::Add(..) => asm.fadd_d(float_a, float_a, float_b),
-                        Inst::Sub(..) => asm.fsub_d(float_a, float_a, float_b),
-                        Inst::Mul(..) => asm.fmul_d(float_a, float_a, float_b),
-                        Inst::Div(..) => asm.fdiv_d(float_a, float_a, float_b),
-                        _ => unreachable!(),
-                    }
+    let mut block_offsets = vec![None; function.blocks.len()];
+    let mut branch_fixups = Vec::<(usize, usize, Option<Condition>)>::new();
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        block_offsets[block_index] = Some(asm.words.len() * 4);
+        for &value in &block.insts {
+            let Some(inst) = function.insts.get(value.0 as usize) else {
+                return Err(format!("missing instruction for value {value:?}"));
+            };
+            match inst {
+                Inst::ConstF64(bits) => {
+                    let pool_index = match pool_indices.get(bits) {
+                        Some(index) => *index,
+                        None => {
+                            let index = pool.len();
+                            pool.push(*bits);
+                            pool_indices.insert(*bits, index);
+                            index
+                        }
+                    };
+                    let instruction_index = asm.words.len();
+                    asm.ldr_literal_d(float_a, 0);
+                    literal_loads.push((instruction_index, pool_index, float_a));
                     store_f64(&mut asm, value, float_a)?;
                 }
-                Some(Ty::I64) => {
+                Inst::ConstI64(number) => {
+                    emit_i64_constant(&mut asm, int_a, *number as u64);
+                    store_int(&mut asm, value, int_a)?;
+                }
+                Inst::ConstBool(boolean) => {
+                    emit_i64_constant(&mut asm, int_a, u64::from(*boolean));
+                    store_int(&mut asm, value, int_a)?;
+                }
+                Inst::Param { .. } | Inst::Cmp { .. } | Inst::Phi { .. } => {}
+                Inst::Add(lhs, rhs)
+                | Inst::Sub(lhs, rhs)
+                | Inst::Mul(lhs, rhs)
+                | Inst::Div(lhs, rhs) => match function.types.get(value.0 as usize) {
+                    Some(Ty::F64) => {
+                        load_f64(&mut asm, *lhs, float_a)?;
+                        load_f64(&mut asm, *rhs, float_b)?;
+                        match inst {
+                            Inst::Add(..) => asm.fadd_d(float_a, float_a, float_b),
+                            Inst::Sub(..) => asm.fsub_d(float_a, float_a, float_b),
+                            Inst::Mul(..) => asm.fmul_d(float_a, float_a, float_b),
+                            Inst::Div(..) => asm.fdiv_d(float_a, float_a, float_b),
+                            _ => unreachable!(),
+                        }
+                        store_f64(&mut asm, value, float_a)?;
+                    }
+                    Some(Ty::I64) => {
+                        load_int(&mut asm, *lhs, int_a)?;
+                        load_int(&mut asm, *rhs, int_b)?;
+                        match inst {
+                            Inst::Add(..) => asm.add_reg(int_a, int_a, int_b),
+                            Inst::Sub(..) => asm.sub_reg(int_a, int_a, int_b),
+                            Inst::Mul(..) => asm.mul(int_a, int_a, int_b),
+                            Inst::Div(..) => asm.sdiv(int_a, int_a, int_b),
+                            _ => unreachable!(),
+                        }
+                        store_int(&mut asm, value, int_a)?;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "mixed spill arithmetic has invalid type for {value:?}"
+                        ))
+                    }
+                },
+                Inst::Rem(lhs, rhs) => {
+                    if function.types.get(value.0 as usize) != Some(&Ty::I64) {
+                        return Err("AArch64 mixed remainder requires an i64 result".to_string());
+                    }
+                    load_int(&mut asm, *lhs, int_a)?;
+                    load_int(&mut asm, *rhs, int_b)?;
+                    asm.sdiv(int_c, int_a, int_b);
+                    asm.msub(int_a, int_c, int_b, int_a);
+                    store_int(&mut asm, value, int_a)?;
+                }
+                Inst::Neg(operand) => match function.types.get(value.0 as usize) {
+                    Some(Ty::F64) => {
+                        load_f64(&mut asm, *operand, float_a)?;
+                        asm.fneg_d(float_a, float_a);
+                        store_f64(&mut asm, value, float_a)?;
+                    }
+                    Some(Ty::I64) => {
+                        load_int(&mut asm, *operand, int_a)?;
+                        asm.sub_reg(int_a, XZR, int_a);
+                        store_int(&mut asm, value, int_a)?;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "mixed spill negation has invalid type for {value:?}"
+                        ))
+                    }
+                },
+                Inst::And(lhs, rhs)
+                | Inst::Or(lhs, rhs)
+                | Inst::Xor(lhs, rhs)
+                | Inst::Shl(lhs, rhs)
+                | Inst::Shr(lhs, rhs)
+                | Inst::Sar(lhs, rhs) => {
+                    if !matches!(
+                        function.types.get(value.0 as usize),
+                        Some(Ty::I64 | Ty::Bool)
+                    ) {
+                        return Err(format!(
+                            "mixed spill logical op has invalid type for {value:?}"
+                        ));
+                    }
                     load_int(&mut asm, *lhs, int_a)?;
                     load_int(&mut asm, *rhs, int_b)?;
                     match inst {
-                        Inst::Add(..) => asm.add_reg(int_a, int_a, int_b),
-                        Inst::Sub(..) => asm.sub_reg(int_a, int_a, int_b),
-                        Inst::Mul(..) => asm.mul(int_a, int_a, int_b),
-                        Inst::Div(..) => asm.sdiv(int_a, int_a, int_b),
+                        Inst::And(..) => asm.and_reg(int_a, int_a, int_b),
+                        Inst::Or(..) => asm.orr_reg(int_a, int_a, int_b),
+                        Inst::Xor(..) => asm.eor_reg(int_a, int_a, int_b),
+                        Inst::Shl(..) => asm.lsl(int_a, int_a, int_b),
+                        Inst::Shr(..) => asm.lsr(int_a, int_a, int_b),
+                        Inst::Sar(..) => asm.asr(int_a, int_a, int_b),
                         _ => unreachable!(),
                     }
                     store_int(&mut asm, value, int_a)?;
                 }
-                _ => {
-                    return Err(format!(
-                        "mixed spill arithmetic has invalid type for {value:?}"
-                    ))
-                }
-            },
-            Inst::Rem(lhs, rhs) => {
-                if function.types.get(value.0 as usize) != Some(&Ty::I64) {
-                    return Err("AArch64 mixed remainder requires an i64 result".to_string());
-                }
-                load_int(&mut asm, *lhs, int_a)?;
-                load_int(&mut asm, *rhs, int_b)?;
-                asm.sdiv(int_c, int_a, int_b);
-                asm.msub(int_a, int_c, int_b, int_a);
-                store_int(&mut asm, value, int_a)?;
-            }
-            Inst::Neg(operand) => match function.types.get(value.0 as usize) {
-                Some(Ty::F64) => {
-                    load_f64(&mut asm, *operand, float_a)?;
-                    asm.fneg_d(float_a, float_a);
-                    store_f64(&mut asm, value, float_a)?;
-                }
-                Some(Ty::I64) => {
+                Inst::Not(operand) => {
+                    if !matches!(
+                        function.types.get(value.0 as usize),
+                        Some(Ty::I64 | Ty::Bool)
+                    ) {
+                        return Err(format!("mixed spill not has invalid type for {value:?}"));
+                    }
                     load_int(&mut asm, *operand, int_a)?;
-                    asm.sub_reg(int_a, XZR, int_a);
+                    emit_i64_constant(&mut asm, int_b, u64::MAX);
+                    asm.eor_reg(int_a, int_b, int_a);
                     store_int(&mut asm, value, int_a)?;
                 }
-                _ => {
+                Inst::IToF(operand) => {
+                    load_int(&mut asm, *operand, int_a)?;
+                    asm.scvtf(float_a, int_a);
+                    store_f64(&mut asm, value, float_a)?;
+                }
+                Inst::FToI(operand) => {
+                    load_f64(&mut asm, *operand, float_a)?;
+                    asm.fcvtzs(int_a, float_a);
+                    store_int(&mut asm, value, int_a)?;
+                }
+                inst => {
                     return Err(format!(
-                        "mixed spill negation has invalid type for {value:?}"
+                        "AArch64 mixed spill emitter does not support {inst:?}"
                     ))
                 }
-            },
-            Inst::And(lhs, rhs)
-            | Inst::Or(lhs, rhs)
-            | Inst::Xor(lhs, rhs)
-            | Inst::Shl(lhs, rhs)
-            | Inst::Shr(lhs, rhs)
-            | Inst::Sar(lhs, rhs) => {
-                if !matches!(
-                    function.types.get(value.0 as usize),
-                    Some(Ty::I64 | Ty::Bool)
-                ) {
-                    return Err(format!(
-                        "mixed spill logical op has invalid type for {value:?}"
-                    ));
-                }
-                load_int(&mut asm, *lhs, int_a)?;
-                load_int(&mut asm, *rhs, int_b)?;
-                match inst {
-                    Inst::And(..) => asm.and_reg(int_a, int_a, int_b),
-                    Inst::Or(..) => asm.orr_reg(int_a, int_a, int_b),
-                    Inst::Xor(..) => asm.eor_reg(int_a, int_a, int_b),
-                    Inst::Shl(..) => asm.lsl(int_a, int_a, int_b),
-                    Inst::Shr(..) => asm.lsr(int_a, int_a, int_b),
-                    Inst::Sar(..) => asm.asr(int_a, int_a, int_b),
-                    _ => unreachable!(),
-                }
-                store_int(&mut asm, value, int_a)?;
-            }
-            Inst::Not(operand) => {
-                if !matches!(
-                    function.types.get(value.0 as usize),
-                    Some(Ty::I64 | Ty::Bool)
-                ) {
-                    return Err(format!("mixed spill not has invalid type for {value:?}"));
-                }
-                load_int(&mut asm, *operand, int_a)?;
-                emit_i64_constant(&mut asm, int_b, u64::MAX);
-                asm.eor_reg(int_a, int_b, int_a);
-                store_int(&mut asm, value, int_a)?;
-            }
-            Inst::IToF(operand) => {
-                load_int(&mut asm, *operand, int_a)?;
-                asm.scvtf(float_a, int_a);
-                store_f64(&mut asm, value, float_a)?;
-            }
-            Inst::FToI(operand) => {
-                load_f64(&mut asm, *operand, float_a)?;
-                asm.fcvtzs(int_a, float_a);
-                store_int(&mut asm, value, int_a)?;
-            }
-            inst => {
-                return Err(format!(
-                    "AArch64 mixed spill emitter does not support {inst:?}"
-                ))
             }
         }
-    }
 
-    match location_of(*result)? {
-        MixedLocation::Register(_) => load_f64(&mut asm, *result, Gpr::new_d(0))?,
-        MixedLocation::Stack(offset) => asm.ldr_d(Gpr::new_d(0), SP, offset),
+        match block.term.as_ref() {
+            Some(Terminator::Return(result)) => {
+                if function.types.get(result.0 as usize) != Some(&Ty::F64) {
+                    return Err("AArch64 mixed spill emitter requires an f64 result".to_string());
+                }
+                load_f64(&mut asm, *result, Gpr::new_d(0))?;
+                for (register, offset) in [(int_c, 16), (int_b, 8), (int_a, 0)] {
+                    asm.ldr(register, SP, offset);
+                }
+                asm.add_imm(SP, SP, frame_bytes, false);
+                asm.ret();
+            }
+            Some(Terminator::Jump(target)) => {
+                let target = target.0 as usize;
+                validate_target(function, target)?;
+                emit_mixed_stack_phi_edge_copies(
+                    function,
+                    target,
+                    block_index,
+                    &locations,
+                    &mut asm,
+                    float_a,
+                    int_a,
+                )?;
+                let instruction_index = asm.words.len();
+                asm.b(0);
+                branch_fixups.push((instruction_index, target, None));
+            }
+            Some(Terminator::Branch { cond, then_, else_ }) => {
+                let condition = emit_mixed_stack_branch_condition(
+                    function, *cond, &locations, &mut asm, float_a, float_b, int_a, int_b,
+                )?;
+                let then_target = then_.0 as usize;
+                let else_target = else_.0 as usize;
+                validate_target(function, then_target)?;
+                validate_target(function, else_target)?;
+                emit_mixed_stack_phi_edge_copies(
+                    function,
+                    then_target,
+                    block_index,
+                    &locations,
+                    &mut asm,
+                    float_a,
+                    int_a,
+                )?;
+                let conditional_index = asm.words.len();
+                asm.b_cond(condition, 0);
+                branch_fixups.push((conditional_index, then_target, Some(condition)));
+                emit_mixed_stack_phi_edge_copies(
+                    function,
+                    else_target,
+                    block_index,
+                    &locations,
+                    &mut asm,
+                    float_a,
+                    int_a,
+                )?;
+                let else_index = asm.words.len();
+                asm.b(0);
+                branch_fixups.push((else_index, else_target, None));
+            }
+            None => return Err(format!("AArch64 block {block_index} has no terminator")),
+        }
     }
-    for (register, offset) in [(int_c, 16), (int_b, 8), (int_a, 0)] {
-        asm.ldr(register, SP, offset);
-    }
-    asm.add_imm(SP, SP, frame_bytes, false);
-    asm.ret();
 
     if !pool.is_empty() && !asm.words.len().is_multiple_of(2) {
         asm.words.push(0);
@@ -1578,7 +1658,168 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
         asm.words.push(bits as u32);
         asm.words.push((bits >> 32) as u32);
     }
+    for (instruction_index, target, condition) in branch_fixups {
+        let target_offset = block_offsets[target].expect("validated block offset") as i32;
+        let source_offset = (instruction_index * 4) as i32;
+        let offset = target_offset - source_offset;
+        asm.words[instruction_index] = match condition {
+            Some(condition) => encode_branch_cond(condition, offset),
+            None => encode_branch(offset),
+        };
+    }
     Ok(asm.bytes())
+}
+
+fn emit_mixed_stack_phi_edge_copies(
+    function: &Function,
+    target: usize,
+    predecessor: usize,
+    locations: &HashMap<Value, MixedLocation>,
+    asm: &mut Assembler,
+    float_scratch: Gpr,
+    int_scratch: Gpr,
+) -> Result<(), String> {
+    for &value in &function.blocks[target].insts {
+        let Inst::Phi { incoming } = &function.insts[value.0 as usize] else {
+            continue;
+        };
+        let Some(phi_ty) = function.types.get(value.0 as usize) else {
+            return Err(format!("phi {value:?} has no AArch64 IR type"));
+        };
+        let Some((_, source)) = incoming
+            .iter()
+            .find(|(block, _)| block.0 as usize == predecessor)
+        else {
+            return Err(format!(
+                "phi {value:?} has no incoming value for block {predecessor}"
+            ));
+        };
+        let Some(source_ty) = function.types.get(source.0 as usize) else {
+            return Err(format!("phi source {source:?} has no AArch64 IR type"));
+        };
+        if source_ty != phi_ty {
+            return Err(format!(
+                "phi {value:?} has mismatched source type {source_ty:?}"
+            ));
+        }
+        let destination = locations
+            .get(&value)
+            .copied()
+            .ok_or_else(|| format!("missing stack location for phi {value:?}"))?;
+        let source_location = locations
+            .get(source)
+            .copied()
+            .ok_or_else(|| format!("missing stack location for phi source {source:?}"))?;
+        match phi_ty {
+            Ty::F64 => {
+                match source_location {
+                    MixedLocation::Register(register) => {
+                        if register != float_scratch {
+                            asm.fmov_d(float_scratch, register);
+                        }
+                    }
+                    MixedLocation::Stack(offset) => asm.ldr_d(float_scratch, SP, offset),
+                }
+                match destination {
+                    MixedLocation::Stack(offset) => asm.str_d(float_scratch, SP, offset),
+                    MixedLocation::Register(_) => {
+                        return Err(format!("f64 phi {value:?} unexpectedly uses a register"))
+                    }
+                }
+            }
+            Ty::I64 | Ty::Bool => {
+                match source_location {
+                    MixedLocation::Register(register) => {
+                        if register != int_scratch {
+                            asm.orr_reg(int_scratch, XZR, register);
+                        }
+                    }
+                    MixedLocation::Stack(offset) => asm.ldr(int_scratch, SP, offset),
+                }
+                match destination {
+                    MixedLocation::Stack(offset) => asm.str(int_scratch, SP, offset),
+                    MixedLocation::Register(_) => {
+                        return Err(format!(
+                            "integer phi {value:?} unexpectedly uses a register"
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_mixed_stack_branch_condition(
+    function: &Function,
+    cond: Value,
+    locations: &HashMap<Value, MixedLocation>,
+    asm: &mut Assembler,
+    lhs_float_scratch: Gpr,
+    rhs_float_scratch: Gpr,
+    lhs_int_scratch: Gpr,
+    rhs_int_scratch: Gpr,
+) -> Result<Condition, String> {
+    let Some(Inst::Cmp { op, lhs, rhs }) = function.insts.get(cond.0 as usize) else {
+        return Err("AArch64 mixed spill branches require a direct scalar comparison".to_string());
+    };
+    if function.types.get(cond.0 as usize) != Some(&Ty::Bool) {
+        return Err("AArch64 mixed spill branch comparison must produce bool".to_string());
+    }
+    let Some(lhs_ty) = function.types.get(lhs.0 as usize) else {
+        return Err(format!("comparison operand {lhs:?} has no AArch64 IR type"));
+    };
+    let Some(rhs_ty) = function.types.get(rhs.0 as usize) else {
+        return Err(format!("comparison operand {rhs:?} has no AArch64 IR type"));
+    };
+    if lhs_ty != rhs_ty {
+        return Err("AArch64 mixed spill comparisons require matching operand types".to_string());
+    }
+    match lhs_ty {
+        Ty::F64 => {
+            for (value, scratch) in [(*lhs, lhs_float_scratch), (*rhs, rhs_float_scratch)] {
+                match locations
+                    .get(&value)
+                    .copied()
+                    .ok_or_else(|| format!("missing location for comparison operand {value:?}"))?
+                {
+                    MixedLocation::Register(register) => {
+                        if register != scratch {
+                            asm.fmov_d(scratch, register);
+                        }
+                    }
+                    MixedLocation::Stack(offset) => asm.ldr_d(scratch, SP, offset),
+                }
+            }
+            asm.fcmp_d(lhs_float_scratch, rhs_float_scratch);
+        }
+        Ty::I64 | Ty::Bool => {
+            for (value, scratch) in [(*lhs, lhs_int_scratch), (*rhs, rhs_int_scratch)] {
+                match locations
+                    .get(&value)
+                    .copied()
+                    .ok_or_else(|| format!("missing location for comparison operand {value:?}"))?
+                {
+                    MixedLocation::Register(register) => {
+                        if register != scratch {
+                            asm.orr_reg(scratch, XZR, register);
+                        }
+                    }
+                    MixedLocation::Stack(offset) => asm.ldr(scratch, SP, offset),
+                }
+            }
+            asm.cmp_reg(lhs_int_scratch, rhs_int_scratch);
+        }
+    }
+    Ok(match op {
+        CmpOp::Eq => Condition::Eq,
+        CmpOp::Ne => Condition::Ne,
+        CmpOp::Lt => Condition::Lt,
+        CmpOp::Le => Condition::Le,
+        CmpOp::Gt => Condition::Gt,
+        CmpOp::Ge => Condition::Ge,
+    })
 }
 
 /// Emits a complete AAPCS64 scalar i64 function for straight-line IR.
@@ -2248,6 +2489,53 @@ mod tests {
             .any(|word| *word == str_d(Gpr::new(29), SP, 40)));
     }
 
+    #[test]
+    fn emits_mixed_cfg_stack_spills_and_typed_phi_edge_stores() {
+        let then_expr = std::iter::repeat_n("x + (n & 1)", 14)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let else_expr = std::iter::repeat_n("x - (n & 1)", 14)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let source = format!("if (n & 1) > 0 then {then_expr} else {else_expr}");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.iter().any(|word| *word == ldr(Gpr::new(28), SP, 32)));
+        assert!(words.iter().any(|word| *word == str_(Gpr::new(28), SP, 32)));
+        assert!(words.iter().any(|word| *word & 0x7f00_0000 == 0x5400_0000));
+        assert!(
+            words
+                .iter()
+                .filter(|word| **word & 0xffc0_0000 == 0x9e40_0000)
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn emits_mixed_cfg_integer_phi_stack_spills() {
+        let source = std::iter::repeat_n("x + (if (n & 1) > 0 then 1 else 2)", 14)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let integer_load = ldr(Gpr::new(28), SP, 0) & 0xffc0_03ff;
+        let integer_store = str_(Gpr::new(28), SP, 0) & 0xffc0_03ff;
+        assert!(words
+            .iter()
+            .any(|word| *word & 0xffc0_03ff == integer_store));
+        assert!(words.iter().any(|word| *word & 0xffc0_03ff == integer_load));
+        assert!(words.iter().any(|word| *word & 0x7f00_0000 == 0x5400_0000));
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn executes_aarch64_f64_function_with_stack_spills() {
@@ -2296,6 +2584,48 @@ mod tests {
             unsafe { std::mem::transmute(buffer.as_ptr()) };
         assert_eq!(unsafe { function(2.0, 3) }, 42.0);
         assert_eq!(unsafe { function(2.0, 4) }, 28.0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_aarch64_mixed_cfg_function_with_stack_spills() {
+        let then_expr = std::iter::repeat_n("x + (n & 1)", 14)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let else_expr = std::iter::repeat_n("x - (n & 1)", 14)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let source = format!("if (n & 1) > 0 then {then_expr} else {else_expr}");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        // SAFETY: the emitted body follows the AAPCS64 fn(f64, i64) -> f64
+        // convention, and the executable buffer remains alive for both calls.
+        let function: unsafe extern "C" fn(f64, i64) -> f64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        assert_eq!(unsafe { function(2.0, 3) }, 42.0);
+        assert_eq!(unsafe { function(2.0, 4) }, 28.0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_aarch64_mixed_cfg_integer_phi_stack_spills() {
+        let source = std::iter::repeat_n("x + (if (n & 1) > 0 then 1 else 2)", 14)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        // SAFETY: the emitted body follows the AAPCS64 fn(f64, i64) -> f64
+        // convention, and the executable buffer remains alive for both calls.
+        let function: unsafe extern "C" fn(f64, i64) -> f64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        assert_eq!(unsafe { function(2.0, 3) }, 42.0);
+        assert_eq!(unsafe { function(2.0, 4) }, 56.0);
     }
 
     #[cfg(target_arch = "aarch64")]
