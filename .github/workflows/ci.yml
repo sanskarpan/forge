@@ -47,3 +47,28 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+
+  linux-valgrind:
+    name: Linux Valgrind executable-memory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y valgrind
+      - name: build forge-mem leak test
+        run: cargo test -p forge-mem --test no_leaks --no-run --locked
+      - name: run executable-memory test under Memcheck
+        shell: bash
+        run: |
+          test_binary="$(find target/debug/deps -maxdepth 1 -type f -name 'no_leaks-*' -perm -111 | head -n 1)"
+          test -n "$test_binary"
+          valgrind \
+            --tool=memcheck \
+            --leak-check=full \
+            --show-leak-kinds=definite,indirect \
+            --errors-for-leak-kinds=definite,indirect \
+            --error-exitcode=1 \
+            "$test_binary" --exact ten_thousand_allocate_free_cycles_do_not_leak

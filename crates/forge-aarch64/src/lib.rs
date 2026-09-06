@@ -705,6 +705,7 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                         | Inst::IToF(_)
                         | Inst::FToI(_)
                         | Inst::Phi { .. }
+                        | Inst::Call { .. }
                 )
             )
         });
@@ -721,7 +722,11 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         };
         instructions_supported && terminator_supported
     });
-    if mixed_stack_spill_f64 && non_param_count > 24 {
+    let contains_mixed_call = function
+        .insts
+        .iter()
+        .any(|inst| matches!(inst, Inst::Call { .. }));
+    if mixed_stack_spill_f64 && (non_param_count > 24 || contains_mixed_call) {
         return emit_mixed_f64_with_stack_spills(function);
     }
 
@@ -1393,8 +1398,14 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
 /// integer scratch registers; D29..D31 remain caller-saved AAPCS64 scratch
 /// registers. Structured CFGs are supported by storing typed phi values on
 /// incoming edges and re-evaluating direct comparisons before branches.
-/// Calls/libm and general live-range allocation remain separate work.
+/// Supported scalar f64 libm calls preserve both AAPCS64 parameter banks in
+/// the same frame. Broader external calls and general live-range allocation
+/// remain separate work.
 fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
+    let contains_call = function
+        .insts
+        .iter()
+        .any(|inst| matches!(inst, Inst::Call { .. }));
     let mut locations = HashMap::<Value, MixedLocation>::new();
     let mut next_slot = 24u16;
     for block in &function.blocks {
@@ -1420,10 +1431,18 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                             "AArch64 mixed spill emitter supports at most 8 {ty:?} parameters"
                         ));
                     }
-                    MixedLocation::Register(match ty {
-                        Ty::F64 => Gpr::new_d(ordinal as u8),
-                        Ty::I64 | Ty::Bool => Gpr::new(ordinal as u8),
-                    })
+                    if contains_call {
+                        let slot = next_slot;
+                        next_slot = next_slot
+                            .checked_add(8)
+                            .ok_or_else(|| "AArch64 mixed spill frame is too large".to_string())?;
+                        MixedLocation::Stack(slot)
+                    } else {
+                        MixedLocation::Register(match ty {
+                            Ty::F64 => Gpr::new_d(ordinal as u8),
+                            Ty::I64 | Ty::Bool => Gpr::new(ordinal as u8),
+                        })
+                    }
                 }
                 Inst::Cmp { .. } => {
                     if function.types.get(value.0 as usize) != Some(&Ty::Bool) {
@@ -1432,11 +1451,6 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                     // A comparison is represented by condition flags at a
                     // branch and therefore has no materialized stack value.
                     continue;
-                }
-                Inst::Call { .. } => {
-                    return Err(
-                        "AArch64 mixed spill emitter does not support calls or libm".to_string()
-                    )
                 }
                 _ => {
                     if function.types.get(value.0 as usize).is_none() {
@@ -1473,6 +1487,26 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
     asm.sub_imm(SP, SP, frame_bytes, false);
     for (register, offset) in [(int_a, 0), (int_b, 8), (int_c, 16)] {
         asm.str(register, SP, offset);
+    }
+    if contains_call {
+        for block in &function.blocks {
+            for &value in &block.insts {
+                let &Inst::Param { index, ty } = &function.insts[value.0 as usize] else {
+                    continue;
+                };
+                let ordinal = function.params[..index as usize]
+                    .iter()
+                    .filter(|(_, candidate)| *candidate == ty)
+                    .count();
+                let MixedLocation::Stack(offset) = location_of(value)? else {
+                    return Err(format!("parameter {value:?} was not assigned a stack slot"));
+                };
+                match ty {
+                    Ty::F64 => asm.str_d(Gpr::new_d(ordinal as u8), SP, offset),
+                    Ty::I64 | Ty::Bool => asm.str(Gpr::new(ordinal as u8), SP, offset),
+                }
+            }
+        }
     }
 
     let load_f64 = |asm: &mut Assembler, value: Value, scratch: Gpr| -> Result<(), String> {
@@ -1672,6 +1706,35 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                     load_f64(&mut asm, *operand, float_a)?;
                     asm.fcvtzs(int_a, float_a);
                     store_int(&mut asm, value, int_a)?;
+                }
+                Inst::Call { func, args } => {
+                    let expected = match func {
+                        forge_ir::LibFunc::Pow => 2,
+                        forge_ir::LibFunc::Sin
+                        | forge_ir::LibFunc::Cos
+                        | forge_ir::LibFunc::Tan
+                        | forge_ir::LibFunc::Exp
+                        | forge_ir::LibFunc::Log => 1,
+                    };
+                    if args.len() != expected
+                        || args
+                            .iter()
+                            .any(|arg| function.types.get(arg.0 as usize) != Some(&Ty::F64))
+                        || function.types.get(value.0 as usize) != Some(&Ty::F64)
+                    {
+                        return Err(
+                            "AArch64 libm calls require f64 arguments and result".to_string()
+                        );
+                    }
+                    load_f64(&mut asm, args[0], float_a)?;
+                    asm.fmov_d(Gpr::new_d(0), float_a);
+                    if expected == 2 {
+                        load_f64(&mut asm, args[1], float_b)?;
+                        asm.fmov_d(Gpr::new_d(1), float_b);
+                    }
+                    emit_i64_constant(&mut asm, Gpr::new(16), libm_address(*func) as u64);
+                    asm.blr(Gpr::new(16));
+                    store_f64(&mut asm, value, Gpr::new_d(0))?;
                 }
                 inst => {
                     return Err(format!(
@@ -2654,6 +2717,22 @@ mod tests {
         assert!(words.contains(&0xd65f_03c0));
     }
 
+    #[test]
+    fn emits_mixed_signature_libm_calls_with_both_parameter_banks_spilled() {
+        let function = forge_runtime::lower_source("sin(x) + (n & 1)").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.iter().any(|word| *word == blr(Gpr::new(16))));
+        assert!(words
+            .iter()
+            .any(|word| *word == str_d(Gpr::new_d(0), SP, 24)));
+        assert!(words.iter().any(|word| *word == str_(Gpr::new(0), SP, 32)));
+        assert!(words.iter().any(|word| *word == ldr(Gpr::new(28), SP, 32)));
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn executes_aarch64_f64_function_with_stack_spills() {
@@ -2760,6 +2839,28 @@ mod tests {
             unsafe { std::mem::transmute(buffer.as_ptr()) };
         let result = unsafe { function(0.5, 2.0) };
         assert_eq!(result.to_bits(), (0.5f64.sin() + 4.0).to_bits());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_aarch64_mixed_signature_libm_call_with_integer_value_live() {
+        let function_ir = forge_runtime::lower_source("sin(x) + (n & 1)").unwrap();
+        let bytes = emit_f64(&function_ir).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        // SAFETY: the emitted body follows the AAPCS64 fn(f64, i64) -> f64
+        // convention, and the executable buffer remains alive for both calls.
+        let function: unsafe extern "C" fn(f64, i64) -> f64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        assert_eq!(
+            unsafe { function(0.5, 3) }.to_bits(),
+            (0.5f64.sin() + 1.0).to_bits()
+        );
+        assert_eq!(
+            unsafe { function(0.5, 4) }.to_bits(),
+            (0.5f64.sin()).to_bits()
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
