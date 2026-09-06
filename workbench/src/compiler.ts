@@ -1,4 +1,4 @@
-import { AstNode, CompileArtifact, Diagnostic, Target, useWorkbench } from './store';
+import { AstNode, BenchmarkResult, CompileArtifact, Diagnostic, Target, useWorkbench } from './store';
 
 export interface ForgeWasmApi {
   parse_and_check?: (source: string) => string | Promise<string>;
@@ -50,7 +50,7 @@ function diagnosticsFrom(value: unknown): Diagnostic[] {
 }
 
 async function browserBenchmark(evaluate: (...args: number[]) => number, args: number[]) {
-  const results = sizes.map((size) => {
+  const results = Array.from(sizes, (size) => {
     const started = performance.now();
     let last = Number.NaN;
     for (let index = 0; index < size; index += 1) last = evaluate(...args);
@@ -69,7 +69,7 @@ export async function compileCurrent(source: string, target: Target): Promise<vo
   }
 
   try {
-    const checked = await jsonCall<{ ok: boolean; stage?: string; ast?: AstNode; parameters?: Array<{ name: string; type: string }>; result_type?: string; diagnostics?: Diagnostic[] }>(wasm.parse_and_check?.bind(wasm));
+    const checked = await jsonCall<{ ok: boolean; stage?: string; ast?: AstNode; parameters?: Array<{ name: string; type: string }>; result_type?: string; diagnostics?: Diagnostic[] }>(() => wasm.parse_and_check!(source));
     if (!checked.ok) {
       state.setCompilation({
         compiling: false,
@@ -96,20 +96,20 @@ export async function compileCurrent(source: string, target: Target): Promise<vo
       return;
     }
 
-    const artifact = await jsonCall<CompileArtifact>(wasm.compile_artifact_json?.bind(wasm));
+    const artifact = await jsonCall<CompileArtifact>(() => wasm.compile_artifact_json!(source));
     if (!artifact.ok) throw new Error((artifact as unknown as { error?: string }).error ?? 'artifact compilation failed');
     state.setCompilation({ artifact, compiling: false, status: 'Compiled successfully. WASM export is ready.' });
 
     const args = parseArguments(useWorkbench.getState().args);
     const bytes = hexBytes(artifact.wasm_bytes_hex);
-    const module = await WebAssembly.instantiate(bytes, {});
-    const evaluate = module.instance.exports.eval;
+    const instance = await WebAssembly.instantiate(bytes, {});
+    const evaluate = instance.exports.eval;
     if (typeof evaluate !== 'function') throw new Error('compiled module does not export eval');
     const invoke = (...values: number[]) => Number((evaluate as (...values: number[]) => number)(...values));
     const result = invoke(...args);
     state.setCompilation({ status: `Compiled successfully. Result: ${String(result)}`, tier: 'baseline WASM' });
     const benchmark = wasm.benchmark
-      ? await jsonCall(wasm.benchmark.bind(wasm, source, sizes))
+      ? await jsonCall<BenchmarkResult>(() => wasm.benchmark!(source, sizes))
       : await browserBenchmark(invoke, args);
     state.setCompilation({ benchmark });
   } catch (error) {
