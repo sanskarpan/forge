@@ -131,7 +131,12 @@ fn float_cmp_lt_uses_unsigned_below_condition() {
 
     assert_eq!(
         disassemble(asm.code()),
-        vec!["ucomisd xmm0,xmm1", "mov rax,0", "setb al"]
+        vec![
+            "mov rax,0",
+            "ucomisd xmm0,xmm1",
+            "jp near 0000000000000014h",
+            "setb al"
+        ]
     );
 }
 
@@ -162,7 +167,13 @@ fn float_cmp_ne_emits_setne_not_sete() {
 
     assert_eq!(
         disassemble(asm.code()),
-        vec!["ucomisd xmm0,xmm1", "mov rax,0", "setne al"]
+        vec![
+            "mov rax,1",
+            "ucomisd xmm0,xmm1",
+            "jp near 000000000000001Bh",
+            "mov rax,0",
+            "setne al"
+        ]
     );
 }
 
