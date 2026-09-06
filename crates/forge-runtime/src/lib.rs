@@ -78,6 +78,7 @@ pub fn lower_source(source: &str) -> Result<Function, CompileError> {
     Ok(function)
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn function_contains_fma(function: &Function) -> bool {
     function
         .insts
