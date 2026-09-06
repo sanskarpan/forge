@@ -21,6 +21,13 @@ impl Gpr {
 
 pub const SP: Gpr = Gpr(31);
 
+/// The architectural zero register. Register number 31 is interpreted as
+/// `XZR` by arithmetic/logical register instructions and as `SP` by the
+/// addressing and add/sub-immediate forms; keep the two names distinct at
+/// call sites so an integer negation cannot accidentally read the stack
+/// pointer as its zero operand.
+pub const XZR: Gpr = Gpr(31);
+
 #[derive(Default)]
 pub struct Assembler {
     words: Vec<u32>,
@@ -655,7 +662,7 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                     if function.types[value.0 as usize] == Ty::F64 {
                         asm.fneg_d(dst, register_of(*operand)?);
                     } else {
-                        asm.sub_reg(dst, SP, register_of(*operand)?);
+                        asm.sub_reg(dst, XZR, register_of(*operand)?);
                     }
                 }
                 Inst::Abs(value) => {
@@ -676,6 +683,18 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                     }
                     asm.fmadd_d(dst, register_of(*a)?, register_of(*b)?, register_of(*c)?)
                 }
+                Inst::Min(lhs, rhs) => {
+                    if function.types[value.0 as usize] != Ty::F64 {
+                        return Err("AArch64 min requires f64 operands".to_string());
+                    }
+                    asm.fmin_d(dst, register_of(*lhs)?, register_of(*rhs)?);
+                }
+                Inst::Max(lhs, rhs) => {
+                    if function.types[value.0 as usize] != Ty::F64 {
+                        return Err("AArch64 max requires f64 operands".to_string());
+                    }
+                    asm.fmax_d(dst, register_of(*lhs)?, register_of(*rhs)?);
+                }
                 Inst::And(lhs, rhs) => asm.and_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
                 Inst::Or(lhs, rhs) => asm.orr_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
                 Inst::Xor(lhs, rhs) => asm.eor_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
@@ -695,9 +714,7 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                 },
                 Inst::IToF(value) => asm.scvtf(dst, register_of(*value)?),
                 Inst::FToI(value) => asm.fcvtzs(dst, register_of(*value)?),
-                Inst::Min(..)
-                | Inst::Max(..)
-                | Inst::Floor(..)
+                Inst::Floor(..)
                 | Inst::Ceil(..)
                 | Inst::Round(..)
                 | Inst::Trunc(..)
@@ -848,7 +865,7 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
                 asm.sdiv(dst, lhs_reg, rhs_reg);
                 asm.msub(dst, dst, rhs_reg, lhs_reg);
             }
-            Some(Inst::Neg(operand)) => asm.sub_reg(dst, SP, register_of(*operand)?),
+            Some(Inst::Neg(operand)) => asm.sub_reg(dst, XZR, register_of(*operand)?),
             Some(Inst::And(lhs, rhs)) => asm.and_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
             Some(Inst::Or(lhs, rhs)) => asm.orr_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
             Some(Inst::Xor(lhs, rhs)) => asm.eor_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
@@ -867,7 +884,7 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
     let result_register = register_of(*result)?;
     if result_register != Gpr::new(0) {
         // ORR Xd, XZR, Xm is the architectural MOV register alias.
-        asm.orr_reg(Gpr::new(0), SP, result_register);
+        asm.orr_reg(Gpr::new(0), XZR, result_register);
     }
     asm.ret();
     Ok(asm.bytes())
@@ -925,7 +942,7 @@ fn emit_phi_edge_copies(
             if phi_type == Ty::F64 {
                 asm.fmov_d(destination, source);
             } else {
-                asm.orr_reg(destination, SP, source);
+                asm.orr_reg(destination, XZR, source);
             }
         }
     }
@@ -978,6 +995,8 @@ mod tests {
         assert_eq!(and_reg(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x8a02_0020);
         assert_eq!(cmp_reg(Gpr::new(1), Gpr::new(2)), 0xeb02_003f);
         assert_eq!(fadd_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_2820);
+        assert_eq!(fmin_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_5820);
+        assert_eq!(fmax_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_4820);
         assert_eq!(fcmp_d(Gpr::new(1), Gpr::new(2)), 0x1e62_2020);
         assert_eq!(fsqrt_d(Gpr::new(0), Gpr::new(1)), 0x1e61_c020);
         assert_eq!(
@@ -1033,6 +1052,36 @@ mod tests {
             u64::from(words[6]) | (u64::from(words[7]) << 32),
             2.5f64.to_bits()
         );
+    }
+
+    #[test]
+    fn emits_scalar_f64_min_and_max() {
+        let min_function = forge_runtime::lower_source("min(x, 2.0)").unwrap();
+        let max_function = forge_runtime::lower_source("max(x, 2.0)").unwrap();
+        let min_words = emit_f64(&min_function)
+            .unwrap()
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let max_words = emit_f64(&max_function)
+            .unwrap()
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(min_words
+            .iter()
+            .any(|word| word & 0xffe0_fc00 == 0x1e60_5800));
+        assert!(max_words
+            .iter()
+            .any(|word| word & 0xffe0_fc00 == 0x1e60_4800));
+    }
+
+    #[test]
+    fn integer_negation_uses_xzr_not_sp() {
+        let mut asm = Assembler::new();
+        asm.sub_reg(Gpr::new(8), XZR, Gpr::new(0));
+        assert_eq!(asm.words(), &[sub_reg(Gpr::new(8), XZR, Gpr::new(0))]);
+        assert_eq!(XZR.index(), 31);
     }
 
     #[test]
