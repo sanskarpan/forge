@@ -21,7 +21,7 @@ implemented lower-level work is absent.
 | Runtime | Implemented source lowering, optimization, selection, allocation, verification, native x86-64 JIT, native AArch64 execution for the supported all-f64 subset, interpreter fallback for unsupported targets/operations, and thread-safe interpreter → baseline → optimized tier promotion; native execution is now differentially checked against the interpreter with generated expressions and IEEE special values | `crates/forge-runtime` |
 | Verification stress coverage | Implemented deterministic 500-live-value native spill-frame coverage, randomized valid-IR optimizer/verifier property coverage with 512 generated programs, and a reproducible 100,000-expression native differential corpus covering arithmetic, guarded division, abs/sqrt, min/max, conditionals, FMA, NaNs, infinities, signed zero, and subnormals; Linux CI runs the executable-memory no-leak test under Valgrind Memcheck, while the macOS Miri limitation remains documented | `crates/forge-emit/tests/execution_corpus.rs`, `crates/forge-opt/tests/differential.rs`, `.github/workflows/ci.yml` |
 | CLI | Implemented documented `eval`, `compile`, `asm`, `ir`, `cfg`, `regalloc`, `bench`, `verify`, `cpuinfo`, and `repl` command surface; the REPL has session bindings/history/inspection commands, terminal-aware color with `NO_COLOR`, AArch64 emission, and tested exit-code classification; `asm --annotate` reports live allocated locations, while `bench` supports warmups, reusable compiled-call timing, and stable JSON reports | `crates/forge-cli` |
-| SIMD | Runtime `CpuFeatures` snapshot, deterministic f64 width selection, packed straight-line f64 array execution on SSE2/AVX2/NEON, exact AVX2+FMA `fma` evaluation when FMA is detected, chunk/tail handling, source-ordered `reduce_sum` over packed chunks, typed straight-line vector IR, and scalar fallback are implemented; stable EVEX packed-double byte forms are implemented separately, while AVX-512 runtime dispatch and masked tails remain open | `crates/forge-simd`, `crates/forge-x64/src/assembler.rs` |
+| SIMD | Runtime `CpuFeatures` snapshot, deterministic f64 width selection, packed straight-line f64 array execution on SSE2/AVX2/AVX-512F/NEON, exact AVX2+FMA and AVX-512F `fma` evaluation when FMA is detected, chunk/tail handling, AVX-512F k-masked zeroing tails, source-ordered `reduce_sum` over packed chunks, typed straight-line vector IR, and scalar fallback are implemented; stable EVEX packed-double byte forms remain separately covered | `crates/forge-simd`, `crates/forge-x64/src/assembler.rs` |
 | AArch64 | Native target capability API plus tested scalar integer/float/conversion/memory/branch/immediate encoder forms; AAPCS64 scalar f64 expression emission includes arithmetic, NaN-compatible min/max, comparisons, CFG branches, typed phi edge copies, aligned literal pools, CLI output, native ARM execution, and Linux ARM64 QEMU coverage; mixed scalar i64/f64/bool parameter banks, integer operations, scalar comparisons, and i64↔f64 conversions are emitted for f64-result functions, with integer negation using the architectural XZR register; temporaries use caller-saved D16..D31/X8..X18 first, then preserve allocated D8..D15/X19..X28 in aligned save/restore frames, with explicit budget rejection and native f64/i64 frame execution coverage; straight-line i64 expressions beyond the register budget spill to aligned stack slots and reload through preserved X28..X30 scratch registers, while high-pressure all-f64 straight-line and structured CFG expressions spill to aligned stack slots and reload through caller-saved D29..D31 scratch registers, including f64 phi edge stores; high-pressure mixed f64/i64/bool expressions returning f64 spill typed values to aligned stack slots across straight-line and structured CFG expressions, including f64 and integer phi edge stores, while preserving the integer scratch frame and both AAPCS64 parameter banks; scalar f64 libm calls use process-local absolute symbol dispatch through AAPCS64 D0/D1 arguments, aligned frames, and saved link registers, and mixed f64/i64/bool parameter functions spill both incoming AAPCS64 banks across those calls; arbitrary mixed-signature external calls, full ABI prologues/epilogues, and general live-range allocation remain open | `crates/forge-aarch64` |
 | WASM | Tested typed scalar byte emitter for `f64`, `i64`, and bool values, including arithmetic, comparisons, conditionals, lets, min/max, and fma lowering; structured artifact JSON exposes bytes, hex, parameter types, result type, lowered/optimized IR, and CFG; parse/type diagnostics now include source spans and a serialized AST; `benchmark(source, sizes)` exposes portable baseline timings and results; reproducible `wasm-pack --target web --release` plus `wasm-opt -Oz` packaging is CI-validated under the documented gzip-size boundary; native interval/assembly artifacts remain open because this target is stack-machine WASM | `crates/forge-wasm`, `crates/forge-wasm-api`, `.github/workflows/ci-containers.yml`, `containers/Dockerfile.wasm-ci` |
 | Benchmarks | Reusable compiled-expression benchmark helper exists; allocator Criterion benchmark now measures about 42–43 µs for its 1000-value workload, below the 50 µs target on the validation machine | `crates/forge-bench`, `crates/forge-regalloc/benches` |
@@ -30,7 +30,7 @@ implemented lower-level work is absent.
 
 The remaining open rows are intentional scope boundaries, not silent stubs.
 
-### Validated implementation batch — 2026-09-06
+### Validated implementation batch — 2026-09-07
 
 - PR #124 completed ABI-aware translation assertions and volatile Win64 XMM
   scratch selection; PR #126 completed layout-level libm scratch selection and
@@ -122,11 +122,16 @@ The remaining open rows are intentional scope boundaries, not silent stubs.
   signed-zero min/max semantics. PR #281's complete Linux x86-64, emulated
   ARM64, WASM, Workbench, macOS, Windows, Valgrind, and GitGuardian matrix
   passed before merge to `codex/integration`.
+- PR #288 adds AVX-512F 8-lane runtime dispatch and stable inline-assembly
+  k-masked zeroing load/store tails, with scalar fallback when AVX-512F is
+  unavailable. Its complete Linux x86-64, emulated ARM64, WASM, Workbench,
+  macOS, Windows, Valgrind, and GitGuardian matrix passed before merge to
+  `codex/integration`.
 - The historical phase checkboxes below remain design-history markers. Open
   scope is tracked explicitly in the table above and in each phase’s notes;
-  this section must not be read as claiming completion of AVX-512 runtime
-  execution/masked tails, full AArch64 ABI/code generation, fuzz/Miri/Valgrind,
-  or other still-open boundaries. The 100,000-expression stress item is
+  this section must not be read as claiming completion of full AArch64 ABI/code
+  generation, fuzz/Miri, native WASM interval/assembly artifacts, or other
+  still-open boundaries. The 100,000-expression stress item is
   implemented by PR #281; its historical checkbox remains unchecked only to
   preserve the original phase-history record.
 
