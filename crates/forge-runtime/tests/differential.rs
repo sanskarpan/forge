@@ -178,6 +178,16 @@ fn jit_preserves_special_values_and_signed_zeroes() {
 }
 
 #[test]
+fn fused_float_diamond_preserves_unordered_else_value() {
+    let source = "if ((((-0.0 * 1.0) * (3.0 * y))) < 0.0) then (abs((-0.0 * 1.0))) else (((3.0 * y) * min(-0.0, 1.0)))";
+    let args = [-f64::MAX];
+    let expected = interpret_source(source, &[RtValue::F64(args[0])]).unwrap();
+    let actual = evaluate(source, &args).unwrap();
+    assert_same(expected, actual, source, &args);
+    assert!(actual.is_nan());
+}
+
+#[test]
 fn compiles_and_executes_100000_reproducible_random_expressions() {
     const CASES: usize = 100_000;
     let mut rng = StressRng(0x5eed_cafe_d00d_f00d);
