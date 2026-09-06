@@ -183,10 +183,7 @@ pub fn translate_inst(
             asm.setcc(int_condition_code(*op), dst_r);
         }
         MachineInst::FloatCmp { op, dst, lhs, rhs } => {
-            let (dst_r, lhs_r, rhs_r) = (loc(*dst), loc(*lhs), loc(*rhs));
-            asm.ucomisd_reg_reg(lhs_r, rhs_r);
-            asm.mov_reg_imm(dst_r, 0);
-            asm.setcc(float_condition_code(*op), dst_r);
+            float_cmp(asm, loc, *op, *dst, *lhs, *rhs);
         }
         MachineInst::IntCmov {
             dst,
@@ -351,6 +348,37 @@ fn float_condition_code(op: forge_ir::CmpOp) -> forge_x64::ConditionCode {
         CmpOp::Gt => ConditionCode::Above,
         CmpOp::Ge => ConditionCode::AboveOrEqual,
     }
+}
+
+/// Lowers an unordered-aware scalar f64 comparison. `ucomisd` sets parity for
+/// NaN operands and also sets the ordinary unsigned flags, so using only
+/// `setcc` would incorrectly make `NaN == x`, `NaN < x`, and the other ordered
+/// comparisons true. Ordered comparisons leave the zeroed result untouched
+/// on parity; `!=` starts at one so unordered values produce the required true
+/// result and overwrites it only for an ordered comparison.
+fn float_cmp(
+    asm: &mut Assembler,
+    loc: &dyn Fn(Value) -> PhysReg,
+    op: forge_ir::CmpOp,
+    dst: Value,
+    lhs: Value,
+    rhs: Value,
+) {
+    let (dst_r, lhs_r, rhs_r) = (loc(dst), loc(lhs), loc(rhs));
+    let done = asm.new_label();
+    if op == forge_ir::CmpOp::Ne {
+        asm.mov_reg_imm(dst_r, 1);
+        asm.ucomisd_reg_reg(lhs_r, rhs_r);
+        asm.jcc(ConditionCode::Parity, done);
+        asm.mov_reg_imm(dst_r, 0);
+        asm.setcc(ConditionCode::NotEqual, dst_r);
+    } else {
+        asm.mov_reg_imm(dst_r, 0);
+        asm.ucomisd_reg_reg(lhs_r, rhs_r);
+        asm.jcc(ConditionCode::Parity, done);
+        asm.setcc(float_condition_code(op), dst_r);
+    }
+    asm.bind(done);
 }
 
 fn shift_op(
