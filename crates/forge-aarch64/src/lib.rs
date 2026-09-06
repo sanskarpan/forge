@@ -586,6 +586,44 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         return Err("AArch64 mixed scalar emitter requires an f64 result".to_string());
     }
 
+    let straight_line_f64 = function.blocks.len() == 1
+        && matches!(function.blocks[0].term, Some(Terminator::Return(_)))
+        && function.params.iter().all(|(_, ty)| *ty == Ty::F64)
+        && function.blocks[0].insts.iter().all(|value| {
+            matches!(
+                function.insts.get(value.0 as usize),
+                Some(
+                    Inst::ConstF64(_)
+                        | Inst::Param { ty: Ty::F64, .. }
+                        | Inst::Add(_, _)
+                        | Inst::Sub(_, _)
+                        | Inst::Mul(_, _)
+                        | Inst::Div(_, _)
+                        | Inst::Neg(_)
+                        | Inst::Abs(_)
+                        | Inst::Sqrt(_)
+                        | Inst::Fma { .. }
+                        | Inst::Min(_, _)
+                        | Inst::Max(_, _)
+                )
+            )
+        });
+    if straight_line_f64 {
+        let non_param_count = function.blocks[0]
+            .insts
+            .iter()
+            .filter(|value| {
+                !matches!(
+                    function.insts.get(value.0 as usize),
+                    Some(Inst::Param { .. })
+                )
+            })
+            .count();
+        if non_param_count > 24 {
+            return emit_f64_with_stack_spills(function);
+        }
+    }
+
     let mut registers = HashMap::<Value, Gpr>::new();
     let mut next_float_temporary = 16u8;
     let mut next_integer_temporary = 8u8;
@@ -894,6 +932,192 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
             Some(condition) => encode_branch_cond(condition, offset),
             None => encode_branch(offset),
         };
+    }
+    for bits in pool {
+        asm.words.push(bits as u32);
+        asm.words.push((bits >> 32) as u32);
+    }
+    Ok(asm.bytes())
+}
+
+#[derive(Clone, Copy)]
+enum F64Location {
+    Register(Gpr),
+    Stack(u16),
+}
+
+/// Emits the straight-line all-f64 subset with every non-parameter value in a
+/// stack slot. D29..D31 are caller-saved AAPCS64 scratch registers, so no
+/// additional register save area is needed. CFG/phi spilling and mixed-value
+/// f64 spilling remain separate allocator work.
+fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
+    let Some(block) = function.blocks.first() else {
+        return Err("AArch64 emitter requires at least one block".to_string());
+    };
+    let Some(Terminator::Return(result)) = block.term.as_ref() else {
+        return Err("AArch64 f64 spill emitter requires a return terminator".to_string());
+    };
+
+    let mut locations = HashMap::<Value, F64Location>::new();
+    let mut next_slot = 0u16;
+    for &value in &block.insts {
+        let Some(inst) = function.insts.get(value.0 as usize) else {
+            return Err(format!("block references missing instruction {value:?}"));
+        };
+        let location = match inst {
+            Inst::Param { index, ty: Ty::F64 } => {
+                let ordinal = function.params[..*index as usize]
+                    .iter()
+                    .filter(|(_, ty)| *ty == Ty::F64)
+                    .count();
+                if *index as usize >= function.params.len() || ordinal >= 8 {
+                    return Err("AArch64 f64 emitter supports at most 8 parameters".to_string());
+                }
+                F64Location::Register(Gpr::new_d(ordinal as u8))
+            }
+            Inst::Param { .. } => {
+                return Err("AArch64 f64 spill emitter requires f64 parameters".to_string())
+            }
+            _ => {
+                let slot = next_slot;
+                next_slot = next_slot
+                    .checked_add(8)
+                    .ok_or_else(|| "AArch64 f64 spill frame is too large".to_string())?;
+                F64Location::Stack(slot)
+            }
+        };
+        locations.insert(value, location);
+    }
+
+    let frame_bytes = u16::try_from((usize::from(next_slot) + 15) & !15)
+        .map_err(|_| "AArch64 f64 spill frame is too large".to_string())?;
+    let location_of = |value: Value| {
+        locations
+            .get(&value)
+            .copied()
+            .ok_or_else(|| format!("missing AArch64 location for value {value:?}"))
+    };
+    let mut asm = Assembler::new();
+    let scratch_a = Gpr::new_d(29);
+    let scratch_b = Gpr::new_d(30);
+    let scratch_c = Gpr::new_d(31);
+    asm.sub_imm(SP, SP, frame_bytes, false);
+
+    let load = |asm: &mut Assembler, value: Value, scratch: Gpr| -> Result<(), String> {
+        match location_of(value)? {
+            F64Location::Register(register) => {
+                if register != scratch {
+                    asm.fmov_d(scratch, register);
+                }
+            }
+            F64Location::Stack(offset) => asm.ldr_d(scratch, SP, offset),
+        }
+        Ok(())
+    };
+    let store = |asm: &mut Assembler, value: Value, source: Gpr| -> Result<(), String> {
+        match location_of(value)? {
+            F64Location::Register(register) => {
+                if register != source {
+                    asm.fmov_d(register, source);
+                }
+            }
+            F64Location::Stack(offset) => asm.str_d(source, SP, offset),
+        }
+        Ok(())
+    };
+
+    let mut pool = Vec::<u64>::new();
+    let mut pool_indices = HashMap::<u64, usize>::new();
+    let mut literal_loads = Vec::<(usize, usize, Gpr)>::new();
+    for &value in &block.insts {
+        match function.insts.get(value.0 as usize) {
+            Some(Inst::ConstF64(bits)) => {
+                let pool_index = match pool_indices.get(bits) {
+                    Some(index) => *index,
+                    None => {
+                        let index = pool.len();
+                        pool.push(*bits);
+                        pool_indices.insert(*bits, index);
+                        index
+                    }
+                };
+                let instruction_index = asm.words.len();
+                asm.ldr_literal_d(scratch_a, 0);
+                literal_loads.push((instruction_index, pool_index, scratch_a));
+                store(&mut asm, value, scratch_a)?;
+            }
+            Some(Inst::Param { .. }) => {}
+            Some(Inst::Add(lhs, rhs))
+            | Some(Inst::Sub(lhs, rhs))
+            | Some(Inst::Mul(lhs, rhs))
+            | Some(Inst::Div(lhs, rhs))
+            | Some(Inst::Min(lhs, rhs))
+            | Some(Inst::Max(lhs, rhs)) => {
+                load(&mut asm, *lhs, scratch_a)?;
+                load(&mut asm, *rhs, scratch_b)?;
+                match function.insts.get(value.0 as usize) {
+                    Some(Inst::Add(..)) => asm.fadd_d(scratch_a, scratch_a, scratch_b),
+                    Some(Inst::Sub(..)) => asm.fsub_d(scratch_a, scratch_a, scratch_b),
+                    Some(Inst::Mul(..)) => asm.fmul_d(scratch_a, scratch_a, scratch_b),
+                    Some(Inst::Div(..)) => asm.fdiv_d(scratch_a, scratch_a, scratch_b),
+                    Some(Inst::Min(..)) => asm.fmin_d(scratch_a, scratch_a, scratch_b),
+                    Some(Inst::Max(..)) => asm.fmax_d(scratch_a, scratch_a, scratch_b),
+                    _ => unreachable!(),
+                }
+                store(&mut asm, value, scratch_a)?;
+            }
+            Some(Inst::Neg(operand)) => {
+                load(&mut asm, *operand, scratch_a)?;
+                asm.fneg_d(scratch_a, scratch_a);
+                store(&mut asm, value, scratch_a)?;
+            }
+            Some(Inst::Abs(operand)) => {
+                load(&mut asm, *operand, scratch_a)?;
+                asm.fabs_d(scratch_a, scratch_a);
+                store(&mut asm, value, scratch_a)?;
+            }
+            Some(Inst::Sqrt(operand)) => {
+                load(&mut asm, *operand, scratch_a)?;
+                asm.fsqrt_d(scratch_a, scratch_a);
+                store(&mut asm, value, scratch_a)?;
+            }
+            Some(Inst::Fma { a, b, c }) => {
+                load(&mut asm, *a, scratch_a)?;
+                load(&mut asm, *b, scratch_b)?;
+                load(&mut asm, *c, scratch_c)?;
+                asm.fmadd_d(scratch_a, scratch_a, scratch_b, scratch_c);
+                store(&mut asm, value, scratch_a)?;
+            }
+            Some(inst) => {
+                return Err(format!(
+                    "AArch64 f64 spill emitter does not support {inst:?}"
+                ))
+            }
+            None => return Err(format!("missing instruction for value {value:?}")),
+        }
+    }
+
+    match location_of(*result)? {
+        F64Location::Register(register) if register != Gpr::new_d(0) => {
+            asm.fmov_d(Gpr::new_d(0), register)
+        }
+        F64Location::Stack(offset) => asm.ldr_d(Gpr::new_d(0), SP, offset),
+        F64Location::Register(_) => {}
+    }
+    asm.add_imm(SP, SP, frame_bytes, false);
+    asm.ret();
+
+    if !pool.is_empty() && !asm.words.len().is_multiple_of(2) {
+        asm.words.push(0);
+    }
+    let pool_start = asm.words.len() * 4;
+    for (instruction_index, pool_index, dst) in literal_loads {
+        let literal_offset = pool_index
+            .checked_mul(8)
+            .and_then(|offset| i32::try_from(offset).ok())
+            .ok_or_else(|| "AArch64 literal pool is too large".to_string())?;
+        let offset = pool_start as i32 + literal_offset - (instruction_index * 4) as i32;
+        asm.words[instruction_index] = encode_ldr_literal_d(dst, offset);
     }
     for bits in pool {
         asm.words.push(bits as u32);
@@ -1419,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_emitter_uses_a_frame_before_rejecting_excess_temporaries() {
+    fn scalar_emitter_uses_a_frame_before_spilling_excess_temporaries() {
         let source = std::iter::repeat_n("x", 18).collect::<Vec<_>>().join(" + ");
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
@@ -1429,8 +1653,26 @@ mod tests {
 
         let source = std::iter::repeat_n("x", 26).collect::<Vec<_>>().join(" + ");
         let function = forge_runtime::lower_source(&source).unwrap();
-        let error = emit_f64(&function).unwrap_err();
-        assert!(error.contains("D-register temporaries"));
+        let bytes = emit_f64(&function).unwrap();
+        assert!(bytes.chunks(4).any(
+            |chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == ldr_d(Gpr::new(29), SP, 0)
+        ));
+        assert!(bytes.chunks(4).any(
+            |chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == str_d(Gpr::new(29), SP, 0)
+        ));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_aarch64_f64_function_with_stack_spills() {
+        let source = std::iter::repeat_n("x", 26).collect::<Vec<_>>().join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
+        assert_eq!(compiled.call_args(&[3.0]), 78.0);
     }
 
     #[cfg(target_arch = "aarch64")]
