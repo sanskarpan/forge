@@ -10,7 +10,9 @@
 //! test suites for the per-pass unit coverage this is meant to complement,
 //! not replace.
 
+use forge_ir::builder::Builder;
 use forge_ir::interp::{interpret, RtValue};
+use forge_ir::{Function, Inst, Terminator, Ty, Value};
 use forge_syntax::lexer::lex;
 use forge_syntax::parser::parse;
 use forge_syntax::resolve::resolve;
@@ -99,6 +101,126 @@ fn try_interpret(f: &forge_ir::Function, args: &[RtValue]) -> Result<RtValue, St
                 .unwrap_or_else(|| "<non-string panic payload>".to_string())
         },
     )
+}
+
+fn random_f64_function(program: &[u8]) -> Function {
+    let mut builder = Builder::new();
+    let entry = builder.create_block();
+    builder.seal_block(entry);
+    let input = builder.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        forge_syntax::span::Span::new(0, 0),
+    );
+    let seed = builder.emit(
+        entry,
+        Inst::ConstF64(1.25f64.to_bits()),
+        Ty::F64,
+        forge_syntax::span::Span::new(0, 0),
+    );
+    builder.f.params.push(("x".to_string(), Ty::F64));
+
+    let mut values = vec![input, seed];
+    for &byte in program {
+        let pick = |salt: usize, values: &[Value]| values[(byte as usize + salt) % values.len()];
+        let value = match byte % 8 {
+            0 => builder.emit(
+                entry,
+                Inst::Add(pick(0, &values), pick(1, &values)),
+                Ty::F64,
+                forge_syntax::span::Span::new(0, 0),
+            ),
+            1 => builder.emit(
+                entry,
+                Inst::Sub(pick(0, &values), pick(1, &values)),
+                Ty::F64,
+                forge_syntax::span::Span::new(0, 0),
+            ),
+            2 => builder.emit(
+                entry,
+                Inst::Mul(pick(0, &values), pick(1, &values)),
+                Ty::F64,
+                forge_syntax::span::Span::new(0, 0),
+            ),
+            3 => builder.emit(
+                entry,
+                Inst::Neg(pick(0, &values)),
+                Ty::F64,
+                forge_syntax::span::Span::new(0, 0),
+            ),
+            4 => builder.emit(
+                entry,
+                Inst::Fma {
+                    a: pick(0, &values),
+                    b: pick(1, &values),
+                    c: pick(2, &values),
+                },
+                Ty::F64,
+                forge_syntax::span::Span::new(0, 0),
+            ),
+            5 => builder.emit(
+                entry,
+                Inst::Min(pick(0, &values), pick(1, &values)),
+                Ty::F64,
+                forge_syntax::span::Span::new(0, 0),
+            ),
+            6 => builder.emit(
+                entry,
+                Inst::Max(pick(0, &values), pick(1, &values)),
+                Ty::F64,
+                forge_syntax::span::Span::new(0, 0),
+            ),
+            _ => {
+                let absolute = builder.emit(
+                    entry,
+                    Inst::Abs(pick(0, &values)),
+                    Ty::F64,
+                    forge_syntax::span::Span::new(0, 0),
+                );
+                values.push(absolute);
+                builder.emit(
+                    entry,
+                    Inst::Sqrt(absolute),
+                    Ty::F64,
+                    forge_syntax::span::Span::new(0, 0),
+                )
+            }
+        };
+        values.push(value);
+    }
+    let result = *values.last().expect("seed values are present");
+    builder.f.blocks[entry.0 as usize].term = Some(Terminator::Return(result));
+    builder.f
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn random_valid_ir_survives_optimization_and_keeps_its_result(
+        program in proptest::collection::vec(any::<u8>(), 1..=128)
+    ) {
+        let mut function = random_f64_function(&program);
+        prop_assert!(forge_ir::verify::verify(&function).is_ok());
+        let expected = interpret(&function, &[RtValue::F64(2.75)]);
+
+        forge_opt::optimize(&mut function);
+        prop_assert!(forge_ir::verify::verify(&function).is_ok());
+        let actual = interpret(&function, &[RtValue::F64(2.75)]);
+        match (expected, actual) {
+            (RtValue::F64(expected), RtValue::F64(actual)) if expected.is_nan() => {
+                prop_assert!(actual.is_nan());
+            }
+            (RtValue::F64(expected), RtValue::F64(actual)) => {
+                prop_assert_eq!(expected.to_bits(), actual.to_bits());
+            }
+            (expected, actual) => prop_assert_eq!(expected, actual),
+        }
+    }
 }
 
 proptest! {
