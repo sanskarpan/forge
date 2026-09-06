@@ -52,6 +52,7 @@ impl CpuFeatures {
 
     pub fn best_width(self, ty: Ty) -> u8 {
         match ty {
+            Ty::F64 if self.avx512f => 8,
             Ty::F64 if self.avx2 => 4,
             Ty::F64 if self.sse2 || self.neon => 2,
             _ => 1,
@@ -103,8 +104,9 @@ impl ArrayPlan {
 pub struct ArrayResult {
     pub values: Vec<f64>,
     pub plan: ArrayPlan,
-    /// False until packed vector IR and encoders land. Keeping this explicit
-    /// prevents callers from mistaking the correct scalar fallback for SIMD.
+    /// Whether the full chunks used a hardware packed backend. The scalar
+    /// epilogue for a non-multiple-of-width length is still included in the
+    /// returned values.
     pub used_packed_backend: bool,
 }
 
@@ -350,6 +352,12 @@ fn try_evaluate_packed_chunk(
     width: SimdWidth,
 ) -> Option<Vec<f64>> {
     #[cfg(target_arch = "x86_64")]
+    if width == SimdWidth::F64x8 && std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: runtime feature detection proves AVX-512F is available.
+        // The evaluator checks every load range before reaching the intrinsic.
+        return unsafe { evaluate_packed::<x86_packed::Avx512>(function, columns, start) }.ok();
+    }
+    #[cfg(target_arch = "x86_64")]
     if width == SimdWidth::F64x4 && std::is_x86_feature_detected!("avx2") {
         // SAFETY: runtime feature detection proves AVX2 is available. FMA is
         // selected separately because fused multiply-add changes rounding.
@@ -391,6 +399,7 @@ mod x86_packed {
 
     pub struct Sse2;
     pub struct Avx2;
+    pub struct Avx512;
 
     macro_rules! impl_x86_ops {
         ($name:ident, $vector:ty, $lanes:expr, $set1:ident, $load:ident, $store:ident,
@@ -481,6 +490,23 @@ mod x86_packed {
         _mm256_and_pd,
         _mm256_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)),
         "avx2"
+    );
+
+    impl_x86_ops!(
+        Avx512,
+        __m512d,
+        8,
+        _mm512_set1_pd,
+        _mm512_loadu_pd,
+        _mm512_storeu_pd,
+        _mm512_add_pd,
+        _mm512_sub_pd,
+        _mm512_mul_pd,
+        _mm512_div_pd,
+        _mm512_sqrt_pd,
+        _mm512_and_pd,
+        _mm512_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)),
+        "avx512f"
     );
 
     pub struct Avx2Fma;
@@ -633,7 +659,7 @@ mod tests {
         features.avx2 = true;
         assert_eq!(features.best_width(Ty::F64), 4);
         features.avx512f = true;
-        assert_eq!(features.best_width(Ty::F64), 4);
+        assert_eq!(features.best_width(Ty::F64), 8);
         assert_eq!(features.best_width(Ty::I64), 1);
     }
 
@@ -718,9 +744,11 @@ mod tests {
         assert_eq!(result.values, expected);
         assert_eq!(
             result.used_packed_backend,
-            result.plan.width == SimdWidth::F64x4
-                && CpuFeatures::detect().avx2
-                && CpuFeatures::detect().fma
+            matches!(result.plan.width, SimdWidth::F64x4 | SimdWidth::F64x8)
+                && ((result.plan.width == SimdWidth::F64x4
+                    && CpuFeatures::detect().avx2
+                    && CpuFeatures::detect().fma)
+                    || (result.plan.width == SimdWidth::F64x8 && CpuFeatures::detect().avx512f))
         );
     }
 }
