@@ -327,6 +327,16 @@ fn assign_spill_scratch(
         {
             Some((*dst, *then_val))
         }
+        // FloatFma copies the addend into dst before issuing the three-source
+        // instruction, so a spilled destination can safely reuse the
+        // addend's reload scratch. This keeps four spilled values within the
+        // three-register XMM scratch budget on both ABIs.
+        MachineInst::FloatFma { dst, addend, .. }
+            if matches!(assignment[dst], Location::Spill(_))
+                && matches!(assignment[addend], Location::Spill(_)) =>
+        {
+            Some((*dst, *addend))
+        }
         _ => None,
     };
     let mut values = reads_of(inst);

@@ -25,6 +25,20 @@ fn sse_binop(
     rhs: Value,
 ) {
     let (dst_r, lhs_r, rhs_r) = (loc(dst), loc(lhs), loc(rhs));
+    // The allocator normally honors the dst->lhs coalescing hint, but a
+    // constrained ABI can still produce dst == rhs. Preserve rhs before the
+    // two-address copy of lhs overwrites that register.
+    let rhs_r = if dst_r == rhs_r {
+        let scratch = forge_regalloc::SCRATCH_XMM
+            .iter()
+            .copied()
+            .find(|candidate| *candidate != dst_r && *candidate != lhs_r)
+            .expect("float minmax alias requires a scratch XMM register");
+        asm.movsd_reg_reg(scratch, rhs_r);
+        scratch
+    } else {
+        rhs_r
+    };
     if dst_r != lhs_r {
         asm.movsd_reg_reg(dst_r, lhs_r);
     }
@@ -157,6 +171,9 @@ pub fn translate_inst(
         }
         MachineInst::FloatMax { dst, lhs, rhs } => {
             sse_minmax(asm, loc, *dst, *lhs, *rhs, SseOp::Max)
+        }
+        MachineInst::FloatMinMaxSelect { dst, lhs, rhs, op } => {
+            sse_minmax_select(asm, loc, *dst, *lhs, *rhs, *op)
         }
 
         MachineInst::FloatSqrt { dst, src } => {
@@ -315,17 +332,60 @@ fn sse_minmax(
     asm.jcc(ConditionCode::Parity, lhs_nan);
     asm.ucomisd_reg_reg(rhs_r, rhs_r);
     asm.jcc(ConditionCode::Parity, done);
-    // Rust's f64::min/max preserve the left operand for equal ordered
-    // values, including +0.0/-0.0. minsd/maxsd are allowed to select the
-    // source operand on that tie, so skip the instruction when the operands
-    // compare equal and retain the initial lhs copy in dst_r.
+    // Rust's f64::min/max normalize equal signed-zero ties: min returns
+    // -0.0 and max returns +0.0 regardless of operand order. For all other
+    // equal, non-NaN values the bitwise operation is a no-op, so use OR for
+    // min and AND for max instead of relying on minsd/maxsd's tie choice.
     asm.ucomisd_reg_reg(lhs_r, rhs_r);
-    asm.jcc(ConditionCode::Equal, done);
+    let equal = asm.new_label();
+    asm.jcc(ConditionCode::Equal, equal);
     asm.sse_reg_reg(op, dst_r, rhs_r);
+    asm.jmp(done);
+    asm.bind(equal);
+    match op {
+        SseOp::Min => asm.orpd_reg_reg(dst_r, rhs_r),
+        SseOp::Max => asm.andpd_reg_reg(dst_r, rhs_r),
+        _ => unreachable!("sse_minmax only accepts min/max operations"),
+    }
     asm.jmp(done);
     asm.bind(lhs_nan);
     asm.movsd_reg_reg(dst_r, rhs_r);
     asm.bind(done);
+}
+
+/// Emits a fused floating min/max diamond while preserving the original
+/// branch's unordered behavior. For a strict comparison, an unordered pair
+/// takes the else arm (the `rhs` value), unlike direct Rust-style min/max,
+/// which ignores a single NaN. Ordered inputs can use the existing NaN-safe
+/// min/max lowering, including its signed-zero tie behavior.
+fn sse_minmax_select(
+    asm: &mut Assembler,
+    loc: &dyn Fn(Value) -> PhysReg,
+    dst: Value,
+    lhs: Value,
+    rhs: Value,
+    op: forge_x64::MinMaxOp,
+) {
+    let (dst_r, lhs_r, rhs_r) = (loc(dst), loc(lhs), loc(rhs));
+    let unordered = asm.new_label();
+    let finish = asm.new_label();
+    asm.ucomisd_reg_reg(lhs_r, rhs_r);
+    asm.jcc(ConditionCode::Parity, unordered);
+    sse_minmax(
+        asm,
+        loc,
+        dst,
+        lhs,
+        rhs,
+        match op {
+            forge_x64::MinMaxOp::Min => SseOp::Min,
+            forge_x64::MinMaxOp::Max => SseOp::Max,
+        },
+    );
+    asm.jmp(finish);
+    asm.bind(unordered);
+    asm.movsd_reg_reg(dst_r, rhs_r);
+    asm.bind(finish);
 }
 
 /// `idiv_reg`'s divisor operand must not itself be Rax/Rdx: `cqo` has already

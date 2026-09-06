@@ -52,6 +52,50 @@ fn f64_inst(x: f64) -> Inst {
     Inst::ConstF64(x.to_bits())
 }
 
+fn forge_min(x: f64, y: f64) -> f64 {
+    if x.is_nan() {
+        return y;
+    }
+    if y.is_nan() {
+        return x;
+    }
+    if x < y {
+        x
+    } else if y < x {
+        y
+    } else if x == 0.0 && y == 0.0 {
+        if x.is_sign_negative() || y.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
+    } else {
+        x
+    }
+}
+
+fn forge_max(x: f64, y: f64) -> f64 {
+    if x.is_nan() {
+        return y;
+    }
+    if y.is_nan() {
+        return x;
+    }
+    if x > y {
+        x
+    } else if y > x {
+        y
+    } else if x == 0.0 && y == 0.0 {
+        if x.is_sign_negative() && y.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
+    } else {
+        x
+    }
+}
+
 fn try_fold(f: &Function, v: Value) -> Option<Inst> {
     match &f.insts[v.0 as usize] {
         Inst::Add(a, b) => match (as_const(f, *a), as_const(f, *b)) {
@@ -129,11 +173,11 @@ fn try_fold(f: &Function, v: Value) -> Option<Inst> {
             _ => None,
         },
         Inst::Min(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(x.min(y))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(forge_min(x, y))),
             _ => None,
         },
         Inst::Max(a, b) => match (as_const(f, *a), as_const(f, *b)) {
-            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(x.max(y))),
+            (Some(ConstVal::F64(x)), Some(ConstVal::F64(y))) => Some(f64_inst(forge_max(x, y))),
             _ => None,
         },
         Inst::Fma { a, b, c } => match (as_const(f, *a), as_const(f, *b), as_const(f, *c)) {

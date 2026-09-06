@@ -769,6 +769,16 @@ impl Assembler {
         self.modrm_reg(dst.encoding(), src.encoding());
     }
 
+    /// `orpd dst, src` -- 66 0F 56 /r. Raw bitwise-OR primitive, used by
+    /// scalar min lowering to normalize an equal signed-zero tie to -0.0.
+    pub fn orpd_reg_reg(&mut self, dst: PhysReg, src: PhysReg) {
+        self.code.push(0x66);
+        self.rex(false, dst.encoding(), 0, src.encoding());
+        self.code.push(0x0F);
+        self.code.push(0x56);
+        self.modrm_reg(dst.encoding(), src.encoding());
+    }
+
     /// `xorpd dst, src` -- 66 0F 57 /r. Same raw-primitive philosophy as
     /// andpd_reg_reg, used to implement float `neg` by flipping the sign
     /// bit against a materialized mask.

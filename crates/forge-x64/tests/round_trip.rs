@@ -973,6 +973,14 @@ fn andpd_reg_reg_encodes_correctly() {
 }
 
 #[test]
+fn orpd_reg_reg_encodes_correctly() {
+    let mut a = Assembler::new();
+    a.orpd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);
+    assert_eq!(a.code(), &[0x66, 0x0F, 0x56, 0xC1]);
+    assert_eq!(disassemble(a.code()), vec!["orpd xmm0,xmm1"]);
+}
+
+#[test]
 fn xorpd_reg_reg_encodes_correctly() {
     let mut a = Assembler::new();
     a.xorpd_reg_reg(PhysReg::Xmm0, PhysReg::Xmm1);

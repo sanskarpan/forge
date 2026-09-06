@@ -218,6 +218,16 @@ pub enum MachineInst {
         lhs: Value,
         rhs: Value,
     },
+    /// Branch-diamond min/max shape with branch semantics for unordered
+    /// operands. This is distinct from a direct `minsd`/`maxsd` operation:
+    /// an unordered comparison takes the else arm, while direct min/max
+    /// ignores a single NaN according to the language contract.
+    FloatMinMaxSelect {
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
+        op: MinMaxOp,
+    },
     FloatRound {
         dst: Value,
         src: Value,
@@ -901,7 +911,12 @@ pub fn select(func: &Function) -> SelectedFunction {
                     lhs,
                     rhs,
                 } => {
-                    sel.insts.push(MachineInst::FloatMin { dst, lhs, rhs });
+                    sel.insts.push(MachineInst::FloatMinMaxSelect {
+                        dst,
+                        lhs,
+                        rhs,
+                        op: MinMaxOp::Min,
+                    });
                 }
                 DiamondFusion::FloatMinMax {
                     dst,
@@ -909,7 +924,12 @@ pub fn select(func: &Function) -> SelectedFunction {
                     lhs,
                     rhs,
                 } => {
-                    sel.insts.push(MachineInst::FloatMax { dst, lhs, rhs });
+                    sel.insts.push(MachineInst::FloatMinMaxSelect {
+                        dst,
+                        lhs,
+                        rhs,
+                        op: MinMaxOp::Max,
+                    });
                 }
                 DiamondFusion::IntCmov {
                     dst,
@@ -1001,7 +1021,8 @@ pub fn compute_coalescing_hints(insts: &[MachineInst]) -> HashMap<Value, Value> 
             | MachineInst::FloatMul { dst, lhs, .. }
             | MachineInst::FloatDiv { dst, lhs, .. }
             | MachineInst::FloatMin { dst, lhs, .. }
-            | MachineInst::FloatMax { dst, lhs, .. } => {
+            | MachineInst::FloatMax { dst, lhs, .. }
+            | MachineInst::FloatMinMaxSelect { dst, lhs, .. } => {
                 hints.insert(*dst, *lhs);
             }
             MachineInst::FloatFma { dst, addend, .. } => {
