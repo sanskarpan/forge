@@ -8,6 +8,8 @@ const [html, app, compiler, packageJson] = await Promise.all([
   read('package.json'),
 ]);
 
+if (!packageJson.includes('"build"')) throw new Error('workbench build script is missing');
+
 for (const marker of ['id="root"', 'src="/src/main.tsx"']) {
   if (!html.includes(marker)) throw new Error(`workbench shell missing ${marker}`);
 }
