@@ -156,6 +156,7 @@ impl CpuFeatures {
 
     pub fn best_width(self, ty: Ty) -> u8 {
         match ty {
+            Ty::F64 if self.avx512f => 8,
             Ty::F64 if self.avx2 => 4,
             Ty::F64 if self.sse2 || self.neon => 2,
             _ => 1,
@@ -208,7 +209,8 @@ pub struct ArrayResult {
     pub values: Vec<f64>,
     pub plan: ArrayPlan,
     /// True only when the typed vector IR and a host ISA implementation
-    /// successfully evaluate all full chunks.
+    /// successfully evaluate the packed chunks, including an AVX-512 masked
+    /// tail when one is present.
     pub used_packed_backend: bool,
 }
 
@@ -239,34 +241,52 @@ fn prepare_array(source: &str, columns: &[&[f64]]) -> Result<(Function, ArrayPla
 
 /// Evaluates a pure expression over one column per free f64 parameter. Full
 /// chunks use the widest safe packed backend for the host when the lowered
-/// function is a straight-line f64 expression; the scalar interpreter remains
-/// the correctness fallback for control flow, libm calls, and operations whose
-/// hardware NaN/rounding behavior does not exactly match the oracle.
+/// function is a straight-line f64 expression. AVX-512 hosts also use a
+/// k-masked packed tail; other widths use the scalar interpreter for a tail.
+/// The scalar interpreter remains the correctness fallback for control flow,
+/// libm calls, and operations whose hardware NaN/rounding behavior does not
+/// exactly match the oracle.
 pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, String> {
     let (function, plan) = prepare_array(source, columns)?;
     let elements = plan.elements;
-    if plan.full_chunks > 0 && plan.width != SimdWidth::Scalar {
+    if plan.width != SimdWidth::Scalar {
         let mut values = Vec::with_capacity(elements);
         let lanes = plan.width.lanes();
         let packed_chunks = (0..plan.full_chunks)
             .map(|chunk| try_evaluate_packed_chunk(&function, columns, chunk * lanes, plan.width))
             .collect::<Option<Vec<_>>>();
         if let Some(chunks) = packed_chunks {
+            let mut used_packed = plan.full_chunks > 0;
             for chunk in chunks {
                 values.extend(chunk);
             }
-            for index in plan.full_chunks * lanes..elements {
-                let args = columns
-                    .iter()
-                    .map(|column| column[index])
-                    .collect::<Vec<_>>();
-                values.push(evaluate_scalar(source, &args)?);
+            if plan.tail > 0 {
+                if let Some(tail) = try_evaluate_packed_tail(
+                    &function,
+                    columns,
+                    plan.full_chunks * lanes,
+                    plan.width,
+                    plan.tail,
+                ) {
+                    values.extend(tail);
+                    used_packed = true;
+                } else {
+                    for index in plan.full_chunks * lanes..elements {
+                        let args = columns
+                            .iter()
+                            .map(|column| column[index])
+                            .collect::<Vec<_>>();
+                        values.push(evaluate_scalar(source, &args)?);
+                    }
+                }
             }
-            return Ok(ArrayResult {
-                values,
-                plan,
-                used_packed_backend: true,
-            });
+            if used_packed && values.len() == elements {
+                return Ok(ArrayResult {
+                    values,
+                    plan,
+                    used_packed_backend: true,
+                });
+            }
         }
     }
 
@@ -292,25 +312,42 @@ pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, S
 /// the scalar interpreter for the complete reduction.
 pub fn reduce_sum(source: &str, columns: &[&[f64]]) -> Result<ReductionResult, String> {
     let (function, plan) = prepare_array(source, columns)?;
-    if plan.full_chunks > 0 && plan.width != SimdWidth::Scalar {
+    if plan.width != SimdWidth::Scalar {
         let lanes = plan.width.lanes();
         let packed_chunks = (0..plan.full_chunks)
             .map(|chunk| try_evaluate_packed_chunk(&function, columns, chunk * lanes, plan.width))
             .collect::<Option<Vec<_>>>();
         if let Some(chunks) = packed_chunks {
-            let mut value = chunks.into_iter().flatten().sum::<f64>();
-            for index in plan.full_chunks * lanes..plan.elements {
-                let args = columns
-                    .iter()
-                    .map(|column| column[index])
-                    .collect::<Vec<_>>();
-                value += evaluate_scalar(source, &args)?;
+            let mut used_packed = plan.full_chunks > 0;
+            let mut values = chunks.into_iter().flatten().collect::<Vec<_>>();
+            if plan.tail > 0 {
+                if let Some(tail) = try_evaluate_packed_tail(
+                    &function,
+                    columns,
+                    plan.full_chunks * lanes,
+                    plan.width,
+                    plan.tail,
+                ) {
+                    values.extend(tail);
+                    used_packed = true;
+                } else {
+                    for index in plan.full_chunks * lanes..plan.elements {
+                        let args = columns
+                            .iter()
+                            .map(|column| column[index])
+                            .collect::<Vec<_>>();
+                        values.push(evaluate_scalar(source, &args)?);
+                    }
+                }
             }
-            return Ok(ReductionResult {
-                value,
-                plan,
-                used_packed_backend: true,
-            });
+            if used_packed && values.len() == plan.elements {
+                let value = values.into_iter().sum::<f64>();
+                return Ok(ReductionResult {
+                    value,
+                    plan,
+                    used_packed_backend: true,
+                });
+            }
         }
     }
 
@@ -337,6 +374,21 @@ trait PackedOps {
     unsafe fn splat(value: f64) -> Self::Vector;
     unsafe fn load(values: *const f64) -> Self::Vector;
     unsafe fn store(value: Self::Vector, values: *mut f64);
+    unsafe fn load_masked(values: *const f64, active: usize) -> Result<Self::Vector, ()> {
+        if active == Self::LANES {
+            Ok(Self::load(values))
+        } else {
+            Err(())
+        }
+    }
+    unsafe fn store_masked(value: Self::Vector, values: *mut f64, active: usize) -> Result<(), ()> {
+        if active == Self::LANES {
+            Self::store(value, values);
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
     unsafe fn add(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
     unsafe fn sub(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
     unsafe fn mul(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
@@ -360,6 +412,18 @@ unsafe fn evaluate_packed<V: PackedOps>(
     columns: &[&[f64]],
     start: usize,
 ) -> Result<Vec<f64>, ()> {
+    evaluate_packed_with_active::<V>(function, columns, start, V::LANES)
+}
+
+unsafe fn evaluate_packed_with_active<V: PackedOps>(
+    function: &Function,
+    columns: &[&[f64]],
+    start: usize,
+    active: usize,
+) -> Result<Vec<f64>, ()> {
+    if active == 0 || active > V::LANES {
+        return Err(());
+    }
     let vector = lower_f64_vector(function, V::LANES as u8).map_err(|_| ())?;
     let mut values = vec![None; function.insts.len()];
     for (value, inst) in vector.insts {
@@ -367,10 +431,10 @@ unsafe fn evaluate_packed<V: PackedOps>(
             VectorInst::SplatF64(bits) => V::splat(f64::from_bits(bits)),
             VectorInst::Param { index } => {
                 let column = columns.get(index as usize).ok_or(())?;
-                if start + V::LANES > column.len() {
+                if start + active > column.len() {
                     return Err(());
                 }
-                V::load(column[start..].as_ptr())
+                V::load_masked(column[start..].as_ptr(), active)?
             }
             VectorInst::Move(value) => get_packed::<V>(&values, value)?,
             VectorInst::Add(lhs, rhs) => V::add(
@@ -410,7 +474,8 @@ unsafe fn evaluate_packed<V: PackedOps>(
     }
     let result = get_packed::<V>(&values, vector.result)?;
     let mut output = vec![0.0; V::LANES];
-    V::store(result, output.as_mut_ptr());
+    V::store_masked(result, output.as_mut_ptr(), active)?;
+    output.truncate(active);
     Ok(output)
 }
 
@@ -420,6 +485,11 @@ fn try_evaluate_packed_chunk(
     start: usize,
     width: SimdWidth,
 ) -> Option<Vec<f64>> {
+    #[cfg(target_arch = "x86_64")]
+    if width == SimdWidth::F64x8 && std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: runtime feature detection proves AVX-512F is available.
+        return unsafe { evaluate_packed::<x86_packed::Avx512>(function, columns, start) }.ok();
+    }
     #[cfg(target_arch = "x86_64")]
     if width == SimdWidth::F64x4 && std::is_x86_feature_detected!("avx2") {
         // SAFETY: runtime feature detection proves AVX2 is available. FMA is
@@ -447,6 +517,28 @@ fn try_evaluate_packed_chunk(
     None
 }
 
+fn try_evaluate_packed_tail(
+    function: &Function,
+    columns: &[&[f64]],
+    start: usize,
+    width: SimdWidth,
+    active: usize,
+) -> Option<Vec<f64>> {
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (function, columns, start, width, active);
+
+    #[cfg(target_arch = "x86_64")]
+    if width == SimdWidth::F64x8 && std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: AVX-512F is runtime-gated and the masked load/store only
+        // accesses the `active` elements that remain in each input column.
+        return unsafe {
+            evaluate_packed_with_active::<x86_packed::Avx512>(function, columns, start, active)
+        }
+        .ok();
+    }
+    None
+}
+
 #[cfg(target_arch = "x86_64")]
 fn function_uses_fma(function: &Function) -> bool {
     function
@@ -458,10 +550,170 @@ fn function_uses_fma(function: &Function) -> bool {
 #[cfg(target_arch = "x86_64")]
 mod x86_packed {
     use super::PackedOps;
+    use std::arch::asm;
     use std::arch::x86_64::*;
 
     pub struct Sse2;
     pub struct Avx2;
+
+    /// AVX-512 implementation using stable inline assembly rather than the
+    /// still-unstable Rust AVX-512 intrinsics. Every operation is reached only
+    /// after `is_x86_feature_detected!("avx512f")` succeeds, and the compiler
+    /// is not asked to generate AVX-512 on the portable code path.
+    pub struct Avx512;
+
+    macro_rules! avx512_binary {
+        ($name:ident, $instruction:literal) => {
+            unsafe fn $name(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+                let mut output = [0.0; 8];
+                asm!(
+                    "vmovupd zmm0, [{lhs}]",
+                    "vmovupd zmm1, [{rhs}]",
+                    concat!($instruction, " zmm0, zmm0, zmm1"),
+                    "vmovupd [{out}], zmm0",
+                    lhs = in(reg) lhs.as_ptr(),
+                    rhs = in(reg) rhs.as_ptr(),
+                    out = in(reg) output.as_mut_ptr(),
+                    out("zmm0") _,
+                    out("zmm1") _,
+                    options(nostack, preserves_flags),
+                );
+                output
+            }
+        };
+    }
+
+    impl PackedOps for Avx512 {
+        type Vector = [f64; 8];
+        const LANES: usize = 8;
+        const HAS_FMA: bool = true;
+
+        unsafe fn splat(value: f64) -> Self::Vector {
+            [value; 8]
+        }
+
+        unsafe fn load(values: *const f64) -> Self::Vector {
+            let mut output = [0.0; 8];
+            asm!(
+                "vmovupd zmm0, [{src}]",
+                "vmovupd [{dst}], zmm0",
+                src = in(reg) values,
+                dst = in(reg) output.as_mut_ptr(),
+                out("zmm0") _,
+                options(nostack, preserves_flags),
+            );
+            output
+        }
+
+        unsafe fn store(value: Self::Vector, values: *mut f64) {
+            asm!(
+                "vmovupd zmm0, [{src}]",
+                "vmovupd [{dst}], zmm0",
+                src = in(reg) value.as_ptr(),
+                dst = in(reg) values,
+                out("zmm0") _,
+                options(nostack, preserves_flags),
+            );
+        }
+
+        unsafe fn load_masked(values: *const f64, active: usize) -> Result<Self::Vector, ()> {
+            if active == 0 || active > Self::LANES {
+                return Err(());
+            }
+            let mut output = [0.0; 8];
+            asm!(
+                "kmovw k1, eax",
+                "vmovupd zmm0 {{k1}}{{z}}, [{src}]",
+                "vmovupd [{dst}], zmm0",
+                src = in(reg) values,
+                dst = in(reg) output.as_mut_ptr(),
+                in("eax") (1u32 << active) - 1,
+                out("zmm0") _,
+                out("k1") _,
+                options(nostack, preserves_flags),
+            );
+            Ok(output)
+        }
+
+        unsafe fn store_masked(
+            value: Self::Vector,
+            values: *mut f64,
+            active: usize,
+        ) -> Result<(), ()> {
+            if active == 0 || active > Self::LANES {
+                return Err(());
+            }
+            asm!(
+                "kmovw k1, eax",
+                "vmovupd zmm0, [{src}]",
+                "vmovupd [{dst}] {{k1}}, zmm0",
+                src = in(reg) value.as_ptr(),
+                dst = in(reg) values,
+                in("eax") (1u32 << active) - 1,
+                out("zmm0") _,
+                out("k1") _,
+                options(nostack, preserves_flags),
+            );
+            Ok(())
+        }
+
+        avx512_binary!(add, "vaddpd");
+        avx512_binary!(sub, "vsubpd");
+        avx512_binary!(mul, "vmulpd");
+        avx512_binary!(div, "vdivpd");
+
+        unsafe fn sqrt(value: Self::Vector) -> Self::Vector {
+            let mut output = [0.0; 8];
+            asm!(
+                "vmovupd zmm0, [{value}]",
+                "vsqrtpd zmm0, zmm0",
+                "vmovupd [{out}], zmm0",
+                value = in(reg) value.as_ptr(),
+                out = in(reg) output.as_mut_ptr(),
+                out("zmm0") _,
+                options(nostack, preserves_flags),
+            );
+            output
+        }
+
+        unsafe fn abs(value: Self::Vector) -> Self::Vector {
+            let mask = [f64::from_bits(0x7fff_ffff_ffff_ffff); 8];
+            let mut output = [0.0; 8];
+            asm!(
+                "vmovupd zmm0, [{value}]",
+                "vmovupd zmm1, [{mask}]",
+                "vandpd zmm0, zmm0, zmm1",
+                "vmovupd [{out}], zmm0",
+                value = in(reg) value.as_ptr(),
+                mask = in(reg) mask.as_ptr(),
+                out = in(reg) output.as_mut_ptr(),
+                out("zmm0") _,
+                out("zmm1") _,
+                options(nostack, preserves_flags),
+            );
+            output
+        }
+
+        unsafe fn fma(lhs: Self::Vector, rhs: Self::Vector, addend: Self::Vector) -> Self::Vector {
+            let mut output = [0.0; 8];
+            asm!(
+                "vmovupd zmm0, [{addend}]",
+                "vmovupd zmm1, [{lhs}]",
+                "vmovupd zmm2, [{rhs}]",
+                "vfmadd231pd zmm0, zmm1, zmm2",
+                "vmovupd [{out}], zmm0",
+                addend = in(reg) addend.as_ptr(),
+                lhs = in(reg) lhs.as_ptr(),
+                rhs = in(reg) rhs.as_ptr(),
+                out = in(reg) output.as_mut_ptr(),
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                options(nostack, preserves_flags),
+            );
+            output
+        }
+    }
 
     macro_rules! impl_x86_ops {
         ($name:ident, $vector:ty, $lanes:expr, $set1:ident, $load:ident, $store:ident,
@@ -646,9 +898,9 @@ mod neon_packed {
 }
 
 /// Selects the widest implementation supported by the current host for the
-/// scalar f64 vector pipeline. The actual packed encoder remains a separate
-/// backend; this function is nevertheless useful to callers and never
-/// claims AVX support on targets where it cannot be queried.
+/// scalar f64 vector pipeline. AVX-512 selection is paired with runtime-gated
+/// inline assembly, so this function never claims an ISA on targets where it
+/// cannot be queried.
 pub fn best_width() -> SimdWidth {
     match CpuFeatures::detect().best_width(Ty::F64) {
         8 => SimdWidth::F64x8,
@@ -704,8 +956,33 @@ mod tests {
         features.avx2 = true;
         assert_eq!(features.best_width(Ty::F64), 4);
         features.avx512f = true;
-        assert_eq!(features.best_width(Ty::F64), 4);
+        assert_eq!(features.best_width(Ty::F64), 8);
         assert_eq!(features.best_width(Ty::I64), 1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_masked_tail_matches_scalar_elements_when_available() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let left = (0..17).map(|value| value as f64 - 8.0).collect::<Vec<_>>();
+        let right = (0..17)
+            .map(|value| value as f64 * 0.25 + 1.0)
+            .collect::<Vec<_>>();
+        let addend = (0..17).map(|value| value as f64 - 2.0).collect::<Vec<_>>();
+        let result = evaluate_array("fma(x, y, z) + abs(x)", &[&left, &right, &addend])
+            .expect("AVX-512 array evaluation");
+
+        let expected = left
+            .iter()
+            .zip(&right)
+            .zip(&addend)
+            .map(|((x, y), z)| x.mul_add(*y, *z) + x.abs())
+            .collect::<Vec<_>>();
+        assert_eq!(result.plan.width, SimdWidth::F64x8);
+        assert_eq!(result.values, expected);
+        assert!(result.used_packed_backend);
     }
 
     #[test]
@@ -727,9 +1004,14 @@ mod tests {
                 .map(|value| value * value + 1.0)
                 .collect::<Vec<_>>();
             assert_eq!(result.values, expected);
+            let avx512_masked_tail = cfg!(target_arch = "x86_64")
+                && result.plan.width == SimdWidth::F64x8
+                && CpuFeatures::detect().avx512f
+                && result.plan.tail > 0;
             assert_eq!(
                 result.used_packed_backend,
-                result.plan.width != SimdWidth::Scalar && result.plan.full_chunks > 0
+                result.plan.width != SimdWidth::Scalar
+                    && (result.plan.full_chunks > 0 || avx512_masked_tail)
             );
             assert_eq!(result.plan.elements, length);
             assert_eq!(
@@ -787,11 +1069,15 @@ mod tests {
             .map(|((left, right), addend)| left.mul_add(*right, *addend))
             .collect::<Vec<_>>();
         assert_eq!(result.values, expected);
+        let avx512_fma = cfg!(target_arch = "x86_64")
+            && result.plan.width == SimdWidth::F64x8
+            && CpuFeatures::detect().avx512f;
         assert_eq!(
             result.used_packed_backend,
-            result.plan.width == SimdWidth::F64x4
+            (result.plan.width == SimdWidth::F64x4
                 && CpuFeatures::detect().avx2
-                && CpuFeatures::detect().fma
+                && CpuFeatures::detect().fma)
+                || avx512_fma
         );
     }
 
