@@ -377,6 +377,7 @@ dependencies = [
  "forge-regalloc",
  "forge-syntax",
  "forge-x64",
+ "proptest",
 ]
 
 [[package]]

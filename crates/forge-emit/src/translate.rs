@@ -426,10 +426,12 @@ enum MaskOp {
 /// mask from the constant pool, then `andpd`/`xorpd` it into `dst`" and
 /// differ only in which bitwise op is used, so `op` picks that.
 ///
-/// The mask is loaded into the first ABI-selected scratch XMM register —
-/// hardcoded rather than resolved via `loc`. The allocator reserves this
-/// register and never assigns it to a live `Value`, making the clobber safe
-/// without a liveness lookup on either supported x86-64 ABI.
+/// The mask is loaded into an ABI-selected scratch XMM register — hardcoded
+/// rather than resolved via `loc`. The allocator reserves this register and
+/// never assigns it to a live `Value`. When the destination itself is spilled,
+/// however, `loc(dst)` maps it to a scratch register too; choose a different
+/// scratch in that case so loading the mask cannot overwrite the value just
+/// reloaded from the source.
 fn float_mask_op(
     asm: &mut Assembler,
     loc: &dyn Fn(Value) -> PhysReg,
@@ -443,7 +445,11 @@ fn float_mask_op(
     if dst_r != src_r {
         asm.movsd_reg_reg(dst_r, src_r);
     }
-    let scratch = forge_regalloc::SCRATCH_XMM[0];
+    let scratch = forge_regalloc::SCRATCH_XMM
+        .iter()
+        .copied()
+        .find(|candidate| *candidate != dst_r && *candidate != src_r)
+        .expect("float mask operation requires a scratch XMM register distinct from operands");
     asm.movsd_reg_riprel(scratch, pool_labels[mask_pool.index()]);
     match op {
         MaskOp::Abs => asm.andpd_reg_reg(dst_r, scratch),
