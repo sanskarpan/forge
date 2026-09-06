@@ -53,7 +53,7 @@ fn run_f64_three(code: &[u8], args: [f64; 3]) -> f64 {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn scalar_minmax_preserves_left_operand_on_equal_signed_zero() {
+fn scalar_minmax_matches_rust_signed_zero_ties() {
     fn emit_minmax(op: fn(Value, Value) -> Inst) -> Vec<u8> {
         let mut b = Builder::new();
         let entry = b.create_block();
@@ -105,13 +105,13 @@ fn scalar_minmax_preserves_left_operand_on_equal_signed_zero() {
             "min",
             Inst::Min as fn(Value, Value) -> Inst,
             [0.0, -0.0],
-            positive_zero,
+            negative_zero,
         ),
         (
             "max",
             Inst::Max as fn(Value, Value) -> Inst,
             [-0.0, 0.0],
-            negative_zero,
+            positive_zero,
         ),
         (
             "max",
