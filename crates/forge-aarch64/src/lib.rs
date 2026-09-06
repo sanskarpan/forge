@@ -538,8 +538,9 @@ pub fn is_native_target() -> bool {
 /// banks. Temporaries use the corresponding register number in their class;
 /// constants are loaded from an aligned literal pool or materialized with
 /// MOVZ/MOVK. Branch edges materialize typed SSA φ values before transfer.
-/// Stack frames, libm calls, and nonvolatile-register allocation remain outside
-/// this deliberately bounded emitter.
+/// Temporaries use caller-saved D16..D31 or X8..X18 registers in their class;
+/// programs beyond these volatile-register budgets are rejected until stack
+/// frames and real spill/reload support are added.
 pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
     if function.blocks.is_empty() {
         return Err("AArch64 emitter requires at least one block".to_string());
@@ -549,6 +550,8 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
     }
 
     let mut registers = HashMap::<Value, Gpr>::new();
+    let mut next_float_temporary = 16u8;
+    let mut next_integer_temporary = 8u8;
     for block in &function.blocks {
         for &value in &block.insts {
             let Some(inst) = function.insts.get(value.0 as usize) else {
@@ -573,16 +576,31 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                     }
                     Gpr::new(ordinal as u8)
                 }
-                _ => {
-                    let index = u8::try_from(value.0)
-                        .ok()
-                        .and_then(|index| index.checked_add(8))
-                        .filter(|index| *index < 31)
-                        .ok_or_else(|| {
-                            "AArch64 emitter ran out of D-register temporaries".to_string()
-                        })?;
-                    Gpr::new(index)
-                }
+                _ => match function.types.get(value.0 as usize) {
+                    Some(Ty::F64) => {
+                        let index = next_float_temporary;
+                        next_float_temporary = next_float_temporary
+                            .checked_add(1)
+                            .filter(|next| *next <= 31)
+                            .ok_or_else(|| {
+                                "AArch64 emitter ran out of caller-saved D-register temporaries"
+                                    .to_string()
+                            })?;
+                        Gpr::new(index)
+                    }
+                    Some(Ty::I64 | Ty::Bool) => {
+                        let index = next_integer_temporary;
+                        next_integer_temporary = next_integer_temporary
+                            .checked_add(1)
+                            .filter(|next| *next <= 18)
+                            .ok_or_else(|| {
+                                "AArch64 emitter ran out of caller-saved X-register temporaries"
+                                    .to_string()
+                            })?;
+                        Gpr::new(index)
+                    }
+                    None => return Err(format!("value {value:?} has no AArch64 IR type")),
+                },
             };
             registers.insert(value, register);
         }
@@ -1087,6 +1105,43 @@ mod tests {
         asm.sub_reg(Gpr::new(8), XZR, Gpr::new(0));
         assert_eq!(asm.words(), &[sub_reg(Gpr::new(8), XZR, Gpr::new(0))]);
         assert_eq!(XZR.index(), 31);
+    }
+
+    #[test]
+    fn scalar_emitter_keeps_floating_temporaries_in_caller_saved_d_registers() {
+        let function = forge_runtime::lower_source("x + x").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words[0], fadd_d(Gpr::new(16), Gpr::new(0), Gpr::new(0)));
+        assert_eq!(words[1], fmov_d(Gpr::new(0), Gpr::new(16)));
+        assert_eq!(words[2], 0xd65f_03c0);
+    }
+
+    #[test]
+    fn mixed_scalar_emitter_keeps_integer_temporaries_in_caller_saved_x_registers() {
+        let function = forge_runtime::lower_source("x + (n & 3)").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words
+            .iter()
+            .any(|word| *word == and_reg(Gpr::new(9), Gpr::new(0), Gpr::new(8))));
+        assert!(words
+            .iter()
+            .any(|word| *word == fadd_d(Gpr::new(17), Gpr::new(0), Gpr::new(16))));
+    }
+
+    #[test]
+    fn scalar_emitter_rejects_more_volatile_temporaries_than_the_abi_budget() {
+        let source = std::iter::repeat_n("x", 18).collect::<Vec<_>>().join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let error = emit_f64(&function).unwrap_err();
+        assert!(error.contains("caller-saved D-register temporaries"));
     }
 
     #[cfg(target_arch = "aarch64")]
