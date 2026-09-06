@@ -280,6 +280,10 @@ impl Assembler {
 pub enum Condition {
     Eq = 0,
     Ne = 1,
+    /// Unsigned lower / carry clear. For `fcmp`, unordered operands set C.
+    Lo = 3,
+    /// Unsigned lower-or-same. For `fcmp`, unordered is C=1,Z=0.
+    Ls = 9,
     Lt = 0xb,
     Ge = 0xa,
     Gt = 0xc,
@@ -1979,6 +1983,9 @@ fn emit_mixed_stack_branch_condition(
             asm.cmp_reg(lhs_int_scratch, rhs_int_scratch);
         }
     }
+    if *lhs_ty == Ty::F64 {
+        return Ok(f64_condition_for_cmp(*op));
+    }
     Ok(match op {
         CmpOp::Eq => Condition::Eq,
         CmpOp::Ne => Condition::Ne,
@@ -2385,14 +2392,23 @@ fn emit_stack_branch_condition(
         }
     }
     asm.fcmp_d(lhs_scratch, rhs_scratch);
-    Ok(match op {
+    Ok(f64_condition_for_cmp(*op))
+}
+
+/// Maps an AArch64 `fcmp` result to an IEEE-ordered source comparison.
+/// `fcmp` represents unordered as NZCV=0011: signed LT/LE would therefore
+/// incorrectly report NaN as less than every number. Unsigned LO/LS reject
+/// unordered for < and <=, while signed GT/GE already reject it because
+/// unordered has N != V.
+fn f64_condition_for_cmp(op: CmpOp) -> Condition {
+    match op {
         CmpOp::Eq => Condition::Eq,
         CmpOp::Ne => Condition::Ne,
-        CmpOp::Lt => Condition::Lt,
-        CmpOp::Le => Condition::Le,
+        CmpOp::Lt => Condition::Lo,
+        CmpOp::Le => Condition::Ls,
         CmpOp::Gt => Condition::Gt,
         CmpOp::Ge => Condition::Ge,
-    })
+    }
 }
 
 fn emit_phi_edge_copies(
@@ -2432,13 +2448,16 @@ fn emit_phi_edge_copies(
 }
 
 fn condition_for_cmp(function: &Function, value: Value) -> Result<Condition, String> {
-    let Inst::Cmp { op, .. } = function
+    let Inst::Cmp { op, lhs, .. } = function
         .insts
         .get(value.0 as usize)
         .ok_or_else(|| format!("missing branch condition {value:?}"))?
     else {
         return Err("AArch64 branches require a direct scalar comparison".to_string());
     };
+    if function.types.get(lhs.0 as usize) == Some(&Ty::F64) {
+        return Ok(f64_condition_for_cmp(*op));
+    }
     Ok(match op {
         CmpOp::Eq => Condition::Eq,
         CmpOp::Ne => Condition::Ne,
