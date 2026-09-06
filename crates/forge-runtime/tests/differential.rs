@@ -109,14 +109,6 @@ fn jit_preserves_special_values_and_signed_zeroes() {
         for input in inputs {
             let expected = interpret_source(source, &[RtValue::F64(input)]).unwrap();
             let actual = evaluate(source, &[input]).unwrap();
-            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-            if source == "if x < 0.0 then abs(x) else x" && input == f64::NEG_INFINITY {
-                let artifacts = forge_runtime::compile_artifacts(source).unwrap();
-                eprintln!(
-                    "windows differential debug: selected={:?} assignment={:?} bytes={:02x?}",
-                    artifacts.selected.insts, artifacts.assignment, artifacts.bytes
-                );
-            }
             assert_same(expected, actual, source, &[input]);
         }
     }
