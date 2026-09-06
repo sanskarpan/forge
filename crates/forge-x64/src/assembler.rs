@@ -1039,7 +1039,8 @@ impl Assembler {
         self.code.push(vex_p2);
         // W=1 selects scalar double precision, inverted vvvv selects src1,
         // L=0, and pp=01 selects 66.
-        self.code.push(0x80 | ((!src1.encoding() & 0x0F) << 3) | 0x01);
+        self.code
+            .push(0x80 | ((!src1.encoding() & 0x0F) << 3) | 0x01);
         self.code.push(0xB9);
         self.modrm_reg(dst.encoding(), src2.encoding());
     }
