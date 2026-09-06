@@ -140,6 +140,18 @@ pub fn translate_inst(
         MachineInst::FloatDiv { dst, lhs, rhs } => {
             sse_binop(asm, loc, SseOp::Div, *dst, *lhs, *rhs)
         }
+        MachineInst::FloatFma {
+            dst,
+            lhs,
+            rhs,
+            addend,
+        } => {
+            let (dst_r, lhs_r, rhs_r, addend_r) = (loc(*dst), loc(*lhs), loc(*rhs), loc(*addend));
+            if dst_r != addend_r {
+                asm.movsd_reg_reg(dst_r, addend_r);
+            }
+            asm.vfmadd231sd(dst_r, lhs_r, rhs_r);
+        }
         MachineInst::FloatMin { dst, lhs, rhs } => {
             sse_minmax(asm, loc, *dst, *lhs, *rhs, SseOp::Min)
         }

@@ -1138,28 +1138,26 @@ fn select_fma_temp_mechanism_is_unaffected_by_the_constant_pool() {
 
     let selected = select(&b.f);
 
-    let mul_tmp = match &selected.insts[3] {
-        MachineInst::FloatMul { dst, lhs, rhs } => {
+    match &selected.insts[3] {
+        MachineInst::FloatFma {
+            dst,
+            lhs,
+            rhs,
+            addend,
+        } => {
+            assert_eq!(*dst, r);
             assert_eq!(*lhs, x);
             assert_eq!(*rhs, y);
-            *dst
+            assert_eq!(*addend, z);
         }
-        other => panic!("expected FloatMul, got {:?}", other),
-    };
-    assert_eq!(
-        selected.insts[4],
-        MachineInst::FloatAdd {
-            dst: r,
-            lhs: mul_tmp,
-            rhs: z
-        }
-    );
-    assert_eq!(selected.synthetic_types.get(&mul_tmp), Some(&Ty::F64));
+        other => panic!("expected FloatFma, got {:?}", other),
+    }
+    assert!(selected.synthetic_types.is_empty());
     assert!(selected.pool.entries().is_empty());
 }
 
 #[test]
-fn select_lowers_fma_as_mul_then_add() {
+fn select_lowers_fma_as_one_scalar_fma() {
     let mut b = Builder::new();
     let entry = b.create_block();
     b.seal_block(entry);
@@ -1195,25 +1193,22 @@ fn select_lowers_fma_as_mul_then_add() {
 
     let selected = select(&b.f);
 
-    // insts[0..3] = the three Params, insts[3] = FloatMul into a
-    // synthetic temp, insts[4] = FloatAdd combining that temp with z.
-    let mul_tmp = match &selected.insts[3] {
-        MachineInst::FloatMul { dst, lhs, rhs } => {
+    // insts[0..3] = the three Params, insts[3] = one three-address FMA.
+    assert_eq!(selected.insts.len(), 5);
+    match &selected.insts[3] {
+        MachineInst::FloatFma {
+            dst,
+            lhs,
+            rhs,
+            addend,
+        } => {
+            assert_eq!(*dst, r);
             assert_eq!(*lhs, x);
             assert_eq!(*rhs, y);
-            *dst
+            assert_eq!(*addend, z);
         }
-        other => panic!("expected FloatMul, got {:?}", other),
-    };
-    assert_eq!(
-        selected.insts[4],
-        MachineInst::FloatAdd {
-            dst: r,
-            lhs: mul_tmp,
-            rhs: z
-        }
-    );
-    assert_eq!(selected.synthetic_types.get(&mul_tmp), Some(&Ty::F64));
+        other => panic!("expected FloatFma, got {:?}", other),
+    }
 }
 
 /// A diamond CFG (entry branches to then/else, both jump to merge,

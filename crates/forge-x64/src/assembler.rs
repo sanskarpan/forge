@@ -1008,6 +1008,43 @@ impl SseOp {
 }
 
 impl Assembler {
+    /// `vfmadd231sd dst, src1, src2` -- VEX.128.66.0F38.W1 B9 /r.
+    /// The 231 form computes `dst = (src1 * src2) + dst` with one rounding,
+    /// so callers place the addend in `dst` before issuing this instruction.
+    /// Scalar FMA3 is emitted only after the runtime has detected FMA support;
+    /// the non-FMA evaluation path remains the verified interpreter.
+    pub fn vfmadd231sd(&mut self, dst: PhysReg, src1: PhysReg, src2: PhysReg) {
+        assert!(
+            dst.encoding() < 16,
+            "VEX scalar destination must be XMM0..XMM15"
+        );
+        assert!(
+            src1.encoding() < 16,
+            "VEX scalar vvvv source must be XMM0..XMM15"
+        );
+        assert!(
+            src2.encoding() < 16,
+            "VEX scalar ModRM source must be XMM0..XMM15"
+        );
+        self.code.push(0xC4);
+        // VEX.R/X/B are inverted; m-mmmm=00010 selects the 0F 38 opcode
+        // map. The three-byte VEX form can encode XMM0..15 through R/B.
+        let mut vex_p2 = 0xE2;
+        if dst.encoding() >= 8 {
+            vex_p2 &= !0x80;
+        }
+        if src2.encoding() >= 8 {
+            vex_p2 &= !0x20;
+        }
+        self.code.push(vex_p2);
+        // W=1 selects scalar double precision, inverted vvvv selects src1,
+        // L=0, and pp=01 selects 66.
+        self.code
+            .push(0x80 | ((!src1.encoding() & 0x0F) << 3) | 0x01);
+        self.code.push(0xB9);
+        self.modrm_reg(dst.encoding(), src2.encoding());
+    }
+
     /// `op dst, src` -- F2 0F <op.opcode()> /r, load direction.
     /// minsd/maxsd are NOT commutative with respect to NaN (matching
     /// CHECKLIST's explicit warning and this project's interpreter's
@@ -1281,6 +1318,42 @@ mod tests {
                 "vfmadd231pd zmm2{k1},zmm1,zmm3",
             ]
         );
+    }
+
+    #[test]
+    fn scalar_fma_register_form_round_trips_through_iced() {
+        use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
+
+        let mut asm = Assembler::new();
+        asm.vfmadd231sd(PhysReg::Xmm4, PhysReg::Xmm2, PhysReg::Xmm3);
+
+        let mut decoder = Decoder::with_ip(64, asm.code(), 0, DecoderOptions::NONE);
+        let mut formatter = NasmFormatter::new();
+        let mut instruction = iced_x86::Instruction::default();
+        let mut text = String::new();
+        decoder.decode_out(&mut instruction);
+        formatter.format(&instruction, &mut text);
+
+        assert_eq!(text, "vfmadd231sd xmm4,xmm2,xmm3");
+        assert!(!decoder.can_decode());
+    }
+
+    #[test]
+    fn scalar_fma_high_register_form_round_trips_through_iced() {
+        use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
+
+        let mut asm = Assembler::new();
+        asm.vfmadd231sd(PhysReg::Xmm12, PhysReg::Xmm2, PhysReg::Xmm11);
+
+        let mut decoder = Decoder::with_ip(64, asm.code(), 0, DecoderOptions::NONE);
+        let mut formatter = NasmFormatter::new();
+        let mut instruction = iced_x86::Instruction::default();
+        decoder.decode_out(&mut instruction);
+        let mut text = String::new();
+        formatter.format(&instruction, &mut text);
+
+        assert_eq!(text, "vfmadd231sd xmm12,xmm2,xmm11");
+        assert!(!decoder.can_decode());
     }
 
     #[test]

@@ -43,6 +43,15 @@ fn run_f64_two(code: &[u8], args: [f64; 2]) -> f64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn run_f64_three(code: &[u8], args: [f64; 3]) -> f64 {
+    let mut buf = forge_mem::ExecutableBuffer::new(code.len().max(64)).unwrap();
+    buf.write(|mem| mem[..code.len()].copy_from_slice(code));
+    buf.make_executable().unwrap();
+    let compiled = forge_mem::CompiledExpr::from_buffer(buf, 3);
+    compiled.call_args(&args)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn scalar_minmax_preserves_left_operand_on_equal_signed_zero() {
     fn emit_minmax(op: fn(Value, Value) -> Inst) -> Vec<u8> {
@@ -118,6 +127,69 @@ fn scalar_minmax_preserves_left_operand_on_equal_signed_zero() {
             "operation={name}, args={args:?}"
         );
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn scalar_fma_executes_with_single_rounding() {
+    let mut b = Builder::new();
+    let entry = b.create_block();
+    b.seal_block(entry);
+    b.f.params = vec![
+        ("a".to_string(), Ty::F64),
+        ("b".to_string(), Ty::F64),
+        ("c".to_string(), Ty::F64),
+    ];
+    let a = b.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let bb = b.emit(
+        entry,
+        Inst::Param {
+            index: 1,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let c = b.emit(
+        entry,
+        Inst::Param {
+            index: 2,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    let result = b.emit(entry, Inst::Fma { a, b: bb, c }, Ty::F64, dummy_span());
+    b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(result));
+
+    let selected = forge_x64::select(&b.f);
+    let assignment: HashMap<Value, Location> = [
+        (a, Location::Reg(PhysReg::Xmm0)),
+        (bb, Location::Reg(PhysReg::Xmm1)),
+        (c, Location::Reg(PhysReg::Xmm2)),
+        (result, Location::Reg(PhysReg::Xmm3)),
+    ]
+    .into_iter()
+    .collect();
+    let code = forge_emit::emit_body(&b.f, &selected, &assignment);
+
+    // (1 + 2^-27) * (1 - 2^-27) - 1 is -2^-54 exactly. Rounding the
+    // product before the subtraction loses that result and produces zero.
+    let a = 1.0 + 2f64.powi(-27);
+    let bb = 1.0 - 2f64.powi(-27);
+    let c = -1.0;
+    let actual = run_f64_three(&code, [a, bb, c]);
+    let expected = a.mul_add(bb, c);
+    assert_eq!(expected.to_bits(), (-2f64.powi(-54)).to_bits());
+    assert_eq!(actual.to_bits(), expected.to_bits());
 }
 
 #[test]
