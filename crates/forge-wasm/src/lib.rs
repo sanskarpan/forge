@@ -102,7 +102,6 @@ pub fn compile_artifact(source: &str) -> Result<WasmArtifact, String> {
     if lets.is_empty() {
         body.push(0);
     } else {
-        body.push(1);
         push_uleb(local_types.len() as u32, &mut body);
         for ty in local_types {
             body.push(1); // one local in each declaration group
