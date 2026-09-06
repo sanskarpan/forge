@@ -1008,6 +1008,34 @@ impl SseOp {
 }
 
 impl Assembler {
+    /// `vfmadd231sd dst, src1, src2` -- VEX.128.F2.0F B9 /r.
+    /// The 231 form computes `dst = (src1 * src2) + dst` with one rounding,
+    /// so callers place the addend in `dst` before issuing this instruction.
+    /// Scalar FMA3 is emitted only after the runtime has detected FMA support;
+    /// the non-FMA evaluation path remains the verified interpreter.
+    pub fn vfmadd231sd(&mut self, dst: PhysReg, src1: PhysReg, src2: PhysReg) {
+        assert!(
+            dst.encoding() < 16,
+            "VEX scalar destination must be XMM0..XMM15"
+        );
+        assert!(
+            src1.encoding() < 16,
+            "VEX scalar vvvv source must be XMM0..XMM15"
+        );
+        assert!(
+            src2.encoding() < 16,
+            "VEX scalar ModRM source must be XMM0..XMM15"
+        );
+        self.code.push(0xC4);
+        // VEX.R/X/B are inverted and all three registers are in the low
+        // range here; m-mmmm=00001 selects the 0F opcode map.
+        self.code.push(0xE1);
+        // W=0, inverted vvvv selects src1, L=0, pp=10 selects F2.
+        self.code.push(((!src1.encoding() & 0x0F) << 3) | 0x02);
+        self.code.push(0xB9);
+        self.modrm_reg(dst.encoding(), src2.encoding());
+    }
+
     /// `op dst, src` -- F2 0F <op.opcode()> /r, load direction.
     /// minsd/maxsd are NOT commutative with respect to NaN (matching
     /// CHECKLIST's explicit warning and this project's interpreter's
