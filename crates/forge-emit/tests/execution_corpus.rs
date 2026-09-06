@@ -21,6 +21,18 @@ fn run_f64(code: &[u8]) -> f64 {
     compiled.call_n(&[])
 }
 
+#[cfg(target_arch = "x86_64")]
+fn run_f64_arg(code: &[u8], arg: f64) -> f64 {
+    let mut buf = forge_mem::ExecutableBuffer::new(code.len().max(64)).unwrap();
+    buf.write(|mem| mem[..code.len()].copy_from_slice(code));
+    buf.make_executable().unwrap();
+    // SAFETY: the emitter's scalar ABI uses one f64 argument in XMM0 and
+    // returns the f64 result in XMM0; the executable mapping stays alive for
+    // the duration of this call.
+    let function: unsafe extern "C" fn(f64) -> f64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+    unsafe { function(arg) }
+}
+
 #[test]
 fn float_neg_flips_sign_bit() {
     let mut b = Builder::new();
@@ -251,4 +263,64 @@ fn spilled_operand_is_reloaded_and_stored_in_a_frame() {
     let lines = disassemble(&code);
     assert!(lines.iter().any(|line| line.starts_with("push rbp")));
     assert!(lines.iter().any(|line| line.starts_with("mov [rbp-8]")));
+}
+
+#[test]
+fn five_hundred_live_values_force_spills_and_preserve_result() {
+    let live_values = 500usize;
+    let mut builder = Builder::new();
+    let entry = builder.create_block();
+    builder.seal_block(entry);
+    let input = builder.emit(
+        entry,
+        Inst::Param {
+            index: 0,
+            ty: Ty::F64,
+        },
+        Ty::F64,
+        dummy_span(),
+    );
+    builder.f.params.push(("x".to_string(), Ty::F64));
+
+    let terms = (0..live_values)
+        .map(|index| {
+            let constant = builder.emit(
+                entry,
+                Inst::ConstF64((index as f64).to_bits()),
+                Ty::F64,
+                dummy_span(),
+            );
+            builder.emit(entry, Inst::Add(input, constant), Ty::F64, dummy_span())
+        })
+        .collect::<Vec<_>>();
+    let result = terms
+        .iter()
+        .copied()
+        .reduce(|lhs, rhs| builder.emit(entry, Inst::Add(lhs, rhs), Ty::F64, dummy_span()))
+        .unwrap();
+    builder.f.blocks[entry.0 as usize].term = Some(Terminator::Return(result));
+
+    forge_ir::verify::verify(&builder.f).unwrap();
+    let selected = forge_x64::select(&builder.f);
+    let intervals = forge_regalloc::build_intervals(&builder.f, &selected);
+    let excluded = forge_regalloc::excluded_registers(&builder.f, &selected);
+    let (assignment, _) = forge_regalloc::allocate(intervals.clone(), &excluded, &selected);
+    forge_regalloc::verify_allocation(&intervals, &assignment).unwrap();
+    let spills = assignment
+        .values()
+        .filter(|location| matches!(location, Location::Spill(_)))
+        .count();
+    assert!(
+        spills > 100,
+        "500 live values should force heavy spilling, observed {spills} spills"
+    );
+
+    let code = forge_emit::emit_body(&builder.f, &selected, &assignment);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let expected = (0..live_values).fold(0.0, |sum, index| sum + 0.25 + index as f64);
+        assert_eq!(run_f64_arg(&code, 0.25).to_bits(), expected.to_bits());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    assert!(!code.is_empty());
 }
