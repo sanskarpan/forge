@@ -24,7 +24,7 @@ implemented lower-level work is absent.
 | AArch64 | Native target capability API plus tested scalar integer/float/conversion/memory/branch/immediate encoder forms; AAPCS64 scalar f64 expression emission includes arithmetic, NaN-compatible min/max, comparisons, CFG branches, typed phi edge copies, aligned literal pools, CLI output, native ARM execution, and Linux ARM64 QEMU coverage; mixed scalar i64/f64/bool parameter banks, integer operations, scalar comparisons, and i64↔f64 conversions are now emitted for f64-result functions, with integer negation using the architectural XZR register; full ABI frames, libm calls, and broader register allocation remain open | `crates/forge-aarch64` |
 | WASM | Tested typed scalar byte emitter for `f64`, `i64`, and bool values, including arithmetic, comparisons, conditionals, lets, min/max, and fma lowering; structured artifact JSON exposes bytes, hex, parameter types, result type, lowered/optimized IR, and CFG; parse/type diagnostics now include source spans and a serialized AST; `benchmark(source, sizes)` exposes portable baseline timings and results; reproducible `wasm-pack --target web --release` plus `wasm-opt -Oz` packaging is CI-validated under the documented gzip-size boundary; native interval/assembly artifacts remain open because this target is stack-machine WASM | `crates/forge-wasm`, `crates/forge-wasm-api`, `.github/workflows/ci-containers.yml`, `containers/Dockerfile.wasm-ci` |
 | Benchmarks | Reusable compiled-expression benchmark helper exists; allocator Criterion benchmark now measures about 42–43 µs for its 1000-value workload, below the 50 µs target on the validation machine | `crates/forge-bench`, `crates/forge-regalloc/benches` |
-| Workbench | Dependency-free browser shell now supports debounced live compilation, structured AST and source diagnostics, execution status, error state, emitted WASM hex, signature metadata, lowered/optimized IR, CFG output, direct compiled-export timing samples, and the portable `benchmark(source, sizes)` baseline API; the full SPEC React workbench remains open | `workbench/`, `Makefile` |
+| Workbench | React/Vite/TypeScript workbench now provides CodeMirror expression editing with syntax highlighting and source-span squiggles, 200 ms debounced compilation, shared Zustand artifact state, D3 AST and dagre CFG views, IR stepper/diff, native interval/assembly panels when supplied, WASM bytes, Recharts benchmark samples, tier labels, and x86-64/AArch64/WASM plus scalar/array selectors; the browser API currently exposes real WASM artifacts only, so native target panels report an explicit unavailable state rather than fabricating data | `workbench/`, `crates/forge-wasm-api`, `containers/Dockerfile.workbench` |
 | Windows executable memory | Implemented `VirtualAlloc`/`VirtualProtect`/`FlushInstructionCache`/`VirtualFree` backend; Win64 register/stack parameters, shadow space, caller-preserved scratch, live-value preservation across libm, and native `windows-latest` workspace/clippy/rustfmt coverage are implemented; mixed signatures, nonvolatile-register allocation, and broader external-ABI coverage remain open | `crates/forge-mem`, `crates/forge-emit`, `crates/forge-runtime`, `.github/workflows/ci.yml` |
 
 The remaining open rows are intentional scope boundaries, not silent stubs.
@@ -51,6 +51,12 @@ The remaining open rows are intentional scope boundaries, not silent stubs.
 - PR #154 adds AArch64 scalar min/max emission with interpreter-compatible NaN
   behavior and fixes integer negation to use XZR; the feature PR and PR #156
   promotion pass the complete matrix.
+- PR #162 implements the React/Vite Workbench against the real
+  `forge-wasm-api` artifact boundary, including CodeMirror editing, AST/IR/CFG
+  visualization, benchmark charting, and explicit native-target availability
+  states; its Workbench production build and full feature matrix pass.
+- PR #164 promotes the Workbench to `main`. The Workbench container now runs
+  `npm ci`, the smoke test, and the production Vite build in CI.
 - The historical phase checkboxes below remain design-history markers. Open
   scope is tracked explicitly in the table above and in each phase’s notes;
   this section must not be read as claiming completion of vector IR/AVX-512,
