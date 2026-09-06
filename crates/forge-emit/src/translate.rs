@@ -158,6 +158,9 @@ pub fn translate_inst(
         MachineInst::FloatMax { dst, lhs, rhs } => {
             sse_minmax(asm, loc, *dst, *lhs, *rhs, SseOp::Max)
         }
+        MachineInst::FloatMinMaxSelect { dst, lhs, rhs, op } => {
+            sse_minmax_select(asm, loc, *dst, *lhs, *rhs, *op)
+        }
 
         MachineInst::FloatSqrt { dst, src } => {
             let (dst_r, src_r) = (loc(*dst), loc(*src));
@@ -326,6 +329,42 @@ fn sse_minmax(
     asm.bind(lhs_nan);
     asm.movsd_reg_reg(dst_r, rhs_r);
     asm.bind(done);
+}
+
+/// Emits a fused floating min/max diamond while preserving the original
+/// branch's unordered behavior. For a strict comparison, an unordered pair
+/// takes the else arm (the `rhs` value), unlike direct Rust-style min/max,
+/// which ignores a single NaN. Ordered inputs can use the existing NaN-safe
+/// min/max lowering, including its signed-zero tie behavior.
+fn sse_minmax_select(
+    asm: &mut Assembler,
+    loc: &dyn Fn(Value) -> PhysReg,
+    dst: Value,
+    lhs: Value,
+    rhs: Value,
+    op: forge_x64::MinMaxOp,
+) {
+    let (dst_r, lhs_r, rhs_r) = (loc(dst), loc(lhs), loc(rhs));
+    if dst_r != lhs_r {
+        asm.movsd_reg_reg(dst_r, lhs_r);
+    }
+    let unordered = asm.new_label();
+    asm.ucomisd_reg_reg(lhs_r, rhs_r);
+    asm.jcc(ConditionCode::Parity, unordered);
+    sse_minmax(
+        asm,
+        loc,
+        dst,
+        lhs,
+        rhs,
+        match op {
+            forge_x64::MinMaxOp::Min => SseOp::Min,
+            forge_x64::MinMaxOp::Max => SseOp::Max,
+        },
+    );
+    asm.jmp(unordered);
+    asm.bind(unordered);
+    asm.movsd_reg_reg(dst_r, rhs_r);
 }
 
 /// `idiv_reg`'s divisor operand must not itself be Rax/Rdx: `cqo` has already
