@@ -16,6 +16,8 @@ pub enum VectorInst {
     Sub(Value, Value),
     Mul(Value, Value),
     Div(Value, Value),
+    Min(Value, Value),
+    Max(Value, Value),
     Neg(Value),
     Sqrt(Value),
     Abs(Value),
@@ -81,6 +83,8 @@ pub fn lower_f64_vector(function: &Function, lanes: u8) -> Result<VectorFunction
             Inst::Sub(lhs, rhs) => VectorInst::Sub(*lhs, *rhs),
             Inst::Mul(lhs, rhs) => VectorInst::Mul(*lhs, *rhs),
             Inst::Div(lhs, rhs) => VectorInst::Div(*lhs, *rhs),
+            Inst::Min(lhs, rhs) => VectorInst::Min(*lhs, *rhs),
+            Inst::Max(lhs, rhs) => VectorInst::Max(*lhs, *rhs),
             Inst::Neg(operand) => VectorInst::Neg(*operand),
             Inst::Sqrt(operand) => VectorInst::Sqrt(*operand),
             Inst::Abs(operand) => VectorInst::Abs(*operand),
@@ -393,6 +397,8 @@ trait PackedOps {
     unsafe fn sub(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
     unsafe fn mul(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
     unsafe fn div(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
+    unsafe fn min(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
+    unsafe fn max(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
     unsafe fn sqrt(value: Self::Vector) -> Self::Vector;
     unsafe fn abs(value: Self::Vector) -> Self::Vector;
     unsafe fn fma(lhs: Self::Vector, rhs: Self::Vector, addend: Self::Vector) -> Self::Vector {
@@ -450,6 +456,14 @@ unsafe fn evaluate_packed_with_active<V: PackedOps>(
                 get_packed::<V>(&values, rhs)?,
             ),
             VectorInst::Div(lhs, rhs) => V::div(
+                get_packed::<V>(&values, lhs)?,
+                get_packed::<V>(&values, rhs)?,
+            ),
+            VectorInst::Min(lhs, rhs) => V::min(
+                get_packed::<V>(&values, lhs)?,
+                get_packed::<V>(&values, rhs)?,
+            ),
+            VectorInst::Max(lhs, rhs) => V::max(
                 get_packed::<V>(&values, lhs)?,
                 get_packed::<V>(&values, rhs)?,
             ),
@@ -562,6 +576,44 @@ mod x86_packed {
     /// is not asked to generate AVX-512 on the portable code path.
     pub struct Avx512;
 
+    #[inline]
+    fn forge_min_scalar(lhs: f64, rhs: f64) -> f64 {
+        if lhs.is_nan() || rhs.is_nan() {
+            if lhs.is_nan() {
+                rhs
+            } else {
+                lhs
+            }
+        } else if lhs < rhs {
+            lhs
+        } else if rhs < lhs {
+            rhs
+        } else if lhs == 0.0 && rhs == 0.0 {
+            f64::from_bits(lhs.to_bits() | rhs.to_bits())
+        } else {
+            lhs
+        }
+    }
+
+    #[inline]
+    fn forge_max_scalar(lhs: f64, rhs: f64) -> f64 {
+        if lhs.is_nan() || rhs.is_nan() {
+            if lhs.is_nan() {
+                rhs
+            } else {
+                lhs
+            }
+        } else if lhs > rhs {
+            lhs
+        } else if rhs > lhs {
+            rhs
+        } else if lhs == 0.0 && rhs == 0.0 {
+            f64::from_bits(lhs.to_bits() & rhs.to_bits())
+        } else {
+            lhs
+        }
+    }
+
     macro_rules! avx512_binary {
         ($name:ident, $instruction:literal) => {
             unsafe fn $name(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
@@ -662,6 +714,17 @@ mod x86_packed {
         avx512_binary!(mul, "vmulpd");
         avx512_binary!(div, "vdivpd");
 
+        // AVX-512F is reached through stable inline assembly for arithmetic,
+        // but exact Forge min/max semantics are intentionally kept in the
+        // scalar lane helper: hardware min/max differs for NaNs and zeros.
+        unsafe fn min(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            std::array::from_fn(|lane| forge_min_scalar(lhs[lane], rhs[lane]))
+        }
+
+        unsafe fn max(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            std::array::from_fn(|lane| forge_max_scalar(lhs[lane], rhs[lane]))
+        }
+
         unsafe fn sqrt(value: Self::Vector) -> Self::Vector {
             let mut output = [0.0; 8];
             asm!(
@@ -715,10 +778,70 @@ mod x86_packed {
         }
     }
 
+    macro_rules! exact_x86_minmax {
+        ($lhs:expr, $rhs:expr, $is_max:expr, $cmp:ident, $and:ident, $andnot:ident,
+         $or:ident, $setzero:ident, $cast_si:ident, $cast_pd:ident, $and_si:ident,
+         $andnot_si:ident, $or_si:ident, $set1_epi64x:ident) => {{
+            let lhs_nan = $cmp($lhs, $lhs, _CMP_UNORD_Q);
+            let rhs_nan = $cmp($rhs, $rhs, _CMP_UNORD_Q);
+            let lt = $cmp($lhs, $rhs, _CMP_LT_OQ);
+            let gt = $cmp($lhs, $rhs, _CMP_GT_OQ);
+            let ordered = if $is_max {
+                $or(
+                    $and(gt, $lhs),
+                    $andnot(gt, $or($and(lt, $rhs), $andnot(lt, $lhs))),
+                )
+            } else {
+                $or(
+                    $and(lt, $lhs),
+                    $andnot(lt, $or($and(gt, $rhs), $andnot(gt, $lhs))),
+                )
+            };
+            // When both inputs are NaN the interpreter returns the RHS. The
+            // second selection therefore applies only to a RHS-only NaN.
+            let result = $or(
+                $and(lhs_nan, $rhs),
+                $andnot(
+                    lhs_nan,
+                    $or(
+                        $and($andnot(lhs_nan, rhs_nan), $lhs),
+                        $andnot($andnot(lhs_nan, rhs_nan), ordered),
+                    ),
+                ),
+            );
+
+            let abs_mask = $set1_epi64x(0x7fff_ffff_ffff_ffffu64 as i64);
+            let zero = $setzero();
+            let lhs_zero = $cmp(
+                $cast_pd($and_si($cast_si($lhs), abs_mask)),
+                zero,
+                _CMP_EQ_OQ,
+            );
+            let rhs_zero = $cmp(
+                $cast_pd($and_si($cast_si($rhs), abs_mask)),
+                zero,
+                _CMP_EQ_OQ,
+            );
+            let both_zero = $and(lhs_zero, rhs_zero);
+            let sign = if $is_max {
+                $and_si($cast_si($lhs), $cast_si($rhs))
+            } else {
+                $or_si($cast_si($lhs), $cast_si($rhs))
+            };
+            let signed_zero = $cast_pd($or_si(
+                $andnot_si(abs_mask, $cast_si(result)),
+                $and_si(sign, abs_mask),
+            ));
+            $or($and(both_zero, signed_zero), $andnot(both_zero, result))
+        }};
+    }
+
     macro_rules! impl_x86_ops {
         ($name:ident, $vector:ty, $lanes:expr, $set1:ident, $load:ident, $store:ident,
          $add:ident, $sub:ident, $mul:ident, $div:ident, $sqrt:ident, $and:ident,
-         $mask:expr, $feature:literal) => {
+         $cmp:ident, $andnot:ident, $or:ident, $setzero:ident, $cast_si:ident,
+         $cast_pd:ident, $and_si:ident, $andnot_si:ident, $or_si:ident,
+         $set1_epi64x:ident, $mask:expr, $feature:literal) => {
             impl PackedOps for $name {
                 type Vector = $vector;
                 const LANES: usize = $lanes;
@@ -753,6 +876,44 @@ mod x86_packed {
                     $div(lhs, rhs)
                 }
                 #[target_feature(enable = $feature)]
+                unsafe fn min(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+                    exact_x86_minmax!(
+                        lhs,
+                        rhs,
+                        false,
+                        $cmp,
+                        $and,
+                        $andnot,
+                        $or,
+                        $setzero,
+                        $cast_si,
+                        $cast_pd,
+                        $and_si,
+                        $andnot_si,
+                        $or_si,
+                        $set1_epi64x
+                    )
+                }
+                #[target_feature(enable = $feature)]
+                unsafe fn max(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+                    exact_x86_minmax!(
+                        lhs,
+                        rhs,
+                        true,
+                        $cmp,
+                        $and,
+                        $andnot,
+                        $or,
+                        $setzero,
+                        $cast_si,
+                        $cast_pd,
+                        $and_si,
+                        $andnot_si,
+                        $or_si,
+                        $set1_epi64x
+                    )
+                }
+                #[target_feature(enable = $feature)]
                 unsafe fn sqrt(value: Self::Vector) -> Self::Vector {
                     $sqrt(value)
                 }
@@ -785,6 +946,16 @@ mod x86_packed {
         _mm_div_pd,
         _mm_sqrt_pd,
         _mm_and_pd,
+        _mm_cmp_pd,
+        _mm_andnot_pd,
+        _mm_or_pd,
+        _mm_setzero_pd,
+        _mm_castpd_si128,
+        _mm_castsi128_pd,
+        _mm_and_si128,
+        _mm_andnot_si128,
+        _mm_or_si128,
+        _mm_set1_epi64x,
         _mm_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)),
         "sse2"
     );
@@ -802,6 +973,16 @@ mod x86_packed {
         _mm256_div_pd,
         _mm256_sqrt_pd,
         _mm256_and_pd,
+        _mm256_cmp_pd,
+        _mm256_andnot_pd,
+        _mm256_or_pd,
+        _mm256_setzero_pd,
+        _mm256_castpd_si256,
+        _mm256_castsi256_pd,
+        _mm256_and_si256,
+        _mm256_andnot_si256,
+        _mm256_or_si256,
+        _mm256_set1_epi64x,
         _mm256_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)),
         "avx2"
     );
@@ -842,6 +1023,44 @@ mod x86_packed {
             _mm256_div_pd(lhs, rhs)
         }
         #[target_feature(enable = "avx2")]
+        unsafe fn min(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            exact_x86_minmax!(
+                lhs,
+                rhs,
+                false,
+                _mm256_cmp_pd,
+                _mm256_and_pd,
+                _mm256_andnot_pd,
+                _mm256_or_pd,
+                _mm256_setzero_pd,
+                _mm256_castpd_si256,
+                _mm256_castsi256_pd,
+                _mm256_and_si256,
+                _mm256_andnot_si256,
+                _mm256_or_si256,
+                _mm256_set1_epi64x
+            )
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn max(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            exact_x86_minmax!(
+                lhs,
+                rhs,
+                true,
+                _mm256_cmp_pd,
+                _mm256_and_pd,
+                _mm256_andnot_pd,
+                _mm256_or_pd,
+                _mm256_setzero_pd,
+                _mm256_castpd_si256,
+                _mm256_castsi256_pd,
+                _mm256_and_si256,
+                _mm256_andnot_si256,
+                _mm256_or_si256,
+                _mm256_set1_epi64x
+            )
+        }
+        #[target_feature(enable = "avx2")]
         unsafe fn sqrt(value: Self::Vector) -> Self::Vector {
             _mm256_sqrt_pd(value)
         }
@@ -860,6 +1079,50 @@ mod x86_packed {
 mod neon_packed {
     use super::PackedOps;
     use std::arch::aarch64::*;
+
+    #[inline]
+    unsafe fn select(mask: uint64x2_t, yes: float64x2_t, no: float64x2_t) -> float64x2_t {
+        vbslq_f64(mask, yes, no)
+    }
+
+    unsafe fn exact_minmax(lhs: float64x2_t, rhs: float64x2_t, is_max: bool) -> float64x2_t {
+        let all_ones = vdupq_n_u64(u64::MAX);
+        let lhs_nan = veorq_u64(vceqq_f64(lhs, lhs), all_ones);
+        let rhs_nan = veorq_u64(vceqq_f64(rhs, rhs), all_ones);
+        let lt = vcltq_f64(lhs, rhs);
+        let gt = vcgtq_f64(lhs, rhs);
+        let ordered = if is_max {
+            select(gt, lhs, select(lt, rhs, lhs))
+        } else {
+            select(lt, lhs, select(gt, rhs, lhs))
+        };
+        let rhs_only_nan = vandq_u64(veorq_u64(lhs_nan, all_ones), rhs_nan);
+        let result = select(lhs_nan, rhs, select(rhs_only_nan, lhs, ordered));
+
+        let abs_mask = vdupq_n_u64(0x7fff_ffff_ffff_ffff);
+        let both_zero = vandq_u64(
+            vceqq_f64(
+                vreinterpretq_f64_u64(vandq_u64(vreinterpretq_u64_f64(lhs), abs_mask)),
+                vdupq_n_f64(0.0),
+            ),
+            vceqq_f64(
+                vreinterpretq_f64_u64(vandq_u64(vreinterpretq_u64_f64(rhs), abs_mask)),
+                vdupq_n_f64(0.0),
+            ),
+        );
+        let lhs_bits = vreinterpretq_u64_f64(lhs);
+        let rhs_bits = vreinterpretq_u64_f64(rhs);
+        let sign = if is_max {
+            vandq_u64(lhs_bits, rhs_bits)
+        } else {
+            vorrq_u64(lhs_bits, rhs_bits)
+        };
+        let signed_zero = vreinterpretq_f64_u64(vorrq_u64(
+            vandq_u64(veorq_u64(abs_mask, all_ones), vreinterpretq_u64_f64(result)),
+            vandq_u64(sign, abs_mask),
+        ));
+        select(both_zero, signed_zero, result)
+    }
 
     pub struct Neon;
 
@@ -887,6 +1150,12 @@ mod neon_packed {
         }
         unsafe fn div(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
             vdivq_f64(lhs, rhs)
+        }
+        unsafe fn min(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            exact_minmax(lhs, rhs, false)
+        }
+        unsafe fn max(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            exact_minmax(lhs, rhs, true)
         }
         unsafe fn sqrt(value: Self::Vector) -> Self::Vector {
             vsqrtq_f64(value)
@@ -1098,6 +1367,82 @@ mod tests {
             .insts
             .iter()
             .any(|(_, inst)| matches!(inst, VectorInst::Sqrt(_))));
+    }
+
+    #[test]
+    fn packed_min_max_match_forge_bits_for_ieee_edges_and_all_tail_lengths() {
+        let special = [
+            1.0,
+            -2.0,
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+        ];
+        let left = (0..100)
+            .map(|index| special[index % special.len()])
+            .collect::<Vec<_>>();
+        let right = (0..100)
+            .map(|index| special[(index * 3 + 1) % special.len()])
+            .collect::<Vec<_>>();
+
+        let forge_min = |lhs: f64, rhs: f64| {
+            if lhs.is_nan() || rhs.is_nan() {
+                if lhs.is_nan() {
+                    rhs
+                } else {
+                    lhs
+                }
+            } else if lhs < rhs {
+                lhs
+            } else if rhs < lhs {
+                rhs
+            } else if lhs == 0.0 && rhs == 0.0 {
+                f64::from_bits(lhs.to_bits() | rhs.to_bits())
+            } else {
+                lhs
+            }
+        };
+        let forge_max = |lhs: f64, rhs: f64| {
+            if lhs.is_nan() || rhs.is_nan() {
+                if lhs.is_nan() {
+                    rhs
+                } else {
+                    lhs
+                }
+            } else if lhs > rhs {
+                lhs
+            } else if rhs > lhs {
+                rhs
+            } else if lhs == 0.0 && rhs == 0.0 {
+                f64::from_bits(lhs.to_bits() & rhs.to_bits())
+            } else {
+                lhs
+            }
+        };
+
+        for length in 1..=100 {
+            let min_result = evaluate_array("min(x, y)", &[&left[..length], &right[..length]])
+                .expect("packed min evaluation");
+            let max_result = evaluate_array("max(x, y)", &[&left[..length], &right[..length]])
+                .expect("packed max evaluation");
+            for index in 0..length {
+                assert_eq!(
+                    min_result.values[index].to_bits(),
+                    forge_min(left[index], right[index]).to_bits(),
+                    "min mismatch at length {length}, index {index}"
+                );
+                assert_eq!(
+                    max_result.values[index].to_bits(),
+                    forge_max(left[index], right[index]).to_bits(),
+                    "max mismatch at length {length}, index {index}"
+                );
+            }
+        }
     }
 
     #[test]
