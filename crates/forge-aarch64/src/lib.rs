@@ -209,6 +209,28 @@ impl Assembler {
         self.words.push(str_(src, base, offset_bytes));
     }
 
+    /// Emits a pre-indexed `stp Xt, Xt2, [Xn, #-16]!` frame-record save.
+    pub fn stp_pre(&mut self, first: Gpr, second: Gpr, base: Gpr, offset_bytes: i16) {
+        self.words.push(stp_pre(first, second, base, offset_bytes));
+    }
+
+    /// Emits a post-indexed `ldp Xt, Xt2, [Xn], #16` frame-record restore.
+    pub fn ldp_post(&mut self, first: Gpr, second: Gpr, base: Gpr, offset_bytes: i16) {
+        self.words.push(ldp_post(first, second, base, offset_bytes));
+    }
+
+    /// Emits a pre-indexed SIMD/floating-point pair save.
+    pub fn stp_d_pre(&mut self, first: Gpr, second: Gpr, base: Gpr, offset_bytes: i16) {
+        self.words
+            .push(stp_d_pre(first, second, base, offset_bytes));
+    }
+
+    /// Emits a post-indexed SIMD/floating-point pair restore.
+    pub fn ldp_d_post(&mut self, first: Gpr, second: Gpr, base: Gpr, offset_bytes: i16) {
+        self.words
+            .push(ldp_d_post(first, second, base, offset_bytes));
+    }
+
     /// Emits `ldr Dd, [Xn, #offset]` for an unsigned, eight-byte-scaled
     /// scalar-double stack slot.
     pub fn ldr_d(&mut self, dst: Gpr, base: Gpr, offset_bytes: u16) {
@@ -532,6 +554,36 @@ pub fn str_(src: Gpr, base: Gpr, offset_bytes: u16) -> u32 {
         | u32::from(src.index())
 }
 
+fn encode_pair(base: u32, first: Gpr, second: Gpr, address: Gpr, offset_bytes: i16) -> u32 {
+    assert!(offset_bytes % 8 == 0);
+    assert!((-512..=504).contains(&offset_bytes));
+    let immediate = u32::from((offset_bytes / 8) as i8 as u8) & 0x7f;
+    base | (immediate << 15)
+        | (u32::from(second.index()) << 10)
+        | (u32::from(address.index()) << 5)
+        | u32::from(first.index())
+}
+
+/// Encodes a pre-indexed 64-bit GPR pair save, including the writeback.
+pub fn stp_pre(first: Gpr, second: Gpr, base: Gpr, offset_bytes: i16) -> u32 {
+    encode_pair(0xa980_0000, first, second, base, offset_bytes)
+}
+
+/// Encodes a post-indexed 64-bit GPR pair restore, including the writeback.
+pub fn ldp_post(first: Gpr, second: Gpr, base: Gpr, offset_bytes: i16) -> u32 {
+    encode_pair(0xa8c0_0000, first, second, base, offset_bytes)
+}
+
+/// Encodes a pre-indexed 64-bit SIMD/floating-point pair save.
+pub fn stp_d_pre(first: Gpr, second: Gpr, base: Gpr, offset_bytes: i16) -> u32 {
+    encode_pair(0x6d80_0000, first, second, base, offset_bytes)
+}
+
+/// Encodes a post-indexed 64-bit SIMD/floating-point pair restore.
+pub fn ldp_d_post(first: Gpr, second: Gpr, base: Gpr, offset_bytes: i16) -> u32 {
+    encode_pair(0x6cc0_0000, first, second, base, offset_bytes)
+}
+
 pub fn ldr_d(dst: Gpr, base: Gpr, offset_bytes: u16) -> u32 {
     assert!(offset_bytes.is_multiple_of(8) && offset_bytes / 8 < 4096);
     0xfd40_0000
@@ -721,6 +773,40 @@ fn aarch64_has_stack_params(params: &[(String, Ty)]) -> bool {
         .any(|(index, (_, _))| stack_param_ordinal(params, index).is_some())
 }
 
+const AAPCS64_FRAME_RECORD_BYTES: u16 = 16;
+
+/// Establishes the conventional AAPCS64 frame record before the backend's
+/// SP-relative local area. Leaf functions with no local area remain frameless;
+/// every generated spill/call frame has `x29`/`x30` saved as a pair and keeps
+/// the stack 16-byte aligned.
+fn emit_standard_prologue(asm: &mut Assembler, local_bytes: u16) {
+    if local_bytes != 0 {
+        asm.stp_pre(
+            Gpr::new(29),
+            Gpr::new(30),
+            SP,
+            -(AAPCS64_FRAME_RECORD_BYTES as i16),
+        );
+        asm.sub_imm(SP, SP, local_bytes, false);
+    }
+}
+
+/// Tears down the local area and restores the conventional AAPCS64 frame
+/// record. The caller must have restored any additional callee-saved values
+/// stored in the local area before invoking this helper.
+fn emit_standard_epilogue(asm: &mut Assembler, local_bytes: u16) {
+    if local_bytes != 0 {
+        asm.add_imm(SP, SP, local_bytes, false);
+        asm.ldp_post(
+            Gpr::new(29),
+            Gpr::new(30),
+            SP,
+            AAPCS64_FRAME_RECORD_BYTES as i16,
+        );
+    }
+    asm.ret();
+}
+
 /// Emits a complete AAPCS64 scalar function with an f64 result for the
 /// supported IR subset. Floating parameters use D0..D7 and integer/bool
 /// parameters use X0..X7, as required by the independent AAPCS64 argument
@@ -729,7 +815,8 @@ fn aarch64_has_stack_params(params: &[(String, Ty)]) -> bool {
 /// MOVZ/MOVK. Branch edges materialize typed SSA φ values before transfer.
 /// Temporaries use caller-saved D16..D31 or X8..X18 registers first. If those
 /// are exhausted, the emitter allocates D8..D15 or X19..X28 and preserves the
-/// selected callee-saved registers in a 16-byte-aligned stack frame.
+/// selected callee-saved registers in a 16-byte-aligned stack frame with the
+/// conventional AAPCS64 x29/x30 frame record.
 pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
     if function.types.last() != Some(&Ty::F64) {
         return Err("AArch64 emitter requires an f64 result".to_string());
@@ -977,8 +1064,8 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
     let frame_bytes = u16::try_from((usize::from(next_slot) + 15) & !15)
         .map_err(|_| "AArch64 stack frame is too large".to_string())?;
 
+    emit_standard_prologue(&mut asm, frame_bytes);
     if frame_bytes != 0 {
-        asm.sub_imm(SP, SP, frame_bytes, false);
         for &(register, offset) in &saved_float_slots {
             asm.str_d(register, SP, offset);
         }
@@ -1173,9 +1260,8 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
                     for &(register, offset) in saved_float_slots.iter().rev() {
                         asm.ldr_d(register, SP, offset);
                     }
-                    asm.add_imm(SP, SP, frame_bytes, false);
                 }
-                asm.ret();
+                emit_standard_epilogue(&mut asm, frame_bytes);
             }
             Some(Terminator::Jump(target)) => {
                 let target = target.0 as usize;
@@ -1333,7 +1419,7 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
     let scratch_a = Gpr::new_d(29);
     let scratch_b = Gpr::new_d(30);
     let scratch_c = Gpr::new_d(31);
-    asm.sub_imm(SP, SP, frame_bytes, false);
+    emit_standard_prologue(&mut asm, frame_bytes);
     if contains_call {
         asm.str(Gpr::new(30), SP, 0);
         for block in &function.blocks {
@@ -1531,8 +1617,7 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
                 if contains_call {
                     asm.ldr(Gpr::new(30), SP, 0);
                 }
-                asm.add_imm(SP, SP, frame_bytes, false);
-                asm.ret();
+                emit_standard_epilogue(&mut asm, frame_bytes);
             }
             Some(Terminator::Jump(target)) => {
                 let target = target.0 as usize;
@@ -1709,7 +1794,7 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
     let int_c = Gpr::new(30);
     let float_a = Gpr::new_d(29);
     let float_b = Gpr::new_d(30);
-    asm.sub_imm(SP, SP, frame_bytes, false);
+    emit_standard_prologue(&mut asm, frame_bytes);
     for (register, offset) in [(int_a, 0), (int_b, 8), (int_c, 16)] {
         asm.str(register, SP, offset);
     }
@@ -1725,7 +1810,9 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                 let ordinal = aarch64_param_bank_ordinal(&function.params, index as usize, ty);
                 let source_offset =
                     if let Some(&incoming_offset) = incoming_stack_offsets.get(&value) {
-                        let source_offset = usize::from(frame_bytes) + usize::from(incoming_offset);
+                        let source_offset = usize::from(frame_bytes)
+                            + usize::from(AAPCS64_FRAME_RECORD_BYTES)
+                            + usize::from(incoming_offset);
                         u16::try_from(source_offset).map_err(|_| {
                             "AArch64 incoming stack parameter offset is out of range".to_string()
                         })?
@@ -2059,8 +2146,7 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                 if matches!(result_ty, Ty::I64 | Ty::Bool) {
                     asm.orr_reg(Gpr::new(0), XZR, Gpr::new(16));
                 }
-                asm.add_imm(SP, SP, frame_bytes, false);
-                asm.ret();
+                emit_standard_epilogue(&mut asm, frame_bytes);
             }
             Some(Terminator::Jump(target)) => {
                 let target = target.0 as usize;
@@ -2408,8 +2494,8 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
     }
     let frame_bytes = u16::try_from((saved_slots.len() * 8 + 15) & !15)
         .map_err(|_| "AArch64 i64 stack frame is too large".to_string())?;
+    emit_standard_prologue(&mut asm, frame_bytes);
     if frame_bytes != 0 {
-        asm.sub_imm(SP, SP, frame_bytes, false);
         for &(register, offset) in &saved_slots {
             asm.str(register, SP, offset);
         }
@@ -2454,9 +2540,8 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
         for &(register, offset) in saved_slots.iter().rev() {
             asm.ldr(register, SP, offset);
         }
-        asm.add_imm(SP, SP, frame_bytes, false);
     }
-    asm.ret();
+    emit_standard_epilogue(&mut asm, frame_bytes);
     Ok(asm.bytes())
 }
 
@@ -2520,7 +2605,7 @@ fn emit_i64_with_stack_spills(function: &Function, result: Value) -> Result<Vec<
             .ok_or_else(|| format!("missing AArch64 location for value {value:?}"))
     };
     let mut asm = Assembler::new();
-    asm.sub_imm(SP, SP, frame_bytes, false);
+    emit_standard_prologue(&mut asm, frame_bytes);
     for (register, offset) in [(Gpr::new(28), 0), (Gpr::new(29), 8), (Gpr::new(30), 16)] {
         asm.str(register, SP, offset);
     }
@@ -2535,7 +2620,8 @@ fn emit_i64_with_stack_spills(function: &Function, result: Value) -> Result<Vec<
             I64Location::Stack(offset) => asm.ldr(scratch, SP, offset),
             I64Location::IncomingStack(offset) => {
                 let incoming_offset = frame_bytes
-                    .checked_add(offset)
+                    .checked_add(AAPCS64_FRAME_RECORD_BYTES)
+                    .and_then(|offset_base| offset_base.checked_add(offset))
                     .ok_or_else(|| "AArch64 i64 incoming stack offset is too large".to_string())?;
                 asm.ldr(scratch, SP, incoming_offset);
             }
@@ -2627,8 +2713,7 @@ fn emit_i64_with_stack_spills(function: &Function, result: Value) -> Result<Vec<
     for (register, offset) in [(Gpr::new(30), 16), (Gpr::new(29), 8), (Gpr::new(28), 0)] {
         asm.ldr(register, SP, offset);
     }
-    asm.add_imm(SP, SP, frame_bytes, false);
-    asm.ret();
+    emit_standard_epilogue(&mut asm, frame_bytes);
     Ok(asm.bytes())
 }
 
@@ -2888,6 +2973,20 @@ mod tests {
     }
 
     #[test]
+    fn encodes_checked_aapcs64_frame_record_pairs() {
+        assert_eq!(stp_pre(Gpr::new(29), Gpr::new(30), SP, -16), 0xa9bf_7bfd);
+        assert_eq!(ldp_post(Gpr::new(29), Gpr::new(30), SP, 16), 0xa8c1_7bfd);
+        assert_eq!(
+            stp_d_pre(Gpr::new_d(8), Gpr::new_d(9), SP, -16),
+            0x6dbf_27e8
+        );
+        assert_eq!(
+            ldp_d_post(Gpr::new_d(8), Gpr::new_d(9), SP, 16),
+            0x6cc1_27e8
+        );
+    }
+
+    #[test]
     fn emits_straight_line_f64_function_and_deduplicates_literals() {
         let function = forge_runtime::lower_source("x * 2.5 + 2.5").unwrap();
         let bytes = emit_f64(&function).unwrap();
@@ -3050,6 +3149,36 @@ mod tests {
     }
 
     #[test]
+    fn generated_spill_paths_use_aapcs64_frame_record_pairs() {
+        let f64_source = std::iter::repeat_n("x", 26).collect::<Vec<_>>().join(" + ");
+        let f64_words = emit_f64(&forge_runtime::lower_source(&f64_source).unwrap())
+            .unwrap()
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            f64_words.first(),
+            Some(&stp_pre(Gpr::new(29), Gpr::new(30), SP, -16))
+        );
+        assert!(f64_words.contains(&ldp_post(Gpr::new(29), Gpr::new(30), SP, 16)));
+
+        let i64_source = (1..=10)
+            .map(|mask| format!("(n & {mask})"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let i64_words = emit_i64(&forge_runtime::lower_source(&i64_source).unwrap())
+            .unwrap()
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            i64_words.first(),
+            Some(&stp_pre(Gpr::new(29), Gpr::new(30), SP, -16))
+        );
+        assert!(i64_words.contains(&ldp_post(Gpr::new(29), Gpr::new(30), SP, 16)));
+    }
+
+    #[test]
     fn emits_cfg_f64_stack_spills_and_phi_edge_stores() {
         let then_expr = std::iter::repeat_n("x", 14).collect::<Vec<_>>().join(" + ");
         let else_expr = std::iter::repeat_n("-x", 14)
@@ -3188,16 +3317,21 @@ mod tests {
             .chunks(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
-        let frame_bytes = ((words[0] >> 10) & 0x0fff) as u16;
+        let frame_bytes = ((words[1] >> 10) & 0x0fff) as u16;
         // The ninth f64 and i64
         // parameters arrive at consecutive AAPCS64 stack slots before the
         // body frame, then are copied into their local typed slots.
-        assert!(words
-            .iter()
-            .any(|word| *word == ldr_d(Gpr::new_d(29), SP, frame_bytes)));
-        assert!(words
-            .iter()
-            .any(|word| *word == ldr(Gpr::new(28), SP, frame_bytes + 8)));
+        assert!(words.iter().any(|word| {
+            *word == ldr_d(Gpr::new_d(29), SP, frame_bytes + AAPCS64_FRAME_RECORD_BYTES)
+        }));
+        assert!(words.iter().any(|word| {
+            *word
+                == ldr(
+                    Gpr::new(28),
+                    SP,
+                    frame_bytes + AAPCS64_FRAME_RECORD_BYTES + 8,
+                )
+        }));
         assert!(words
             .iter()
             .any(|word| *word == str_d(Gpr::new_d(29), SP, 24)));
@@ -3433,7 +3567,7 @@ mod tests {
         // This expression has 35 non-parameter values, so the aligned spill
         // frame is 304 bytes and the first incoming stack parameter is at
         // SP+304 in the body.
-        assert!(words.iter().any(|word| *word == ldr(Gpr::new(28), SP, 304)));
+        assert!(words.iter().any(|word| *word == ldr(Gpr::new(28), SP, 320)));
         assert_eq!(words.last(), Some(&0xd65f_03c0));
     }
 
