@@ -14,7 +14,7 @@ implemented lower-level work is absent.
 | Area | Current state | Evidence |
 |---|---|---|
 | Front end, SSA IR, interpreter, optimizer, executable memory, x86 encoder and selection | Implemented and workspace-tested | `crates/forge-*/src`, `cargo test --workspace --offline` |
-| Final x86 emission | Implemented for selected scalar instructions, System V and Win64 ABI parameters (including Win64 stack parameters), libm calls, spill reload/store, stack frames, control flow, return placement, ABI-safe scratch selection, and typed native calls through the runtime trampoline; broader external-ABI coverage remains open | `crates/forge-emit`, `crates/forge-runtime`, focused emitter tests, Windows-native CI |
+| Final x86 emission | Implemented for selected scalar instructions, System V and Win64 ABI parameters (including stack-backed parameters for both ABIs), libm calls, spill reload/store, stack frames, control flow, return placement, ABI-safe scratch selection, and typed native calls through the runtime trampoline; broader external-ABI coverage remains open | `crates/forge-emit`, `crates/forge-runtime`, focused emitter tests, Windows-native CI |
 | Fixed-register allocation conflict | Implemented: non-fixed active victims spill; overlapping fixed intervals fail explicitly | `forge-regalloc` linear-scan tests |
 | Variable shifts | Implemented with allocator constraints for RCX/CL, an emission fallback move, and preservation of unrelated live RCX values | `forge-regalloc::excluded_registers`, emitter/layout tests |
 | Float remainder | Explicitly unsupported and rejected during x86 instruction selection; no approximation is emitted | `forge-x64/src/machine_inst/mod.rs` |
@@ -143,6 +143,10 @@ The remaining open rows are intentional scope boundaries, not silent stubs.
   through eight, including aligned shadow space and packed stack argument
   marshalling for mixed f64/i64 signatures; its complete platform matrix
   passed before merge to `codex/integration`.
+- PR #312 extends typed x86-64 calls across System V stack-backed integer and
+  floating-point parameters and fixes entry parameter lowering to use parallel
+  copies, preventing one incoming ABI register from clobbering another. Its
+  complete platform matrix passed before merge to `codex/integration`.
 - PR #306 adds native AArch64 typed runtime execution for supported mixed
   AAPCS64 f64-result signatures and straight-line all-i64 signatures, with
   separate floating/integer bank loading and link-register preservation; its
