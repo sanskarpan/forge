@@ -173,10 +173,11 @@ The x86 emitter materializes entry parameters with parallel copies so
 allocator destinations may safely overlap incoming ABI registers, and the
 trampoline packs exhausted SysV integer/XMM banks into aligned caller stack
 slots. On AArch64 it uses an AArch64 trampoline for supported mixed signatures
-returning `f64` and straight-line all-`i64` signatures, including values beyond
-the eight-register AAPCS64 GPR or floating-point banks in aligned stack
-argument slots. Other targets and unsupported shapes use the verified
-interpreter fallback.
+returning `f64`, `i64`, or `bool`, including values beyond the eight-register
+AAPCS64 GPR or floating-point banks in aligned stack argument slots. Comparison
+results are materialized as canonical `0`/`1` words with `CSET` before a typed
+return or a composed boolean use. Other targets and unsupported shapes use the
+verified interpreter fallback.
 
 On Windows, the native x86 allocator may use the nonvolatile GPRs RBX, RSI,
 RDI, and R12-R15 plus XMM6-XMM15. The emitted frame saves the active GPR set
@@ -1275,8 +1276,10 @@ places values beyond either eight-register bank in aligned stack argument
 slots, and preserves the link register across the target call. The AArch64
 body accounts for its local frame when loading those incoming stack values;
 this includes straight-line all-`i64` bodies whose integer parameters overflow
-X0..X7. Control-flow phi spilling, general live-range allocation, and broader
-external calls remain outside this typed trampoline boundary.
+X0..X7 and supported bool-returning bodies whose comparison operands overflow a
+register bank. Control-flow phi spilling beyond the supported typed spill
+shapes, general live-range allocation, and broader external calls remain
+outside this typed trampoline boundary.
 Unsupported shapes fall back to the interpreter rather than being called
 through an unverifiable function pointer type.
 
