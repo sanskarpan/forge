@@ -167,8 +167,10 @@ pub enum RtValue {
 like `CompiledExpr::call1`/`call2` (§11) stay `f64`-specific shortcuts for
 the common all-float case. The public typed entry point is
 `forge_runtime::evaluate_typed(source, args)`: on x86-64 it uses an
-ABI-aware executable trampoline for register-backed System V and Win64
-signatures, while non-x86 hosts and unsupported stack-heavy signatures use
+ABI-aware executable trampoline for supported System V signatures and Win64
+register/stack signatures (through eight parameters). On AArch64 it uses an
+AArch64 trampoline for supported mixed signatures returning `f64` and
+straight-line all-`i64` signatures. Other targets and unsupported shapes use
 the verified interpreter fallback.
 
 ---
@@ -1257,10 +1259,12 @@ impl CompiledExpr {
 runtime's typed entry point, `forge_runtime::evaluate_typed(source, args)`
 (§3, "Runtime value representation"), validates each `RtValue`, packs its
 raw representation, and uses a private executable trampoline to marshal
-register-backed signatures into the right class (GPR for `i64`/`bool`, XMM
-for `f64`) per the ABI table. Unsupported stack-heavy shapes fall back to
-the interpreter rather than being called through an unverifiable function
-pointer type.
+supported signatures into the right ABI locations: GPR for `i64`/`bool`, XMM
+for `f64`, and the Win64 caller stack for positions five through eight. On
+AArch64 the trampoline loads the separate AAPCS64 GPR and D-register banks
+and preserves the link register across the target call. Unsupported shapes
+fall back to the interpreter rather than being called through an unverifiable
+function pointer type.
 
 ---
 
