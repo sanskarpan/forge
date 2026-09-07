@@ -3136,7 +3136,7 @@ mod tests {
 
     #[test]
     fn emits_aarch64_libm_calls_with_aligned_indirect_dispatch() {
-        let function = forge_runtime::lower_source("sin(x) + pow(y, 2.0)").unwrap();
+        let function = forge_runtime::lower_source("sin(x) + pow(y, 2.0) + (z % 2.0)").unwrap();
         let bytes = emit_f64(&function).unwrap();
         let words = bytes
             .chunks(4)
@@ -3645,6 +3645,24 @@ mod tests {
                 compiled.call_args(&[input]).to_bits(),
                 expected.to_bits(),
                 "{source}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_native_aarch64_floating_remainder_with_interpreter_semantics() {
+        for (x, y) in [(-7.5, 2.0), (f64::MAX, 3.0), (-0.0, 2.0)] {
+            let function = forge_runtime::lower_source("x % y").unwrap();
+            let bytes = emit_f64(&function).unwrap();
+            let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+            buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+            buffer.make_executable().unwrap();
+            let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 2);
+            assert_eq!(
+                compiled.call_args(&[x, y]).to_bits(),
+                (x % y).to_bits(),
+                "x={x}, y={y}"
             );
         }
     }
