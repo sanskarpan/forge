@@ -97,9 +97,9 @@ pub const SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
 ]; // 14 - 3 reserved (R9, R10, R11 excluded)
 
 /// Xmm13/Xmm14/Xmm15 are the last three entries of ALLOCATABLE_XMM on
-/// System V. Windows reserves Xmm3/Xmm4/Xmm5 instead and keeps the
-/// nonvolatile XMM registers in this public analysis fixture; the actual
-/// Windows allocation pool remains caller-preserved only.
+/// System V. Windows reserves Xmm3/Xmm4/Xmm5 instead; its active pool also
+/// includes the nonvolatile Xmm6-Xmm15 registers, which the emitter preserves
+/// in the generated frame.
 #[cfg(not(windows))]
 pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = ALLOCATABLE_XMM.split_at(13).0; // 16 - 3 reserved
 #[cfg(windows)]
@@ -121,12 +121,36 @@ pub const SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = &[
 
 #[cfg(windows)]
 #[allow(dead_code)]
-const WIN64_SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] =
-    &[PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8];
+const WIN64_SPILL_AWARE_ALLOCATABLE_GPR: &[PhysReg] = &[
+    PhysReg::Rax,
+    PhysReg::Rcx,
+    PhysReg::Rdx,
+    PhysReg::R8,
+    PhysReg::Rbx,
+    PhysReg::Rsi,
+    PhysReg::Rdi,
+    PhysReg::R12,
+    PhysReg::R13,
+    PhysReg::R14,
+    PhysReg::R15,
+];
 #[cfg(windows)]
 #[allow(dead_code)]
-const WIN64_SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] =
-    &[PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2];
+const WIN64_SPILL_AWARE_ALLOCATABLE_XMM: &[PhysReg] = &[
+    PhysReg::Xmm0,
+    PhysReg::Xmm1,
+    PhysReg::Xmm2,
+    PhysReg::Xmm6,
+    PhysReg::Xmm7,
+    PhysReg::Xmm8,
+    PhysReg::Xmm9,
+    PhysReg::Xmm10,
+    PhysReg::Xmm11,
+    PhysReg::Xmm12,
+    PhysReg::Xmm13,
+    PhysReg::Xmm14,
+    PhysReg::Xmm15,
+];
 
 /// Excludes a `Value`'s specific registers at SPECIFIC instruction
 /// positions (8a's `excluded_registers`, keyed per position for IntDiv/
@@ -685,26 +709,18 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn win64_active_pools_avoid_nonvolatile_registers() {
-        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_GPR.iter().all(|reg| matches!(
-            reg,
-            PhysReg::Rax | PhysReg::Rcx | PhysReg::Rdx | PhysReg::R8
-        )));
-        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_XMM
+    fn win64_active_pools_include_preservable_registers() {
+        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_GPR.contains(&PhysReg::Rbx));
+        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_GPR.contains(&PhysReg::Rsi));
+        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_GPR.contains(&PhysReg::R15));
+        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_XMM.contains(&PhysReg::Xmm6));
+        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_XMM.contains(&PhysReg::Xmm15));
+        assert!(!WIN64_SPILL_AWARE_ALLOCATABLE_GPR
             .iter()
-            .all(|reg| reg.encoding() <= PhysReg::Xmm2.encoding()));
-        assert!(WIN64_SPILL_AWARE_ALLOCATABLE_GPR
+            .any(|reg| SCRATCH_GPR.contains(reg)));
+        assert!(!WIN64_SPILL_AWARE_ALLOCATABLE_XMM
             .iter()
-            .all(|reg| !matches!(
-                reg,
-                PhysReg::Rbx
-                    | PhysReg::Rsi
-                    | PhysReg::Rdi
-                    | PhysReg::R12
-                    | PhysReg::R13
-                    | PhysReg::R14
-                    | PhysReg::R15
-            )));
+            .any(|reg| SCRATCH_XMM.contains(reg)));
     }
 
     #[test]
