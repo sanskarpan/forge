@@ -121,7 +121,7 @@ Deliberately minimal: `f64`, `i64`, `bool`, plus `vec<f64, N>` / `vec<i64, N>` i
 
 - `sqrt`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `trunc` → **single instructions** (`vsqrtsd`, `vandpd`, `vminsd`, `vroundsd`)
 - `sin`, `cos`, `exp`, `log`, `pow` → **calls into libm**, which forces the project to handle a real call sequence: caller-saved spilling, stack alignment, and the difference between the System V and Win64 ABIs
-- `fma` → scalar `vfmadd231sd` when x86 FMA3 is available; on x86 without FMA3 the runtime uses the interpreter fallback so the result remains exact relative to Forge's defined semantics. Packed AVX2+FMA uses the corresponding vector instruction; AArch64 has a native `fmadd` path. Stable EVEX forms are encoded separately, while AVX-512 runtime dispatch and masked tails remain open.
+- `fma` → scalar `vfmadd231sd` when x86 FMA3 is available; on x86 without FMA3 the runtime uses the interpreter fallback so the result remains exact relative to Forge's defined semantics. Packed AVX2+FMA and AVX-512F+FMA use the corresponding vector instructions; AVX-512F array tails use k-masked zeroing loads/stores; AArch64 has a native `fmadd` path. Stable EVEX byte forms are encoded separately and round-trip tested.
 
 ### Operators & precedence
 
@@ -1266,9 +1266,9 @@ Array mode is where the JIT stops being a curiosity and starts being 8× faster 
 /// Runtime feature detection — you cannot compile AVX-512 into a binary that
 /// must run on older CPUs, so the JIT picks its width when it compiles.
 /// This is the intended JIT advantage over AOT. The current runtime selects
-/// SSE2/AVX2/NEON paths; AVX-512 runtime dispatch remains a follow-up because
-/// stable Rust does not expose the required AVX-512 target-feature surface in
-/// this project.
+/// SSE2/AVX2/AVX-512F/NEON paths. The AVX-512F path uses stable inline
+/// assembly and is entered only after runtime feature detection confirms the
+/// instruction set is available.
 pub struct CpuFeatures {
     pub sse2: bool, pub sse41: bool,
     pub avx: bool, pub avx2: bool, pub fma: bool,
@@ -1292,10 +1292,13 @@ impl CpuFeatures {
 
 ### Vectorizer
 
-The current packed implementation supports SSE2, AVX2, and NEON widths with
-scalar tail handling. EVEX byte encoders exist and are round-trip tested, but
-they are not yet selected by the runtime vectorizer; AVX-512 masked-tail
-execution therefore remains an explicit scope boundary.
+The current packed implementation supports SSE2, AVX2, AVX-512F, and NEON
+widths. SSE2, AVX2, and NEON use scalar epilogues for incomplete chunks;
+AVX-512F uses stable inline assembly with k-masked zeroing loads/stores for
+the tail. The separate EVEX byte encoders remain round-trip tested; the
+runtime AVX-512F path is implemented in `forge-simd` because the packed
+evaluator operates on runtime-detected CPU features rather than compile-time
+target-feature specialization.
 
 ```rust
 /// The expression is already a pure dataflow DAG over element i, so
@@ -1304,7 +1307,7 @@ execution therefore remains an explicit scope boundary.
 ///
 /// Three things must be handled:
 ///   1. TAIL: N % width leftover elements. Either a scalar epilogue, or a
-///      masked store (AVX-512 k-registers make this free).
+///      k-masked load/store (AVX-512 k-registers provide this path).
 ///   2. ALIGNMENT: unaligned loads (vmovupd) are nearly free on modern CPUs,
 ///      so we don't require alignment — but we do emit vmovapd when we can
 ///      prove 32/64-byte alignment, and the workbench shows the difference.
@@ -1543,8 +1546,13 @@ forge/
 2. **Optimization safety.** `-O0`, `-O1`, `-O2` all produce identical results without fast-math.
 3. **Encoding correctness.** Every emitted instruction disassembles to exactly the mnemonic and operands intended.
 4. **Cross-architecture agreement.** Supported x86-64, AArch64, and WASM
-   programs are specified to produce identical results; the end-to-end
-   three-backend differential harness remains an explicit verification item.
+   programs are specified to produce identical results. The executable
+   differential harness in `crates/forge-runtime/tests/cross_backend.rs`
+   compares the interpreter and native target with the same generated WASM
+   module, including exact floating-point bits, on both the x86-64 and
+   emulated AArch64 CI lanes. A single process directly running and comparing
+   x86-64 and AArch64 machine code remains a cross-host artifact, not a
+   supported local test operation.
 5. **Register allocation soundness.** No two values live at the same point are assigned the same register. Verified by an independent checker, not by the allocator itself.
 6. **ABI compliance.** Generated functions are callable from C, preserve all callee-saved registers, maintain 16-byte stack alignment at every `call`, and honor Win64 shadow space.
 7. **W^X maintained.** No page is ever simultaneously writable and executable, on any platform.
