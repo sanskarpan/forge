@@ -121,7 +121,7 @@ Deliberately minimal: `f64`, `i64`, `bool`, plus `vec<f64, N>` / `vec<i64, N>` i
 
 - `sqrt`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `trunc` → **single instructions** (`vsqrtsd`, `vandpd`, `vminsd`, `vroundsd`)
 - `sin`, `cos`, `exp`, `log`, `pow` → **calls into libm**, which forces the project to handle a real call sequence: caller-saved spilling, stack alignment, and the difference between the System V and Win64 ABIs
-- `fma` → scalar `vfmadd231sd` when x86 FMA3 is available; on x86 without FMA3 the runtime uses the interpreter fallback so the result remains exact relative to Forge's defined semantics. Packed AVX2+FMA and AVX-512F+FMA use the corresponding vector instructions; AVX-512F array tails use k-masked zeroing loads/stores; AArch64 has a native `fmadd` path. Stable EVEX byte forms are encoded separately and round-trip tested.
+- `fma` → scalar `vfmadd231sd` when x86 FMA3 is available; on x86 without FMA3 the runtime uses the interpreter fallback so the result remains exact relative to Forge's defined semantics. Packed AVX2+FMA and AVX-512F+FMA use the corresponding vector instructions; AVX-512F array tails use k-masked zeroing loads/stores; AArch64 has native `fmadd` and scalar FRINTM/FRINTP/FRINTA/FRINTZ paths for `floor`, `ceil`, Rust-compatible ties-away-from-zero `round`, and `trunc`. Stable EVEX byte forms are encoded separately and round-trip tested.
 
 ### Operators & precedence
 
@@ -1277,7 +1277,9 @@ slots, and preserves the link register across the target call. The AArch64
 body accounts for its local frame when loading those incoming stack values;
 this includes straight-line all-`i64` bodies whose integer parameters overflow
 X0..X7 and supported bool-returning bodies whose comparison operands overflow a
-register bank. Control-flow phi spilling beyond the supported typed spill
+register bank. Native AArch64 scalar `floor`, `ceil`, `round`, and `trunc`
+also use the corresponding FRINT instruction in both register and supported
+stack-spill bodies. Control-flow phi spilling beyond the supported typed spill
 shapes, general live-range allocation, and broader external calls remain
 outside this typed trampoline boundary.
 Unsupported shapes fall back to the interpreter rather than being called
