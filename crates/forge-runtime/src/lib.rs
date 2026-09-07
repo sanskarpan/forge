@@ -176,11 +176,11 @@ fn supports_native_typed_signature(function: &Function) -> bool {
         .count();
 
     if cfg!(windows) {
-        // The first four Win64 argument positions are register-backed. The
-        // existing native emitter supports later f64 stack parameters, but
-        // this first typed call boundary intentionally handles only the
-        // register form; unsupported shapes use the interpreter fallback.
-        function.params.len() <= 4
+        // The emitter supports the four register positions followed by the
+        // caller-provided stack argument area. Keep the trampoline boundary
+        // aligned with the scalar entry point's existing eight-parameter
+        // limit; larger signatures remain on the interpreter fallback.
+        function.params.len() <= 8
     } else {
         integer_args <= 6 && float_args <= 8
     }
@@ -266,6 +266,12 @@ fn emit_typed_trampoline(
     let mut float_ordinal = 0usize;
     for (index, (_, ty)) in params.iter().enumerate() {
         let offset = (index * 8) as i32;
+        if cfg!(windows) && index >= 4 {
+            // Win64 positions five and onward are loaded by the target from
+            // the caller's stack argument area below. Leave R10 holding the
+            // packed argument pointer until those stores are complete.
+            continue;
+        }
         if *ty == forge_ir::Ty::F64 {
             let dst = if cfg!(windows) {
                 [PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3][index]
@@ -302,9 +308,31 @@ fn emit_typed_trampoline(
     }
 
     // The trampoline itself enters with RSP % 16 == 8. Preserve the target's
-    // expected entry alignment and reserve Win64 home space before CALL.
-    let call_stack_bytes = if cfg!(windows) { 40 } else { 8 };
+    // expected entry alignment and reserve Win64 home space plus stack
+    // arguments before CALL. The target's framed Win64 parameter loads use
+    // [RBP + 48 + (index - 4) * 8], which corresponds to [RSP + 32 + ...]
+    // immediately before CALL.
+    let call_stack_bytes = if cfg!(windows) {
+        let stack_args = params.len().saturating_sub(4);
+        let mut bytes = 32 + stack_args * 8;
+        if bytes % 16 != 8 {
+            bytes += 8;
+        }
+        bytes
+    } else {
+        8
+    };
+    let call_stack_bytes = i32::try_from(call_stack_bytes)
+        .expect("typed trampoline stack area is too large for an x86 displacement");
     asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, call_stack_bytes);
+    if cfg!(windows) {
+        for index in 4..params.len() {
+            let packed_offset = (index * 8) as i32;
+            let stack_offset = 32 + ((index - 4) * 8) as i32;
+            asm.mov_reg_mem(PhysReg::R11, PhysReg::R10, packed_offset);
+            asm.mov_mem_reg(PhysReg::Rsp, stack_offset, PhysReg::R11);
+        }
+    }
     asm.mov_reg_imm(PhysReg::R11, target);
     asm.call_reg(PhysReg::R11);
     asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, call_stack_bytes);
@@ -510,6 +538,24 @@ mod tests {
             )
             .unwrap(),
             RtValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn typed_runtime_marshals_stack_backed_win64_shape() {
+        assert_eq!(
+            evaluate_typed(
+                "a + (n & 1) + (m & 1) + (k & 1) + (q & 1)",
+                &[
+                    RtValue::F64(2.5),
+                    RtValue::I64(3),
+                    RtValue::I64(4),
+                    RtValue::I64(5),
+                    RtValue::I64(6),
+                ],
+            )
+            .unwrap(),
+            RtValue::F64(4.5)
         );
     }
 
