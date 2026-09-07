@@ -1149,6 +1149,18 @@ pub fn encode_logical_imm(value: u64, sf: bool) -> Option<(u8, u8, u8)> { /* N, 
 
 The comparison is genuinely instructive: the x86 encoder is ~1500 lines with a dozen special cases; the AArch64 encoder is ~600 lines that are almost all straight-line bit packing. And AArch64 gets a 3-operand FMA for free where x86 needed VEX.
 
+### AAPCS64 frame records
+
+Generated AArch64 functions that need a local spill area establish the
+conventional AAPCS64 frame record with the checked pair forms
+`stp x29, x30, [sp, #-16]!` and `ldp x29, x30, [sp], #16`. The backend's
+existing SP-relative local layout remains below that 16-byte record, so an
+incoming stack argument is addressed at `local_frame + 16 + argument_offset`
+from the body SP. Leaf functions with no local area remain frameless. This
+keeps SP 16-byte aligned, preserves the caller's frame pointer and link
+register, and makes spill, CFG, typed-parameter, and process-local libm paths
+conform to the same prologue/epilogue convention.
+
 ---
 
 ## §10 WASM Backend (for the workbench)
