@@ -11,6 +11,8 @@ mod tiered;
 use forge_ir::{Function, Value};
 use forge_mem::{CompiledExpr, ExecutableBuffer};
 use forge_syntax::Diagnostic;
+#[cfg(target_arch = "x86_64")]
+use forge_x64::{AluOp, Assembler, PhysReg};
 use std::collections::HashMap;
 pub use tiered::{ExecutionTier, TieredExpr, BASELINE_THRESHOLD, OPTIMIZED_THRESHOLD};
 
@@ -118,6 +120,198 @@ fn interpret_f64_function(function: &Function, args: &[f64]) -> Result<f64, Comp
 pub fn interpret_source(source: &str, args: &[RtValue]) -> Result<RtValue, CompileError> {
     let function = lower_source(source)?;
     Ok(forge_ir::interp::interpret(&function, args))
+}
+
+/// Executes a typed scalar expression through the native x86-64 emitter when
+/// the active ABI can be represented by the runtime trampoline. The packed
+/// `u64` argument area is deliberately private: f64 values use their raw
+/// bits, i64 values use two's-complement bits, and bool values use 0/1. On a
+/// non-x86 host, or for a signature outside the register-only trampoline
+/// boundary, the verified interpreter remains the portable fallback.
+pub fn evaluate_typed(source: &str, args: &[RtValue]) -> Result<RtValue, CompileError> {
+    let function = lower_source(source)?;
+    validate_typed_arguments(&function, args)?;
+
+    #[cfg(target_arch = "x86_64")]
+    if supports_native_typed_signature(&function) {
+        return execute_native_typed(source, args, &function);
+    }
+
+    Ok(forge_ir::interp::interpret(&function, args))
+}
+
+fn value_ty(value: RtValue) -> forge_ir::Ty {
+    match value {
+        RtValue::F64(_) => forge_ir::Ty::F64,
+        RtValue::I64(_) => forge_ir::Ty::I64,
+        RtValue::Bool(_) => forge_ir::Ty::Bool,
+    }
+}
+
+fn validate_typed_arguments(function: &Function, args: &[RtValue]) -> Result<(), CompileError> {
+    if args.len() != function.params.len()
+        || args
+            .iter()
+            .zip(function.params.iter())
+            .any(|(value, (_, ty))| value_ty(*value) != *ty)
+    {
+        return Err(CompileError::UnsupportedTarget(
+            "typed runtime arguments do not match the function signature",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn supports_native_typed_signature(function: &Function) -> bool {
+    let integer_args = function
+        .params
+        .iter()
+        .filter(|(_, ty)| *ty != forge_ir::Ty::F64)
+        .count();
+    let float_args = function
+        .params
+        .iter()
+        .filter(|(_, ty)| *ty == forge_ir::Ty::F64)
+        .count();
+
+    if cfg!(windows) {
+        // The first four Win64 argument positions are register-backed. The
+        // existing native emitter supports later f64 stack parameters, but
+        // this first typed call boundary intentionally handles only the
+        // register form; unsupported shapes use the interpreter fallback.
+        function.params.len() <= 4
+    } else {
+        integer_args <= 6 && float_args <= 8
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn execute_native_typed(
+    source: &str,
+    args: &[RtValue],
+    function: &Function,
+) -> Result<RtValue, CompileError> {
+    let artifacts = compile_artifacts(source)?;
+    let result_ty = *artifacts
+        .function
+        .types
+        .last()
+        .ok_or(CompileError::UnsupportedTarget(
+            "function has no result type",
+        ))?;
+    let mut body = ExecutableBuffer::new(artifacts.bytes.len())?;
+    body.write(|dst| dst[..artifacts.bytes.len()].copy_from_slice(&artifacts.bytes));
+    body.make_executable()?;
+
+    let mut trampoline = Assembler::new();
+    emit_typed_trampoline(
+        &mut trampoline,
+        body.as_ptr() as usize as i64,
+        &function.params,
+        result_ty,
+    );
+    let trampoline_bytes = trampoline.code().to_vec();
+    let mut trampoline_buffer = ExecutableBuffer::new(trampoline_bytes.len())?;
+    trampoline_buffer.write(|dst| dst[..trampoline_bytes.len()].copy_from_slice(&trampoline_bytes));
+    trampoline_buffer.make_executable()?;
+
+    let packed = args
+        .iter()
+        .map(|value| match value {
+            RtValue::F64(value) => value.to_bits(),
+            RtValue::I64(value) => *value as u64,
+            RtValue::Bool(value) => u64::from(*value),
+        })
+        .collect::<Vec<_>>();
+    // SAFETY: the trampoline has the fixed `extern "C" fn(*const u64) -> u64`
+    // ABI, loads exactly one eight-byte word per validated argument, calls
+    // the live executable body with its platform-specific scalar ABI, and
+    // normalizes an f64 return into RAX before returning.
+    let call: unsafe extern "C" fn(*const u64) -> u64 =
+        unsafe { std::mem::transmute(trampoline_buffer.as_ptr()) };
+    let raw = unsafe { call(packed.as_ptr()) };
+
+    Ok(match result_ty {
+        forge_ir::Ty::F64 => RtValue::F64(f64::from_bits(raw)),
+        forge_ir::Ty::I64 => RtValue::I64(raw as i64),
+        forge_ir::Ty::Bool => {
+            if raw > 1 {
+                return Err(CompileError::UnsupportedTarget(
+                    "native typed bool result was not canonical",
+                ));
+            }
+            RtValue::Bool(raw == 1)
+        }
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn emit_typed_trampoline(
+    asm: &mut Assembler,
+    target: i64,
+    params: &[(String, forge_ir::Ty)],
+    result_ty: forge_ir::Ty,
+) {
+    let pointer_arg = if cfg!(windows) {
+        PhysReg::Rcx
+    } else {
+        PhysReg::Rdi
+    };
+    // R10 is not an incoming scalar argument register on either supported
+    // x86-64 ABI and is excluded from ordinary Forge allocation, so it can
+    // hold the packed argument pointer while the target registers load.
+    asm.mov_reg_reg(PhysReg::R10, pointer_arg);
+    let mut integer_ordinal = 0usize;
+    let mut float_ordinal = 0usize;
+    for (index, (_, ty)) in params.iter().enumerate() {
+        let offset = (index * 8) as i32;
+        if *ty == forge_ir::Ty::F64 {
+            let dst = if cfg!(windows) {
+                [PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3][index]
+            } else {
+                [
+                    PhysReg::Xmm0,
+                    PhysReg::Xmm1,
+                    PhysReg::Xmm2,
+                    PhysReg::Xmm3,
+                    PhysReg::Xmm4,
+                    PhysReg::Xmm5,
+                    PhysReg::Xmm6,
+                    PhysReg::Xmm7,
+                ][float_ordinal]
+            };
+            asm.movsd_reg_mem(dst, PhysReg::R10, offset);
+            float_ordinal += 1;
+        } else {
+            let dst = if cfg!(windows) {
+                [PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8, PhysReg::R9][index]
+            } else {
+                [
+                    PhysReg::Rdi,
+                    PhysReg::Rsi,
+                    PhysReg::Rdx,
+                    PhysReg::Rcx,
+                    PhysReg::R8,
+                    PhysReg::R9,
+                ][integer_ordinal]
+            };
+            asm.mov_reg_mem(dst, PhysReg::R10, offset);
+            integer_ordinal += 1;
+        }
+    }
+
+    // The trampoline itself enters with RSP % 16 == 8. Preserve the target's
+    // expected entry alignment and reserve Win64 home space before CALL.
+    let call_stack_bytes = if cfg!(windows) { 40 } else { 8 };
+    asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, call_stack_bytes);
+    asm.mov_reg_imm(PhysReg::R11, target);
+    asm.call_reg(PhysReg::R11);
+    asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, call_stack_bytes);
+    if result_ty == forge_ir::Ty::F64 {
+        asm.movq_xmm_to_gpr(PhysReg::Rax, PhysReg::Xmm0);
+    }
+    asm.ret();
 }
 
 /// Evaluates an all-f64 expression using the native JIT where the active
@@ -289,6 +483,34 @@ mod tests {
     #[test]
     fn evaluate_runs_on_the_active_execution_path() {
         assert_eq!(evaluate("x * x + 1", &[3.0]).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn typed_runtime_executes_mixed_and_non_f64_results() {
+        assert_eq!(
+            evaluate_typed("x + (n & 1)", &[RtValue::F64(2.5), RtValue::I64(3)],).unwrap(),
+            RtValue::F64(3.5)
+        );
+        assert_eq!(
+            evaluate_typed(
+                "if flag then x else x + 1.0",
+                &[RtValue::Bool(false), RtValue::F64(2.5)],
+            )
+            .unwrap(),
+            RtValue::F64(3.5)
+        );
+        assert_eq!(
+            evaluate_typed("n & 7", &[RtValue::I64(11)]).unwrap(),
+            RtValue::I64(3)
+        );
+        assert_eq!(
+            evaluate_typed(
+                "left && right",
+                &[RtValue::Bool(true), RtValue::Bool(false)]
+            )
+            .unwrap(),
+            RtValue::Bool(false)
+        );
     }
 
     #[test]
