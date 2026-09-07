@@ -1365,6 +1365,17 @@ impl CpuFeatures {
 }
 ```
 
+Runtime callers may provide an explicit `CpuFeatures` mask to array
+evaluation. The mask is intersected with the capabilities detected on the
+current host before a width is selected, so a feature request can only disable
+an available backend, never enable an unsupported instruction set. The
+`CpuFeatures::scalar()` mask forces the verified interpreter path, including
+for source-ordered reductions. FMA is checked independently when an expression
+contains `fma`; disabling it therefore prevents an FMA packed body even on a
+host where another packed width is available. The public entry points are
+`evaluate_array_with_features` and `reduce_sum_with_features` in
+`forge-simd`.
+
 ### Vectorizer
 
 The current packed implementation supports SSE2, AVX2, AVX-512F, and NEON
