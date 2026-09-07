@@ -827,6 +827,59 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     #[test]
+    fn win64_high_pressure_jit_uses_and_preserves_nonvolatile_registers() {
+        let integer_source =
+            "(a & 1) | ((b & 2) | ((c & 4) | ((d & 8) | ((e & 16) | ((f & 32) | ((g & 64) | (h & 128)))))))";
+        let integer_artifacts = compile_artifacts(integer_source).unwrap();
+        assert!(integer_artifacts
+            .assignment
+            .values()
+            .any(|location| *location == forge_regalloc::Location::Reg(forge_x64::PhysReg::Rbx)));
+        assert_eq!(
+            evaluate_typed(
+                integer_source,
+                &[
+                    RtValue::I64(1),
+                    RtValue::I64(2),
+                    RtValue::I64(4),
+                    RtValue::I64(8),
+                    RtValue::I64(16),
+                    RtValue::I64(32),
+                    RtValue::I64(64),
+                    RtValue::I64(128),
+                ],
+            )
+            .unwrap(),
+            RtValue::I64(255)
+        );
+
+        let float_source = "a + (b + (c + (d + (e + (f + (g + h))))))";
+        let float_artifacts = compile_artifacts(float_source).unwrap();
+        assert!(float_artifacts
+            .assignment
+            .values()
+            .any(|location| *location == forge_regalloc::Location::Reg(forge_x64::PhysReg::Xmm6)));
+        assert_eq!(
+            evaluate_typed(
+                float_source,
+                &[
+                    RtValue::F64(1.0),
+                    RtValue::F64(2.0),
+                    RtValue::F64(4.0),
+                    RtValue::F64(8.0),
+                    RtValue::F64(16.0),
+                    RtValue::F64(32.0),
+                    RtValue::F64(64.0),
+                    RtValue::F64(128.0),
+                ],
+            )
+            .unwrap(),
+            RtValue::F64(255.0)
+        );
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[test]
     fn win64_jit_preserves_live_value_across_libm_call() {
         let compiled = compile("sin(x) + y").unwrap();
         let expected = 0.5f64.sin() + 2.0;
