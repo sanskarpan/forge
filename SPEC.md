@@ -1546,8 +1546,13 @@ forge/
 2. **Optimization safety.** `-O0`, `-O1`, `-O2` all produce identical results without fast-math.
 3. **Encoding correctness.** Every emitted instruction disassembles to exactly the mnemonic and operands intended.
 4. **Cross-architecture agreement.** Supported x86-64, AArch64, and WASM
-   programs are specified to produce identical results; the end-to-end
-   three-backend differential harness remains an explicit verification item.
+   programs are specified to produce identical results. The executable
+   differential harness in `crates/forge-runtime/tests/cross_backend.rs`
+   compares the interpreter and native target with the same generated WASM
+   module, including exact floating-point bits, on both the x86-64 and
+   emulated AArch64 CI lanes. A single process directly running and comparing
+   x86-64 and AArch64 machine code remains a cross-host artifact, not a
+   supported local test operation.
 5. **Register allocation soundness.** No two values live at the same point are assigned the same register. Verified by an independent checker, not by the allocator itself.
 6. **ABI compliance.** Generated functions are callable from C, preserve all callee-saved registers, maintain 16-byte stack alignment at every `call`, and honor Win64 shadow space.
 7. **W^X maintained.** No page is ever simultaneously writable and executable, on any platform.
