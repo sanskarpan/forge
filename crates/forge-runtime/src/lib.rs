@@ -8,9 +8,13 @@
 pub use forge_ir::interp::RtValue;
 mod tiered;
 
+#[cfg(target_arch = "aarch64")]
+use forge_aarch64::{Assembler as Aarch64Assembler, Gpr as Aarch64Gpr, SP as AARCH64_SP, XZR};
 use forge_ir::{Function, Value};
 use forge_mem::{CompiledExpr, ExecutableBuffer};
 use forge_syntax::Diagnostic;
+#[cfg(target_arch = "x86_64")]
+use forge_x64::{AluOp, Assembler, PhysReg};
 use std::collections::HashMap;
 pub use tiered::{ExecutionTier, TieredExpr, BASELINE_THRESHOLD, OPTIMIZED_THRESHOLD};
 
@@ -118,6 +122,348 @@ fn interpret_f64_function(function: &Function, args: &[f64]) -> Result<f64, Comp
 pub fn interpret_source(source: &str, args: &[RtValue]) -> Result<RtValue, CompileError> {
     let function = lower_source(source)?;
     Ok(forge_ir::interp::interpret(&function, args))
+}
+
+/// Executes a typed scalar expression through the native x86-64 emitter when
+/// the active ABI can be represented by the runtime trampoline. The packed
+/// `u64` argument area is deliberately private: f64 values use their raw
+/// bits, i64 values use two's-complement bits, and bool values use 0/1. On a
+/// non-x86 host, or for a signature outside the register-only trampoline
+/// boundary, the verified interpreter remains the portable fallback.
+pub fn evaluate_typed(source: &str, args: &[RtValue]) -> Result<RtValue, CompileError> {
+    let function = lower_source(source)?;
+    validate_typed_arguments(&function, args)?;
+
+    #[cfg(target_arch = "x86_64")]
+    if supports_native_typed_signature(&function) {
+        return execute_native_typed(source, args, &function);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if let Some(value) = execute_native_typed_aarch64(args, &function)? {
+        return Ok(value);
+    }
+
+    Ok(forge_ir::interp::interpret(&function, args))
+}
+
+fn value_ty(value: RtValue) -> forge_ir::Ty {
+    match value {
+        RtValue::F64(_) => forge_ir::Ty::F64,
+        RtValue::I64(_) => forge_ir::Ty::I64,
+        RtValue::Bool(_) => forge_ir::Ty::Bool,
+    }
+}
+
+fn validate_typed_arguments(function: &Function, args: &[RtValue]) -> Result<(), CompileError> {
+    if args.len() != function.params.len()
+        || args
+            .iter()
+            .zip(function.params.iter())
+            .any(|(value, (_, ty))| value_ty(*value) != *ty)
+    {
+        return Err(CompileError::UnsupportedTarget(
+            "typed runtime arguments do not match the function signature",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn supports_native_typed_signature(function: &Function) -> bool {
+    let integer_args = function
+        .params
+        .iter()
+        .filter(|(_, ty)| *ty != forge_ir::Ty::F64)
+        .count();
+    let float_args = function
+        .params
+        .iter()
+        .filter(|(_, ty)| *ty == forge_ir::Ty::F64)
+        .count();
+
+    if cfg!(windows) {
+        // The emitter supports the four register positions followed by the
+        // caller-provided stack argument area. Keep the trampoline boundary
+        // aligned with the scalar entry point's existing eight-parameter
+        // limit; larger signatures remain on the interpreter fallback.
+        function.params.len() <= 8
+    } else {
+        integer_args <= 6 && float_args <= 8
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn execute_native_typed(
+    source: &str,
+    args: &[RtValue],
+    function: &Function,
+) -> Result<RtValue, CompileError> {
+    let artifacts = compile_artifacts(source)?;
+    let result_ty = *artifacts
+        .function
+        .types
+        .last()
+        .ok_or(CompileError::UnsupportedTarget(
+            "function has no result type",
+        ))?;
+    let mut body = ExecutableBuffer::new(artifacts.bytes.len())?;
+    body.write(|dst| dst[..artifacts.bytes.len()].copy_from_slice(&artifacts.bytes));
+    body.make_executable()?;
+
+    let mut trampoline = Assembler::new();
+    emit_typed_trampoline(
+        &mut trampoline,
+        body.as_ptr() as usize as i64,
+        &function.params,
+        result_ty,
+    );
+    let trampoline_bytes = trampoline.code().to_vec();
+    let mut trampoline_buffer = ExecutableBuffer::new(trampoline_bytes.len())?;
+    trampoline_buffer.write(|dst| dst[..trampoline_bytes.len()].copy_from_slice(&trampoline_bytes));
+    trampoline_buffer.make_executable()?;
+
+    let packed = args
+        .iter()
+        .map(|value| match value {
+            RtValue::F64(value) => value.to_bits(),
+            RtValue::I64(value) => *value as u64,
+            RtValue::Bool(value) => u64::from(*value),
+        })
+        .collect::<Vec<_>>();
+    // SAFETY: the trampoline has the fixed `extern "C" fn(*const u64) -> u64`
+    // ABI, loads exactly one eight-byte word per validated argument, calls
+    // the live executable body with its platform-specific scalar ABI, and
+    // normalizes an f64 return into RAX before returning.
+    let call: unsafe extern "C" fn(*const u64) -> u64 =
+        unsafe { std::mem::transmute(trampoline_buffer.as_ptr()) };
+    let raw = unsafe { call(packed.as_ptr()) };
+
+    Ok(match result_ty {
+        forge_ir::Ty::F64 => RtValue::F64(f64::from_bits(raw)),
+        forge_ir::Ty::I64 => RtValue::I64(raw as i64),
+        forge_ir::Ty::Bool => {
+            if raw > 1 {
+                return Err(CompileError::UnsupportedTarget(
+                    "native typed bool result was not canonical",
+                ));
+            }
+            RtValue::Bool(raw == 1)
+        }
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn emit_typed_trampoline(
+    asm: &mut Assembler,
+    target: i64,
+    params: &[(String, forge_ir::Ty)],
+    result_ty: forge_ir::Ty,
+) {
+    let pointer_arg = if cfg!(windows) {
+        PhysReg::Rcx
+    } else {
+        PhysReg::Rdi
+    };
+    // R10 is not an incoming scalar argument register on either supported
+    // x86-64 ABI and is excluded from ordinary Forge allocation, so it can
+    // hold the packed argument pointer while the target registers load.
+    asm.mov_reg_reg(PhysReg::R10, pointer_arg);
+    let mut integer_ordinal = 0usize;
+    let mut float_ordinal = 0usize;
+    for (index, (_, ty)) in params.iter().enumerate() {
+        let offset = (index * 8) as i32;
+        if cfg!(windows) && index >= 4 {
+            // Win64 positions five and onward are loaded by the target from
+            // the caller's stack argument area below. Leave R10 holding the
+            // packed argument pointer until those stores are complete.
+            continue;
+        }
+        if *ty == forge_ir::Ty::F64 {
+            let dst = if cfg!(windows) {
+                [PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3][index]
+            } else {
+                [
+                    PhysReg::Xmm0,
+                    PhysReg::Xmm1,
+                    PhysReg::Xmm2,
+                    PhysReg::Xmm3,
+                    PhysReg::Xmm4,
+                    PhysReg::Xmm5,
+                    PhysReg::Xmm6,
+                    PhysReg::Xmm7,
+                ][float_ordinal]
+            };
+            asm.movsd_reg_mem(dst, PhysReg::R10, offset);
+            float_ordinal += 1;
+        } else {
+            let dst = if cfg!(windows) {
+                [PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8, PhysReg::R9][index]
+            } else {
+                [
+                    PhysReg::Rdi,
+                    PhysReg::Rsi,
+                    PhysReg::Rdx,
+                    PhysReg::Rcx,
+                    PhysReg::R8,
+                    PhysReg::R9,
+                ][integer_ordinal]
+            };
+            asm.mov_reg_mem(dst, PhysReg::R10, offset);
+            integer_ordinal += 1;
+        }
+    }
+
+    // The trampoline itself enters with RSP % 16 == 8. Preserve the target's
+    // expected entry alignment and reserve Win64 home space plus stack
+    // arguments before CALL. The target's framed Win64 parameter loads use
+    // [RBP + 48 + (index - 4) * 8], which corresponds to [RSP + 32 + ...]
+    // immediately before CALL.
+    let call_stack_bytes = if cfg!(windows) {
+        let stack_args = params.len().saturating_sub(4);
+        let mut bytes = 32 + stack_args * 8;
+        if bytes % 16 != 8 {
+            bytes += 8;
+        }
+        bytes
+    } else {
+        8
+    };
+    let call_stack_bytes = i32::try_from(call_stack_bytes)
+        .expect("typed trampoline stack area is too large for an x86 displacement");
+    asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, call_stack_bytes);
+    if cfg!(windows) {
+        for index in 4..params.len() {
+            let packed_offset = (index * 8) as i32;
+            let stack_offset = 32 + ((index - 4) * 8) as i32;
+            asm.mov_reg_mem(PhysReg::R11, PhysReg::R10, packed_offset);
+            asm.mov_mem_reg(PhysReg::Rsp, stack_offset, PhysReg::R11);
+        }
+    }
+    asm.mov_reg_imm(PhysReg::R11, target);
+    asm.call_reg(PhysReg::R11);
+    asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, call_stack_bytes);
+    if result_ty == forge_ir::Ty::F64 {
+        asm.movq_xmm_to_gpr(PhysReg::Rax, PhysReg::Xmm0);
+    }
+    asm.ret();
+}
+
+#[cfg(target_arch = "aarch64")]
+fn execute_native_typed_aarch64(
+    args: &[RtValue],
+    function: &Function,
+) -> Result<Option<RtValue>, CompileError> {
+    let result_ty = *function
+        .types
+        .last()
+        .ok_or(CompileError::UnsupportedTarget(
+            "function has no result type",
+        ))?;
+    let float_args = function
+        .params
+        .iter()
+        .filter(|(_, ty)| *ty == forge_ir::Ty::F64)
+        .count();
+    let integer_args = function
+        .params
+        .iter()
+        .filter(|(_, ty)| *ty != forge_ir::Ty::F64)
+        .count();
+    if float_args > 8 || integer_args > 8 {
+        return Ok(None);
+    }
+
+    let bytes = match result_ty {
+        forge_ir::Ty::F64 => forge_aarch64::emit_f64(function),
+        forge_ir::Ty::I64
+            if function
+                .params
+                .iter()
+                .all(|(_, ty)| *ty == forge_ir::Ty::I64) =>
+        {
+            forge_aarch64::emit_i64(function)
+        }
+        _ => return Ok(None),
+    };
+    let Ok(bytes) = bytes else {
+        return Ok(None);
+    };
+    let mut body = ExecutableBuffer::new(bytes.len())?;
+    body.write(|dst| dst[..bytes.len()].copy_from_slice(&bytes));
+    body.make_executable()?;
+
+    let mut trampoline = Aarch64Assembler::new();
+    emit_typed_trampoline_aarch64(&mut trampoline, body.as_ptr() as usize, &function.params);
+    let trampoline_bytes = trampoline.bytes();
+    let mut trampoline_buffer = ExecutableBuffer::new(trampoline_bytes.len())?;
+    trampoline_buffer.write(|dst| dst[..trampoline_bytes.len()].copy_from_slice(&trampoline_bytes));
+    trampoline_buffer.make_executable()?;
+
+    let packed = args
+        .iter()
+        .map(|value| match value {
+            RtValue::F64(value) => value.to_bits(),
+            RtValue::I64(value) => *value as u64,
+            RtValue::Bool(value) => u64::from(*value),
+        })
+        .collect::<Vec<_>>();
+    match result_ty {
+        forge_ir::Ty::F64 => {
+            // SAFETY: the trampoline has the AAPCS64 C ABI for one pointer
+            // argument and an f64 result, loads each validated packed value
+            // into the matching AAPCS64 bank, and tail-preserves the target's
+            // f64 return in D0.
+            let call: unsafe extern "C" fn(*const u64) -> f64 =
+                unsafe { std::mem::transmute(trampoline_buffer.as_ptr()) };
+            Ok(Some(RtValue::F64(unsafe { call(packed.as_ptr()) })))
+        }
+        forge_ir::Ty::I64 => {
+            // SAFETY: the i64 path has the same validated pointer ABI and
+            // returns its scalar result in X0 as required by AAPCS64.
+            let call: unsafe extern "C" fn(*const u64) -> i64 =
+                unsafe { std::mem::transmute(trampoline_buffer.as_ptr()) };
+            Ok(Some(RtValue::I64(unsafe { call(packed.as_ptr()) })))
+        }
+        forge_ir::Ty::Bool => Ok(None),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn emit_typed_trampoline_aarch64(
+    asm: &mut Aarch64Assembler,
+    target: usize,
+    params: &[(String, forge_ir::Ty)],
+) {
+    let packed = Aarch64Gpr::new(16);
+    let target_reg = Aarch64Gpr::new(17);
+    let link = Aarch64Gpr::new(30);
+    asm.sub_imm(AARCH64_SP, AARCH64_SP, 16, false);
+    asm.str(link, AARCH64_SP, 0);
+    asm.orr_reg(packed, Aarch64Gpr::new(0), XZR);
+
+    let mut integer_ordinal = 0u8;
+    let mut float_ordinal = 0u8;
+    for (index, (_, ty)) in params.iter().enumerate() {
+        let offset = u16::try_from(index * 8).expect("packed typed arguments fit AArch64 offset");
+        if *ty == forge_ir::Ty::F64 {
+            asm.ldr_d(Aarch64Gpr::new_d(float_ordinal), packed, offset);
+            float_ordinal += 1;
+        } else {
+            asm.ldr(Aarch64Gpr::new(integer_ordinal), packed, offset);
+            integer_ordinal += 1;
+        }
+    }
+
+    let target = target as u64;
+    asm.movz(target_reg, (target & 0xffff) as u16, 0);
+    asm.movk(target_reg, ((target >> 16) & 0xffff) as u16, 16);
+    asm.movk(target_reg, ((target >> 32) & 0xffff) as u16, 32);
+    asm.movk(target_reg, ((target >> 48) & 0xffff) as u16, 48);
+    asm.blr(target_reg);
+    asm.ldr(link, AARCH64_SP, 0);
+    asm.add_imm(AARCH64_SP, AARCH64_SP, 16, false);
+    asm.ret();
 }
 
 /// Evaluates an all-f64 expression using the native JIT where the active
@@ -289,6 +635,52 @@ mod tests {
     #[test]
     fn evaluate_runs_on_the_active_execution_path() {
         assert_eq!(evaluate("x * x + 1", &[3.0]).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn typed_runtime_executes_mixed_and_non_f64_results() {
+        assert_eq!(
+            evaluate_typed("x + (n & 1)", &[RtValue::F64(2.5), RtValue::I64(3)],).unwrap(),
+            RtValue::F64(3.5)
+        );
+        assert_eq!(
+            evaluate_typed(
+                "if flag then x else x + 1.0",
+                &[RtValue::Bool(false), RtValue::F64(2.5)],
+            )
+            .unwrap(),
+            RtValue::F64(3.5)
+        );
+        assert_eq!(
+            evaluate_typed("n & 7", &[RtValue::I64(11)]).unwrap(),
+            RtValue::I64(3)
+        );
+        assert_eq!(
+            evaluate_typed(
+                "left && right",
+                &[RtValue::Bool(true), RtValue::Bool(false)]
+            )
+            .unwrap(),
+            RtValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn typed_runtime_marshals_stack_backed_win64_shape() {
+        assert_eq!(
+            evaluate_typed(
+                "a + (n & 1) + (m & 1) + (k & 1) + (q & 1)",
+                &[
+                    RtValue::F64(2.5),
+                    RtValue::I64(3),
+                    RtValue::I64(4),
+                    RtValue::I64(5),
+                    RtValue::I64(6),
+                ],
+            )
+            .unwrap(),
+            RtValue::F64(4.5)
+        );
     }
 
     #[test]

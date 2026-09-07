@@ -165,8 +165,13 @@ pub enum RtValue {
 `interpret(f: &Function, args: &[RtValue]) -> RtValue` is the real signature
 (§14.1 and Phase 3's oracle both use it). Fixed-arity convenience wrappers
 like `CompiledExpr::call1`/`call2` (§11) stay `f64`-specific shortcuts for
-the common all-float case; the general entry point is
-`CompiledExpr::call(&self, args: &[RtValue]) -> RtValue`.
+the common all-float case. The public typed entry point is
+`forge_runtime::evaluate_typed(source, args)`: on x86-64 it uses an
+ABI-aware executable trampoline for supported System V signatures and Win64
+register/stack signatures (through eight parameters). On AArch64 it uses an
+AArch64 trampoline for supported mixed signatures returning `f64` and
+straight-line all-`i64` signatures. Other targets and unsupported shapes use
+the verified interpreter fallback.
 
 ---
 
@@ -1251,10 +1256,15 @@ impl CompiledExpr {
 ```
 
 `call1`/`call2` above are `f64`-only conveniences for the common case. The
-general entry point, used for functions with mixed `f64`/`i64`/`bool`
-parameters, is `call(&self, args: &[RtValue]) -> RtValue` (§3, "Runtime
-value representation") — it marshals each `RtValue` into the right register
-class (GPR for `i64`/`bool`, XMM for `f64`) per the ABI table in §7.
+runtime's typed entry point, `forge_runtime::evaluate_typed(source, args)`
+(§3, "Runtime value representation"), validates each `RtValue`, packs its
+raw representation, and uses a private executable trampoline to marshal
+supported signatures into the right ABI locations: GPR for `i64`/`bool`, XMM
+for `f64`, and the Win64 caller stack for positions five through eight. On
+AArch64 the trampoline loads the separate AAPCS64 GPR and D-register banks
+and preserves the link register across the target call. Unsupported shapes
+fall back to the interpreter rather than being called through an unverifiable
+function pointer type.
 
 ---
 
