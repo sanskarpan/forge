@@ -5,7 +5,7 @@ use forge_ir::{Function, Inst, Terminator, Ty, Value};
 /// The typed, lane-wise IR consumed by the packed evaluator. Values reuse the
 /// scalar IR's SSA indices so the vector program can be inspected alongside
 /// the scalar pipeline without a second value-numbering scheme.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VectorInst {
     SplatF64(u64),
     Param {
@@ -55,9 +55,34 @@ pub struct VectorFunction {
     pub result: Value,
 }
 
+/// The explicit loop envelope used by array mode. The body remains a typed
+/// SSA dataflow graph, while this small control-flow layer owns the induction
+/// variable and the scalar tail boundary. Keeping the loop plan separate from
+/// the scalar IR makes it possible to reuse one lowered body for every full
+/// chunk instead of rebuilding it for each input offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VectorStore {
+    pub value: Value,
+    pub offset: i32,
+    pub lanes: u8,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorLoop {
+    pub lanes: u8,
+    pub elements: usize,
+    pub induction_start: usize,
+    pub induction_step: usize,
+    pub full_chunks: usize,
+    pub tail: usize,
+    pub body: VectorFunction,
+    pub store: VectorStore,
+}
+
 /// Lowers the supported straight-line scalar subset into typed vector IR.
-/// Control flow, calls, integer/boolean values, and memory operations are
-/// rejected explicitly until their vector semantics and loop ABI exist.
+/// Scalar f64 parameters become explicit `VecLoad` operations. Control flow,
+/// calls, integer/boolean values, and vector stores/reductions are rejected
+/// explicitly until their vector semantics exist.
 pub fn lower_f64_vector(function: &Function, lanes: u8) -> Result<VectorFunction, String> {
     if !matches!(lanes, 2 | 4 | 8) {
         return Err(format!("unsupported f64 vector width: {lanes}"));
@@ -78,7 +103,11 @@ pub fn lower_f64_vector(function: &Function, lanes: u8) -> Result<VectorFunction
         let vector = match scalar {
             Inst::ConstF64(bits) => VectorInst::SplatF64(*bits),
             Inst::ConstI64(number) => VectorInst::SplatF64((*number as f64).to_bits()),
-            Inst::Param { index, ty: Ty::F64 } => VectorInst::Param { index: *index },
+            Inst::Param { ty: Ty::F64, .. } => VectorInst::VecLoad {
+                base: value,
+                offset: 0,
+                lanes,
+            },
             Inst::Add(lhs, rhs) => VectorInst::Add(*lhs, *rhs),
             Inst::Sub(lhs, rhs) => VectorInst::Sub(*lhs, *rhs),
             Inst::Mul(lhs, rhs) => VectorInst::Mul(*lhs, *rhs),
@@ -107,6 +136,36 @@ pub fn lower_f64_vector(function: &Function, lanes: u8) -> Result<VectorFunction
         lanes,
         insts,
         result: *result,
+    })
+}
+
+/// Lowers a scalar all-f64 function into an explicit packed loop. The loop
+/// performs `full_chunks` iterations at offsets
+/// `induction_start + iteration * induction_step`; incomplete elements are
+/// deliberately left to the caller's scalar epilogue or masked-tail path.
+pub fn lower_f64_vector_loop(
+    function: &Function,
+    lanes: u8,
+    elements: usize,
+) -> Result<VectorLoop, String> {
+    if !matches!(lanes, 2 | 4 | 8) {
+        return Err(format!("unsupported f64 vector width: {lanes}"));
+    }
+    let body = lower_f64_vector(function, lanes)?;
+    let induction_step = usize::from(lanes);
+    Ok(VectorLoop {
+        lanes,
+        elements,
+        induction_start: 0,
+        induction_step,
+        full_chunks: elements / induction_step,
+        tail: elements % induction_step,
+        store: VectorStore {
+            value: body.result,
+            offset: 0,
+            lanes,
+        },
+        body,
     })
 }
 
@@ -256,14 +315,9 @@ pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, S
     if plan.width != SimdWidth::Scalar {
         let mut values = Vec::with_capacity(elements);
         let lanes = plan.width.lanes();
-        let packed_chunks = (0..plan.full_chunks)
-            .map(|chunk| try_evaluate_packed_chunk(&function, columns, chunk * lanes, plan.width))
-            .collect::<Option<Vec<_>>>();
-        if let Some(chunks) = packed_chunks {
+        if let Some(chunks) = try_evaluate_packed_loop(&function, columns, plan) {
             let mut used_packed = plan.full_chunks > 0;
-            for chunk in chunks {
-                values.extend(chunk);
-            }
+            values.extend(chunks);
             if plan.tail > 0 {
                 if let Some(tail) = try_evaluate_packed_tail(
                     &function,
@@ -318,12 +372,9 @@ pub fn reduce_sum(source: &str, columns: &[&[f64]]) -> Result<ReductionResult, S
     let (function, plan) = prepare_array(source, columns)?;
     if plan.width != SimdWidth::Scalar {
         let lanes = plan.width.lanes();
-        let packed_chunks = (0..plan.full_chunks)
-            .map(|chunk| try_evaluate_packed_chunk(&function, columns, chunk * lanes, plan.width))
-            .collect::<Option<Vec<_>>>();
-        if let Some(chunks) = packed_chunks {
+        if let Some(chunks) = try_evaluate_packed_loop(&function, columns, plan) {
             let mut used_packed = plan.full_chunks > 0;
-            let mut values = chunks.into_iter().flatten().collect::<Vec<_>>();
+            let mut values = chunks;
             if plan.tail > 0 {
                 if let Some(tail) = try_evaluate_packed_tail(
                     &function,
@@ -413,14 +464,36 @@ fn get_packed<V: PackedOps>(values: &[Option<V::Vector>], value: Value) -> Resul
         .ok_or(())
 }
 
-unsafe fn evaluate_packed<V: PackedOps>(
+unsafe fn evaluate_packed_loop<V: PackedOps>(
     function: &Function,
     columns: &[&[f64]],
-    start: usize,
+    plan: ArrayPlan,
 ) -> Result<Vec<f64>, ()> {
-    evaluate_packed_with_active::<V>(function, columns, start, V::LANES)
+    let vector_loop =
+        lower_f64_vector_loop(function, V::LANES as u8, plan.elements).map_err(|_| ())?;
+    if vector_loop.store.value != vector_loop.body.result
+        || vector_loop.store.lanes as usize != V::LANES
+    {
+        return Err(());
+    }
+    let mut values = Vec::with_capacity(vector_loop.full_chunks * vector_loop.lanes as usize);
+    for iteration in 0..vector_loop.full_chunks {
+        let start = vector_loop
+            .induction_start
+            .checked_add(iteration * vector_loop.induction_step)
+            .ok_or(())?;
+        values.extend(evaluate_vector_function::<V>(
+            function,
+            &vector_loop.body,
+            columns,
+            start,
+            vector_loop.lanes as usize,
+        )?);
+    }
+    Ok(values)
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn evaluate_packed_with_active<V: PackedOps>(
     function: &Function,
     columns: &[&[f64]],
@@ -431,16 +504,51 @@ unsafe fn evaluate_packed_with_active<V: PackedOps>(
         return Err(());
     }
     let vector = lower_f64_vector(function, V::LANES as u8).map_err(|_| ())?;
+    evaluate_vector_function::<V>(function, &vector, columns, start, active)
+}
+
+unsafe fn evaluate_vector_function<V: PackedOps>(
+    function: &Function,
+    vector: &VectorFunction,
+    columns: &[&[f64]],
+    start: usize,
+    active: usize,
+) -> Result<Vec<f64>, ()> {
     let mut values = vec![None; function.insts.len()];
-    for (value, inst) in vector.insts {
+    for &(value, inst) in &vector.insts {
         let result = match inst {
             VectorInst::SplatF64(bits) => V::splat(f64::from_bits(bits)),
             VectorInst::Param { index } => {
                 let column = columns.get(index as usize).ok_or(())?;
-                if start + active > column.len() {
+                if start.checked_add(active).ok_or(())? > column.len() {
                     return Err(());
                 }
                 V::load_masked(column[start..].as_ptr(), active)?
+            }
+            VectorInst::VecLoad {
+                base,
+                offset,
+                lanes,
+            } => {
+                if usize::from(lanes) != V::LANES {
+                    return Err(());
+                }
+                let Some(Inst::Param { index, ty: Ty::F64 }) = function.insts.get(base.0 as usize)
+                else {
+                    return Err(());
+                };
+                let begin = if offset >= 0 {
+                    start.checked_add(offset as usize).ok_or(())?
+                } else {
+                    start
+                        .checked_sub(offset.unsigned_abs() as usize)
+                        .ok_or(())?
+                };
+                let column = columns.get(*index as usize).ok_or(())?;
+                if begin.checked_add(active).ok_or(())? > column.len() {
+                    return Err(());
+                }
+                V::load_masked(column[begin..].as_ptr(), active)?
             }
             VectorInst::Move(value) => get_packed::<V>(&values, value)?,
             VectorInst::Add(lhs, rhs) => V::add(
@@ -480,9 +588,7 @@ unsafe fn evaluate_packed_with_active<V: PackedOps>(
                     get_packed::<V>(&values, c)?,
                 )
             }
-            VectorInst::VecLoad { .. }
-            | VectorInst::VecStore { .. }
-            | VectorInst::VecReduce { .. } => return Err(()),
+            VectorInst::VecStore { .. } | VectorInst::VecReduce { .. } => return Err(()),
         };
         values[value.0 as usize] = Some(result);
     }
@@ -493,40 +599,39 @@ unsafe fn evaluate_packed_with_active<V: PackedOps>(
     Ok(output)
 }
 
-fn try_evaluate_packed_chunk(
+fn try_evaluate_packed_loop(
     function: &Function,
     columns: &[&[f64]],
-    start: usize,
-    width: SimdWidth,
+    plan: ArrayPlan,
 ) -> Option<Vec<f64>> {
     #[cfg(target_arch = "x86_64")]
-    if width == SimdWidth::F64x8 && std::is_x86_feature_detected!("avx512f") {
+    if plan.width == SimdWidth::F64x8 && std::is_x86_feature_detected!("avx512f") {
         // SAFETY: runtime feature detection proves AVX-512F is available.
-        return unsafe { evaluate_packed::<x86_packed::Avx512>(function, columns, start) }.ok();
+        return unsafe { evaluate_packed_loop::<x86_packed::Avx512>(function, columns, plan) }.ok();
     }
     #[cfg(target_arch = "x86_64")]
-    if width == SimdWidth::F64x4 && std::is_x86_feature_detected!("avx2") {
+    if plan.width == SimdWidth::F64x4 && std::is_x86_feature_detected!("avx2") {
         // SAFETY: runtime feature detection proves AVX2 is available. FMA is
         // selected separately because fused multiply-add changes rounding.
         if function_uses_fma(function) {
             if !std::is_x86_feature_detected!("fma") {
                 return None;
             }
-            return unsafe { evaluate_packed::<x86_packed::Avx2Fma>(function, columns, start) }
+            return unsafe { evaluate_packed_loop::<x86_packed::Avx2Fma>(function, columns, plan) }
                 .ok();
         }
-        return unsafe { evaluate_packed::<x86_packed::Avx2>(function, columns, start) }.ok();
+        return unsafe { evaluate_packed_loop::<x86_packed::Avx2>(function, columns, plan) }.ok();
     }
     #[cfg(target_arch = "x86_64")]
-    if width == SimdWidth::F64x2 && std::is_x86_feature_detected!("sse2") {
+    if plan.width == SimdWidth::F64x2 && std::is_x86_feature_detected!("sse2") {
         // SAFETY: SSE2 is guaranteed by the runtime check and lane ranges
         // were checked inside evaluate_packed.
-        return unsafe { evaluate_packed::<x86_packed::Sse2>(function, columns, start) }.ok();
+        return unsafe { evaluate_packed_loop::<x86_packed::Sse2>(function, columns, plan) }.ok();
     }
     #[cfg(target_arch = "aarch64")]
-    if width == SimdWidth::F64x2 {
+    if plan.width == SimdWidth::F64x2 {
         // AArch64 always provides the NEON register set used here.
-        return unsafe { evaluate_packed::<neon_packed::Neon>(function, columns, start) }.ok();
+        return unsafe { evaluate_packed_loop::<neon_packed::Neon>(function, columns, plan) }.ok();
     }
     None
 }
@@ -1355,10 +1460,14 @@ mod tests {
         let function = forge_runtime::lower_source("fma(x, 2.0, y) + sqrt(abs(x))").unwrap();
         let vector = lower_f64_vector(&function, 4).unwrap();
         assert_eq!(vector.lanes, 4);
-        assert!(vector
-            .insts
-            .iter()
-            .any(|(_, inst)| matches!(inst, VectorInst::Param { index: 0 })));
+        assert!(vector.insts.iter().any(|(_, inst)| matches!(
+            inst,
+            VectorInst::VecLoad {
+                base: Value(0),
+                lanes: 4,
+                ..
+            }
+        )));
         assert!(vector
             .insts
             .iter()
@@ -1367,6 +1476,29 @@ mod tests {
             .insts
             .iter()
             .any(|(_, inst)| matches!(inst, VectorInst::Sqrt(_))));
+    }
+
+    #[test]
+    fn vector_loop_lowering_models_induction_and_output_store() {
+        let function = forge_runtime::lower_source("x * x + 1.0").unwrap();
+        let loop_ir = lower_f64_vector_loop(&function, 4, 10).unwrap();
+
+        assert_eq!(loop_ir.induction_start, 0);
+        assert_eq!(loop_ir.induction_step, 4);
+        assert_eq!(loop_ir.full_chunks, 2);
+        assert_eq!(loop_ir.tail, 2);
+        assert_eq!(loop_ir.store.value, loop_ir.body.result);
+        assert_eq!(loop_ir.store.offset, 0);
+        assert_eq!(loop_ir.store.lanes, 4);
+        assert_eq!(
+            loop_ir
+                .body
+                .insts
+                .iter()
+                .filter(|(_, inst)| matches!(inst, VectorInst::VecLoad { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
