@@ -609,6 +609,51 @@ pub fn is_native_target() -> bool {
     backend_info().target_available
 }
 
+fn aarch64_param_bank_ordinal(params: &[(String, Ty)], index: usize, ty: Ty) -> usize {
+    params[..index]
+        .iter()
+        .filter(|(_, candidate)| *candidate == ty)
+        .count()
+}
+
+/// Returns the zero-based stack-slot ordinal for an AAPCS64 parameter that
+/// overflows its type-specific register bank. Stack arguments are assigned in
+/// source parameter order after the floating-point and integer banks are
+/// exhausted.
+pub fn stack_param_ordinal(params: &[(String, Ty)], index: usize) -> Option<usize> {
+    let mut integer_ordinal = 0usize;
+    let mut float_ordinal = 0usize;
+    let mut stack_ordinal = 0usize;
+    for (candidate_index, (_, ty)) in params.iter().enumerate() {
+        let ordinal = match ty {
+            Ty::F64 => {
+                let ordinal = float_ordinal;
+                float_ordinal += 1;
+                ordinal
+            }
+            Ty::I64 | Ty::Bool => {
+                let ordinal = integer_ordinal;
+                integer_ordinal += 1;
+                ordinal
+            }
+        };
+        if ordinal >= 8 {
+            if candidate_index == index {
+                return Some(stack_ordinal);
+            }
+            stack_ordinal += 1;
+        }
+    }
+    None
+}
+
+fn aarch64_has_stack_params(params: &[(String, Ty)]) -> bool {
+    params
+        .iter()
+        .enumerate()
+        .any(|(index, (_, _))| stack_param_ordinal(params, index).is_some())
+}
+
 /// Emits a complete AAPCS64 scalar function with an f64 result for the
 /// supported IR subset. Floating parameters use D0..D7 and integer/bool
 /// parameters use X0..X7, as required by the independent AAPCS64 argument
@@ -679,8 +724,13 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         .iter()
         .any(|inst| matches!(inst, Inst::Call { .. }))
         && function.params.iter().all(|(_, ty)| *ty == Ty::F64);
-    if stack_spill_f64 && (non_param_count > 24 || contains_f64_call) {
-        return emit_f64_with_stack_spills(function);
+    let has_stack_params = aarch64_has_stack_params(&function.params);
+    if stack_spill_f64 && (non_param_count > 24 || contains_f64_call || has_stack_params) {
+        return if has_stack_params {
+            emit_mixed_f64_with_stack_spills(function)
+        } else {
+            emit_f64_with_stack_spills(function)
+        };
     }
 
     let mixed_stack_spill_f64 = function.blocks.iter().all(|block| {
@@ -730,7 +780,7 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         .insts
         .iter()
         .any(|inst| matches!(inst, Inst::Call { .. }));
-    if mixed_stack_spill_f64 && (non_param_count > 24 || contains_mixed_call) {
+    if mixed_stack_spill_f64 && (non_param_count > 24 || contains_mixed_call || has_stack_params) {
         return emit_mixed_f64_with_stack_spills(function);
     }
 
@@ -1411,6 +1461,7 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
         .iter()
         .any(|inst| matches!(inst, Inst::Call { .. }));
     let mut locations = HashMap::<Value, MixedLocation>::new();
+    let mut incoming_stack_offsets = HashMap::<Value, u16>::new();
     let mut next_slot = 24u16;
     for block in &function.blocks {
         for &value in &block.insts {
@@ -1426,20 +1477,20 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                     if declared_ty != ty || function.types.get(value.0 as usize) != Some(ty) {
                         return Err(format!("parameter {index} has inconsistent IR type"));
                     }
-                    let ordinal = function.params[..index]
-                        .iter()
-                        .filter(|(_, candidate)| candidate == ty)
-                        .count();
-                    if ordinal >= 8 {
-                        return Err(format!(
-                            "AArch64 mixed spill emitter supports at most 8 {ty:?} parameters"
-                        ));
-                    }
-                    if contains_call {
+                    let ordinal = aarch64_param_bank_ordinal(&function.params, index, *ty);
+                    if ordinal >= 8 || contains_call {
                         let slot = next_slot;
                         next_slot = next_slot
                             .checked_add(8)
                             .ok_or_else(|| "AArch64 mixed spill frame is too large".to_string())?;
+                        if ordinal >= 8 {
+                            let stack_ordinal = stack_param_ordinal(&function.params, index)
+                                .expect("parameters beyond the AAPCS64 bank limit use the stack");
+                            let offset = u16::try_from(stack_ordinal * 8).map_err(|_| {
+                                "AArch64 incoming stack parameter area is too large".to_string()
+                            })?;
+                            incoming_stack_offsets.insert(value, offset);
+                        }
                         MixedLocation::Stack(slot)
                     } else {
                         MixedLocation::Register(match ty {
@@ -1492,22 +1543,42 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
     for (register, offset) in [(int_a, 0), (int_b, 8), (int_c, 16)] {
         asm.str(register, SP, offset);
     }
-    if contains_call {
+    if contains_call || !incoming_stack_offsets.is_empty() {
         for block in &function.blocks {
             for &value in &block.insts {
                 let &Inst::Param { index, ty } = &function.insts[value.0 as usize] else {
                     continue;
                 };
-                let ordinal = function.params[..index as usize]
-                    .iter()
-                    .filter(|(_, candidate)| *candidate == ty)
-                    .count();
                 let MixedLocation::Stack(offset) = location_of(value)? else {
-                    return Err(format!("parameter {value:?} was not assigned a stack slot"));
+                    continue;
                 };
+                let ordinal = aarch64_param_bank_ordinal(&function.params, index as usize, ty);
+                let source_offset =
+                    if let Some(&incoming_offset) = incoming_stack_offsets.get(&value) {
+                        let source_offset = usize::from(frame_bytes) + usize::from(incoming_offset);
+                        u16::try_from(source_offset).map_err(|_| {
+                            "AArch64 incoming stack parameter offset is out of range".to_string()
+                        })?
+                    } else {
+                        0
+                    };
                 match ty {
-                    Ty::F64 => asm.str_d(Gpr::new_d(ordinal as u8), SP, offset),
-                    Ty::I64 | Ty::Bool => asm.str(Gpr::new(ordinal as u8), SP, offset),
+                    Ty::F64 => {
+                        if incoming_stack_offsets.contains_key(&value) {
+                            asm.ldr_d(float_a, SP, source_offset);
+                            asm.str_d(float_a, SP, offset);
+                        } else {
+                            asm.str_d(Gpr::new_d(ordinal as u8), SP, offset);
+                        }
+                    }
+                    Ty::I64 | Ty::Bool => {
+                        if incoming_stack_offsets.contains_key(&value) {
+                            asm.ldr(int_a, SP, source_offset);
+                            asm.str(int_a, SP, offset);
+                        } else {
+                            asm.str(Gpr::new(ordinal as u8), SP, offset);
+                        }
+                    }
                 }
             }
         }
@@ -2750,6 +2821,79 @@ mod tests {
             .any(|word| *word == str_d(Gpr::new_d(0), SP, 24)));
         assert!(words.iter().any(|word| *word == str_(Gpr::new(0), SP, 32)));
         assert!(words.iter().any(|word| *word == ldr(Gpr::new(28), SP, 32)));
+    }
+
+    #[test]
+    fn emits_aapcs64_stack_backed_mixed_parameters() {
+        let source = (0..9)
+            .map(|index| format!("f{index} + (i{index} & 1)"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let frame_bytes = ((words[0] >> 10) & 0x0fff) as u16;
+        // The ninth f64 and i64
+        // parameters arrive at consecutive AAPCS64 stack slots before the
+        // body frame, then are copied into their local typed slots.
+        assert!(words
+            .iter()
+            .any(|word| *word == ldr_d(Gpr::new_d(29), SP, frame_bytes)));
+        assert!(words
+            .iter()
+            .any(|word| *word == ldr(Gpr::new(28), SP, frame_bytes + 8)));
+        assert!(words
+            .iter()
+            .any(|word| *word == str_d(Gpr::new_d(29), SP, 24)));
+        assert!(words.iter().any(|word| *word == str_(Gpr::new(28), SP, 32)));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_aapcs64_stack_backed_mixed_parameters() {
+        let source = (0..9)
+            .map(|index| format!("f{index} + (i{index} & 1)"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function_ir = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function_ir).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        // SAFETY: the emitted body follows the AAPCS64 fn(f64, i64, ...)
+        // -> f64 convention, including its two stack-backed arguments, and
+        // the executable buffer remains alive for the call.
+        let function: unsafe extern "C" fn(
+            f64,
+            i64,
+            f64,
+            i64,
+            f64,
+            i64,
+            f64,
+            i64,
+            f64,
+            i64,
+            f64,
+            i64,
+            f64,
+            i64,
+            f64,
+            i64,
+            f64,
+            i64,
+        ) -> f64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
+        assert_eq!(
+            unsafe {
+                function(
+                    1.0, 1, 2.0, 1, 3.0, 1, 4.0, 1, 5.0, 1, 6.0, 1, 7.0, 1, 8.0, 1, 9.0, 1,
+                )
+            },
+            54.0
+        );
     }
 
     #[cfg(target_arch = "aarch64")]

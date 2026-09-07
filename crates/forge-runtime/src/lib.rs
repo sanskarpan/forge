@@ -397,17 +397,10 @@ fn execute_native_typed_aarch64(
         .ok_or(CompileError::UnsupportedTarget(
             "function has no result type",
         ))?;
-    let float_args = function
-        .params
-        .iter()
-        .filter(|(_, ty)| *ty == forge_ir::Ty::F64)
-        .count();
-    let integer_args = function
-        .params
-        .iter()
-        .filter(|(_, ty)| *ty != forge_ir::Ty::F64)
-        .count();
-    if float_args > 8 || integer_args > 8 {
+    // The mixed f64-result emitter also handles AAPCS64 stack-backed
+    // parameters. Keep the packed trampoline's immediate-offset limit
+    // explicit so an unusually large public signature falls back cleanly.
+    if function.params.len() > 4095 {
         return Ok(None);
     }
 
@@ -474,22 +467,51 @@ fn emit_typed_trampoline_aarch64(
 ) {
     let packed = Aarch64Gpr::new(16);
     let target_reg = Aarch64Gpr::new(17);
+    let stack_scratch = Aarch64Gpr::new(15);
     let link = Aarch64Gpr::new(30);
     asm.sub_imm(AARCH64_SP, AARCH64_SP, 16, false);
     asm.str(link, AARCH64_SP, 0);
     asm.orr_reg(packed, Aarch64Gpr::new(0), XZR);
+
+    let stack_args = (0..params.len())
+        .filter_map(|index| {
+            forge_aarch64::stack_param_ordinal(params, index).map(|ordinal| (index, ordinal))
+        })
+        .collect::<Vec<_>>();
+    let mut stack_bytes = stack_args.len() * 8;
+    if !stack_args.is_empty() && !stack_bytes.is_multiple_of(16) {
+        stack_bytes += 8;
+    }
+    let stack_bytes = u16::try_from(stack_bytes)
+        .expect("AArch64 typed trampoline stack area fits its immediate offset");
+    if stack_bytes != 0 {
+        asm.sub_imm(AARCH64_SP, AARCH64_SP, stack_bytes, false);
+    }
 
     let mut integer_ordinal = 0u8;
     let mut float_ordinal = 0u8;
     for (index, (_, ty)) in params.iter().enumerate() {
         let offset = u16::try_from(index * 8).expect("packed typed arguments fit AArch64 offset");
         if *ty == forge_ir::Ty::F64 {
-            asm.ldr_d(Aarch64Gpr::new_d(float_ordinal), packed, offset);
+            if float_ordinal < 8 {
+                asm.ldr_d(Aarch64Gpr::new_d(float_ordinal), packed, offset);
+            }
             float_ordinal += 1;
         } else {
-            asm.ldr(Aarch64Gpr::new(integer_ordinal), packed, offset);
+            if integer_ordinal < 8 {
+                asm.ldr(Aarch64Gpr::new(integer_ordinal), packed, offset);
+            }
             integer_ordinal += 1;
         }
+    }
+
+    for (index, stack_ordinal) in stack_args {
+        let packed_offset =
+            u16::try_from(index * 8).expect("packed typed arguments fit AArch64 offset");
+        let stack_offset = u16::try_from(stack_ordinal * 8)
+            .expect("AArch64 stack arguments fit the immediate offset");
+        asm.ldr(stack_scratch, packed, packed_offset);
+        asm.str(stack_scratch, AARCH64_SP, stack_offset);
     }
 
     let target = target as u64;
@@ -498,6 +520,9 @@ fn emit_typed_trampoline_aarch64(
     asm.movk(target_reg, ((target >> 32) & 0xffff) as u16, 32);
     asm.movk(target_reg, ((target >> 48) & 0xffff) as u16, 48);
     asm.blr(target_reg);
+    if stack_bytes != 0 {
+        asm.add_imm(AARCH64_SP, AARCH64_SP, stack_bytes, false);
+    }
     asm.ldr(link, AARCH64_SP, 0);
     asm.add_imm(AARCH64_SP, AARCH64_SP, 16, false);
     asm.ret();
@@ -758,6 +783,23 @@ mod tests {
             evaluate_typed("p0 + p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8", &float_args,).unwrap(),
             RtValue::F64(45.0)
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn typed_runtime_marshals_aapcs64_stack_backed_mixed_parameters() {
+        let source = (0..9)
+            .map(|index| format!("f{index} + (i{index} & 1)"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let args = (0..9)
+            .flat_map(|index| [RtValue::F64((index + 1) as f64), RtValue::I64(1)])
+            .collect::<Vec<_>>();
+        let function = lower_source(&source).unwrap();
+        assert!(execute_native_typed_aarch64(&args, &function)
+            .unwrap()
+            .is_some());
+        assert_eq!(evaluate_typed(&source, &args).unwrap(), RtValue::F64(54.0));
     }
 
     #[test]
