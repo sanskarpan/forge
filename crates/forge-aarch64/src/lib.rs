@@ -172,6 +172,22 @@ impl Assembler {
         self.words.push(fmax_d(dst, lhs, rhs));
     }
 
+    pub fn frintm_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(frintm_d(dst, src));
+    }
+
+    pub fn frintp_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(frintp_d(dst, src));
+    }
+
+    pub fn frintn_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(frintn_d(dst, src));
+    }
+
+    pub fn frintz_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(frintz_d(dst, src));
+    }
+
     pub fn fcvtzs(&mut self, dst: Gpr, src: Gpr) {
         self.words.push(fcvtzs(dst, src));
     }
@@ -458,6 +474,26 @@ pub fn fmax_d(dst: Gpr, lhs: Gpr, rhs: Gpr) -> u32 {
     // See fmin_d: use the numeric form so native execution preserves the
     // interpreter's NaN behavior.
     rr(0x1e60_6800, dst, lhs, rhs)
+}
+
+/// Round toward negative infinity (`floor`).
+pub fn frintm_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e65_4000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
+/// Round toward positive infinity (`ceil`).
+pub fn frintp_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e64_c000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
+/// Round to nearest integral value, using the architectural ties-to-even mode.
+pub fn frintn_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e64_4000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
+/// Round toward zero (`trunc`).
+pub fn frintz_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e65_c000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
 }
 
 pub fn fcvtzs(dst: Gpr, src: Gpr) -> u32 {
@@ -2687,6 +2723,10 @@ mod tests {
         assert_eq!(fadd_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_2820);
         assert_eq!(fmin_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_7820);
         assert_eq!(fmax_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_6820);
+        assert_eq!(frintm_d(Gpr::new(0), Gpr::new(1)), 0x1e65_4020);
+        assert_eq!(frintp_d(Gpr::new(2), Gpr::new(3)), 0x1e64_c062);
+        assert_eq!(frintn_d(Gpr::new(4), Gpr::new(5)), 0x1e64_40a4);
+        assert_eq!(frintz_d(Gpr::new(6), Gpr::new(7)), 0x1e65_c0e6);
         assert_eq!(fcmp_d(Gpr::new(1), Gpr::new(2)), 0x1e62_2020);
         assert_eq!(fsqrt_d(Gpr::new(0), Gpr::new(1)), 0x1e61_c020);
         assert_eq!(
