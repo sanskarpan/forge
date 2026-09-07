@@ -14,8 +14,8 @@ struct EmitContext<'a> {
 
 /// Lowers a selected function into a self-contained x86-64 code sequence.
 /// Spilled values are reloaded into allocator-reserved scratch registers and
-/// written back after their defining instruction. A frame is emitted only
-/// when the allocation contains spills.
+/// written back after their defining instruction. A frame is emitted when the
+/// allocation contains spills, stack-backed parameters, or callee-saved values.
 pub fn emit_body(
     func: &Function,
     selected: &SelectedFunction,
@@ -28,6 +28,10 @@ pub fn emit_body(
         .collect::<HashMap<_, _>>();
     let framed =
         assignment.values().any(|l| matches!(l, Location::Spill(_)))
+            || assignment.values().any(|location| match location {
+                Location::Reg(reg) => forge_x64::CALLEE_SAVED.contains(reg),
+                Location::Spill(_) => false,
+            })
             || (cfg!(windows) && func.params.len() > 4)
             || (!cfg!(windows)
                 && func.params.iter().enumerate().any(|(index, (_, ty))| {
@@ -42,11 +46,17 @@ pub fn emit_body(
         .max()
         .unwrap_or(0)
         .saturating_mul(8);
-    let callee_saved: Vec<PhysReg> = forge_x64::SYSV_CALLEE_SAVED
+    let callee_saved: Vec<PhysReg> = forge_x64::CALLEE_SAVED
         .iter()
         .copied()
         .filter(|r| assignment.values().any(|l| *l == Location::Reg(*r)))
         .collect();
+    let spill_bias = if cfg!(windows) {
+        i32::try_from(callee_saved.len() * 8)
+            .expect("callee-saved frame is too large for an x86 displacement")
+    } else {
+        0
+    };
     if framed {
         forge_x64::emit_prologue(&mut asm, &callee_saved, spill_bytes);
     }
@@ -66,7 +76,7 @@ pub fn emit_body(
             .unwrap_or(selected.insts.len());
         asm.bind(block_labels[&block]);
         if block == func.entry {
-            emit_params(func, selected, assignment, &mut asm, framed);
+            emit_params(func, selected, assignment, &mut asm, framed, spill_bias);
         }
 
         for (offset, inst) in selected.insts[start..end].iter().enumerate() {
@@ -83,9 +93,9 @@ pub fn emit_body(
                     if let Location::Spill(slot) = assignment[&value] {
                         let reg = scratch[&value];
                         if value_ty(func, selected, value) == Ty::F64 {
-                            asm.movsd_reg_mem(reg, PhysReg::Rbp, spill_offset(slot));
+                            asm.movsd_reg_mem(reg, PhysReg::Rbp, spill_offset(slot, spill_bias));
                         } else {
-                            asm.mov_reg_mem(reg, PhysReg::Rbp, spill_offset(slot));
+                            asm.mov_reg_mem(reg, PhysReg::Rbp, spill_offset(slot, spill_bias));
                         }
                     }
                 }
@@ -131,15 +141,15 @@ pub fn emit_body(
                     });
                 }
                 MachineInst::Jump { target } => {
-                    emit_phi_edge_copies(func, block, *target, assignment, &mut asm);
+                    emit_phi_edge_copies(func, block, *target, assignment, &mut asm, spill_bias);
                     asm.jmp(block_labels[target]);
                 }
                 MachineInst::Branch { cond, then_, else_ } => {
-                    emit_phi_edge_copies(func, block, *then_, assignment, &mut asm);
+                    emit_phi_edge_copies(func, block, *then_, assignment, &mut asm, spill_bias);
                     let cond_r = loc(*cond);
                     asm.test_reg_reg(cond_r, cond_r);
                     asm.jcc(ConditionCode::NotEqual, block_labels[then_]);
-                    emit_phi_edge_copies(func, block, *else_, assignment, &mut asm);
+                    emit_phi_edge_copies(func, block, *else_, assignment, &mut asm, spill_bias);
                     asm.jmp(block_labels[else_]);
                 }
                 MachineInst::Return { value } => {
@@ -171,9 +181,9 @@ pub fn emit_body(
                     if let Location::Spill(slot) = assignment[&dst] {
                         let reg = scratch[&dst];
                         if value_ty(func, selected, dst) == Ty::F64 {
-                            asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(slot), reg);
+                            asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(slot, spill_bias), reg);
                         } else {
-                            asm.mov_mem_reg(PhysReg::Rbp, spill_offset(slot), reg);
+                            asm.mov_mem_reg(PhysReg::Rbp, spill_offset(slot, spill_bias), reg);
                         }
                     }
                 }
@@ -203,6 +213,7 @@ fn emit_phi_edge_copies(
     target: Block,
     assignment: &HashMap<Value, Location>,
     asm: &mut Assembler,
+    spill_bias: i32,
 ) {
     let mut copies = Vec::new();
     for &phi in &func.blocks[target.0 as usize].insts {
@@ -226,10 +237,10 @@ fn emit_phi_edge_copies(
             });
         }
     }
-    emit_parallel_copies(&mut copies, asm);
+    emit_parallel_copies(&mut copies, asm, spill_bias);
 }
 
-fn emit_parallel_copies(copies: &mut Vec<PhiCopy>, asm: &mut Assembler) {
+fn emit_parallel_copies(copies: &mut Vec<PhiCopy>, asm: &mut Assembler, spill_bias: i32) {
     while !copies.is_empty() {
         let safe = (0..copies.len()).find(|&index| {
             !copies
@@ -239,7 +250,7 @@ fn emit_parallel_copies(copies: &mut Vec<PhiCopy>, asm: &mut Assembler) {
         });
         if let Some(index) = safe {
             let copy = copies.remove(index);
-            emit_copy(asm, copy.src, copy.dst, copy.ty);
+            emit_copy(asm, copy.src, copy.dst, copy.ty, spill_bias);
             continue;
         }
 
@@ -254,7 +265,7 @@ fn emit_parallel_copies(copies: &mut Vec<PhiCopy>, asm: &mut Assembler) {
             ),
             "φ parallel-copy scratch register is unexpectedly allocated"
         );
-        emit_copy(asm, first.src, Location::Reg(scratch), first.ty);
+        emit_copy(asm, first.src, Location::Reg(scratch), first.ty, spill_bias);
         for copy in copies.iter_mut() {
             if copy.src == first.src {
                 copy.src = Location::Reg(scratch);
@@ -263,7 +274,7 @@ fn emit_parallel_copies(copies: &mut Vec<PhiCopy>, asm: &mut Assembler) {
     }
 }
 
-fn emit_copy(asm: &mut Assembler, src: Location, dst: Location, ty: Ty) {
+fn emit_copy(asm: &mut Assembler, src: Location, dst: Location, ty: Ty, spill_bias: i32) {
     match (src, dst) {
         (Location::Reg(src), Location::Reg(dst)) => {
             if src != dst {
@@ -276,26 +287,26 @@ fn emit_copy(asm: &mut Assembler, src: Location, dst: Location, ty: Ty) {
         }
         (Location::Spill(slot), Location::Reg(dst)) => {
             if ty == Ty::F64 {
-                asm.movsd_reg_mem(dst, PhysReg::Rbp, spill_offset(slot));
+                asm.movsd_reg_mem(dst, PhysReg::Rbp, spill_offset(slot, spill_bias));
             } else {
-                asm.mov_reg_mem(dst, PhysReg::Rbp, spill_offset(slot));
+                asm.mov_reg_mem(dst, PhysReg::Rbp, spill_offset(slot, spill_bias));
             }
         }
         (Location::Reg(src), Location::Spill(slot)) => {
             if ty == Ty::F64 {
-                asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(slot), src);
+                asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(slot, spill_bias), src);
             } else {
-                asm.mov_mem_reg(PhysReg::Rbp, spill_offset(slot), src);
+                asm.mov_mem_reg(PhysReg::Rbp, spill_offset(slot, spill_bias), src);
             }
         }
         (Location::Spill(src), Location::Spill(dst)) => {
             let scratch = phi_scratch(ty);
             if ty == Ty::F64 {
-                asm.movsd_reg_mem(scratch, PhysReg::Rbp, spill_offset(src));
-                asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(dst), scratch);
+                asm.movsd_reg_mem(scratch, PhysReg::Rbp, spill_offset(src, spill_bias));
+                asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(dst, spill_bias), scratch);
             } else {
-                asm.mov_reg_mem(scratch, PhysReg::Rbp, spill_offset(src));
-                asm.mov_mem_reg(PhysReg::Rbp, spill_offset(dst), scratch);
+                asm.mov_reg_mem(scratch, PhysReg::Rbp, spill_offset(src, spill_bias));
+                asm.mov_mem_reg(PhysReg::Rbp, spill_offset(dst, spill_bias), scratch);
             }
         }
     }
@@ -319,6 +330,7 @@ fn emit_params(
     assignment: &HashMap<Value, Location>,
     asm: &mut Assembler,
     framed: bool,
+    spill_bias: i32,
 ) {
     let mut register_copies = Vec::new();
     let mut stack_params = Vec::new();
@@ -342,14 +354,20 @@ fn emit_params(
         }
     }
 
-    emit_parallel_copies(&mut register_copies, asm);
+    emit_parallel_copies(&mut register_copies, asm, spill_bias);
     for (index, destination, ty) in stack_params {
         let destination_register = match destination {
             Location::Reg(reg) => reg,
             Location::Spill(slot) => {
                 let scratch = phi_scratch(ty);
                 emit_stack_param_load(&func.params, index, ty, scratch, asm, framed);
-                emit_copy(asm, Location::Reg(scratch), Location::Spill(slot), ty);
+                emit_copy(
+                    asm,
+                    Location::Reg(scratch),
+                    Location::Spill(slot),
+                    ty,
+                    spill_bias,
+                );
                 continue;
             }
         };
@@ -413,12 +431,15 @@ fn emit_stack_param_load(
     }
 }
 
-fn spill_offset(slot: u32) -> i32 {
+fn spill_offset(slot: u32, spill_bias: i32) -> i32 {
     let bytes = slot
         .checked_add(1)
         .and_then(|n| n.checked_mul(8))
         .expect("spill frame is too large for an x86 displacement");
-    -(i32::try_from(bytes).expect("spill frame is too large for an x86 displacement"))
+    -i32::try_from(bytes)
+        .expect("spill frame is too large for an x86 displacement")
+        .checked_add(spill_bias)
+        .expect("spill frame is too large for an x86 displacement")
 }
 
 fn assign_spill_scratch(
