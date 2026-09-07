@@ -847,6 +847,26 @@ mod tests {
         assert_eq!(evaluate_typed(&source, &args).unwrap(), RtValue::Bool(true));
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn typed_runtime_executes_aapcs64_rounding_intrinsics_natively() {
+        for (source, expected) in [
+            ("floor(x)", -3.0),
+            ("ceil(x)", -2.0),
+            ("round(x)", -3.0),
+            ("trunc(x)", -2.0),
+        ] {
+            assert_eq!(
+                evaluate_typed(source, &[RtValue::F64(-2.5)]).unwrap(),
+                RtValue::F64(expected)
+            );
+        }
+        assert_eq!(
+            evaluate_typed("floor(x) + (n & 1)", &[RtValue::F64(2.75), RtValue::I64(3)]).unwrap(),
+            RtValue::F64(3.0)
+        );
+    }
+
     #[test]
     fn depth_100_expression_compiles_and_runs() {
         let source = (0..100).fold("x".to_string(), |expression, _| {
