@@ -1164,6 +1164,19 @@ keeps SP 16-byte aligned, preserves the caller's frame pointer and link
 register, and makes spill, CFG, typed-parameter, and process-local libm paths
 conform to the same prologue/epilogue convention.
 
+### AArch64 scalar live-range reuse
+
+Eligible straight-line scalar programs without calls, stack-backed parameters,
+or unsupported operations use an inclusive liveness-based allocator. D16..D31
+and X8..X18 are preferred because they are caller-saved; D8..D15 and X19..X28
+are selected only when simultaneous live values require them, and the existing
+aligned frame-record machinery preserves those registers. A value whose last
+use has ended is eligible for reuse, while touching intervals remain distinct.
+Structured CFGs continue to use the established monotonic assignment and
+edge-copy/spill paths until edge-aware interval splitting is available. This
+boundary improves allocation of long straight-line chains without claiming
+general spill insertion or arbitrary external-call ABI support.
+
 ---
 
 ## §10 WASM Backend (for the workbench)
@@ -1303,7 +1316,8 @@ X0..X7 and supported bool-returning bodies whose comparison operands overflow a
 register bank. Native AArch64 scalar `floor`, `ceil`, `round`, and `trunc`
 also use the corresponding FRINT instruction in both register and supported
 stack-spill bodies. Control-flow phi spilling beyond the supported typed spill
-shapes, general live-range allocation, and broader external calls remain
+shapes, edge-aware/general live-range allocation across structured CFGs, and
+broader external calls remain
 outside this typed trampoline boundary.
 Unsupported shapes fall back to the interpreter rather than being called
 through an unverifiable function pointer type.

@@ -2,7 +2,7 @@
 //! backend. Instructions are kept as 32-bit words until [`Assembler::bytes`]
 //! serializes them in architectural little-endian order.
 
-use forge_ir::{CmpOp, Function, Inst, Terminator, Ty, Value};
+use forge_ir::{uses_of, CmpOp, Function, Inst, Terminator, Ty, Value};
 use std::collections::HashMap;
 
 unsafe extern "C" {
@@ -775,6 +775,264 @@ fn aarch64_has_stack_params(params: &[(String, Ty)]) -> bool {
 
 const AAPCS64_FRAME_RECORD_BYTES: u16 = 16;
 
+struct LinearAllocation {
+    registers: HashMap<Value, Gpr>,
+    saved_float: Vec<Gpr>,
+    saved_integer: Vec<Gpr>,
+}
+
+/// Allocates the supported scalar IR with inclusive live intervals. The
+/// emitter has historically used monotonically increasing temporary numbers,
+/// which is correct but needlessly reaches the spill fallback for long
+/// dependency chains whose values are dead. This pass reuses a register only
+/// after its previous interval has ended strictly before the next interval's
+/// start. Parameter registers stay in their AAPCS64 banks; temporary pools
+/// keep caller-saved registers first and report the callee-saved registers that
+/// need the existing frame preservation path.
+///
+/// This is intentionally a no-spill allocator. Returning `None` leaves the
+/// established stack-spill emitters responsible for genuine register
+/// pressure, calls, and stack-backed ABI shapes.
+fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation>, String> {
+    // The existing edge-copy emitter has a deliberately conservative spill
+    // implementation for structured CFGs. Keep this first reuse slice
+    // restricted to straight-line code until edge-specific interval splitting
+    // is added; sharing a flat interval across two control-flow arms would be
+    // unsound for a value whose last use differs by edge.
+    if function.blocks.len() != 1 {
+        return Ok(None);
+    }
+    let mut starts = HashMap::<Value, u32>::new();
+    let mut ends = HashMap::<Value, u32>::new();
+    let mut param_values = HashMap::<Value, (u32, Ty)>::new();
+
+    let mut position = 0u32;
+    let mut block_ends = Vec::with_capacity(function.blocks.len());
+    for block in &function.blocks {
+        for &value in &block.insts {
+            let Some(inst) = function.insts.get(value.0 as usize) else {
+                return Err(format!("block references missing instruction {value:?}"));
+            };
+            starts.entry(value).or_insert(position);
+            ends.entry(value).or_insert(position);
+            if let Inst::Param { index, ty } = inst {
+                let Some((_, declared_ty)) = function.params.get(*index as usize) else {
+                    return Err(format!("parameter index {index} is out of range"));
+                };
+                if declared_ty != ty {
+                    return Err(format!("parameter {index} has inconsistent IR type"));
+                }
+                param_values.insert(value, (*index, *ty));
+                starts.insert(value, 0);
+            }
+            for used in uses_of(inst) {
+                ends.entry(used)
+                    .and_modify(|end| *end = (*end).max(position))
+                    .or_insert(position);
+            }
+            position += 1;
+        }
+        let terminator_position = position;
+        match block.term.as_ref() {
+            Some(Terminator::Return(value)) => {
+                ends.entry(*value)
+                    .and_modify(|end| *end = (*end).max(terminator_position))
+                    .or_insert(terminator_position);
+            }
+            Some(Terminator::Branch { cond, .. }) => {
+                ends.entry(*cond)
+                    .and_modify(|end| *end = (*end).max(terminator_position))
+                    .or_insert(terminator_position);
+            }
+            Some(Terminator::Jump(_)) | None => {}
+        }
+        block_ends.push(terminator_position);
+        position += 1;
+    }
+
+    // A φ's incoming values are consumed on the predecessor edge. Keeping
+    // them live through the φ position is conservative and makes edge-copy
+    // emission safe even for hand-built CFGs whose blocks are not laid out in
+    // the usual front-end order.
+    for block in &function.blocks {
+        for &value in &block.insts {
+            let Some(Inst::Phi { incoming }) = function.insts.get(value.0 as usize) else {
+                continue;
+            };
+            for &(source, incoming_value) in incoming {
+                if let Some(end) = ends.get_mut(&incoming_value) {
+                    *end = (*end).max(block_ends[source.0 as usize]);
+                }
+            }
+        }
+    }
+
+    let mut registers = HashMap::<Value, Gpr>::new();
+    for (&value, &(index, ty)) in &param_values {
+        let ordinal = function.params[..index as usize]
+            .iter()
+            .filter(|(_, candidate)| *candidate == ty)
+            .count();
+        if ordinal >= 8 {
+            return Err(format!(
+                "AArch64 emitter supports at most 8 {ty:?} parameters"
+            ));
+        }
+        registers.insert(
+            value,
+            match ty {
+                Ty::F64 => Gpr::new_d(ordinal as u8),
+                Ty::I64 | Ty::Bool => Gpr::new(ordinal as u8),
+            },
+        );
+    }
+
+    let mut intervals = starts
+        .into_iter()
+        .filter_map(|(value, start)| {
+            let ty = *function.types.get(value.0 as usize)?;
+            Some((value, start, *ends.get(&value).unwrap_or(&start), ty))
+        })
+        .filter(|(value, _, _, _)| !param_values.contains_key(value))
+        .collect::<Vec<_>>();
+    intervals.sort_by_key(|(value, start, end, _)| (*start, *end, value.0));
+
+    let float_pool = (16..=31).chain(8..=15).map(Gpr::new_d).collect::<Vec<_>>();
+    let integer_pool = (8..=18).chain(19..=28).map(Gpr::new).collect::<Vec<_>>();
+    let mut active_float = Vec::<(u32, Gpr)>::new();
+    let mut active_integer = Vec::<(u32, Gpr)>::new();
+    let mut saved_float = Vec::new();
+    let mut saved_integer = Vec::new();
+
+    for (value, start, end, ty) in intervals {
+        let (pool, active) = match ty {
+            Ty::F64 => (&float_pool, &mut active_float),
+            Ty::I64 | Ty::Bool => (&integer_pool, &mut active_integer),
+        };
+        active.retain(|(active_end, _)| *active_end >= start);
+        let used = active
+            .iter()
+            .map(|(_, register)| *register)
+            .collect::<Vec<_>>();
+        let Some(register) = pool
+            .iter()
+            .copied()
+            .find(|register| !used.contains(register))
+        else {
+            return Ok(None);
+        };
+        registers.insert(value, register);
+        active.push((end, register));
+        if ty == Ty::F64 && register.index() < 16 {
+            if !saved_float.contains(&register) {
+                saved_float.push(register);
+            }
+        } else if matches!(ty, Ty::I64 | Ty::Bool)
+            && register.index() >= 19
+            && !saved_integer.contains(&register)
+        {
+            saved_integer.push(register);
+        }
+    }
+
+    // Keep the local above intentionally tied to interval construction so a
+    // future CFG shape cannot silently make the terminator-position data dead
+    // code while the allocator still appears to work.
+    debug_assert_eq!(block_ends.len(), function.blocks.len());
+    Ok(Some(LinearAllocation {
+        registers,
+        saved_float,
+        saved_integer,
+    }))
+}
+
+/// Preserves the original deterministic assignment for structured CFGs. The
+/// spill emitters already handle high-pressure CFGs; this fallback keeps the
+/// existing register-per-definition behavior for small CFGs until edge-aware
+/// interval splitting is implemented.
+fn monotonic_allocate_scalar(function: &Function) -> Result<LinearAllocation, String> {
+    let mut registers = HashMap::<Value, Gpr>::new();
+    let mut next_float_temporary = 16u8;
+    let mut next_integer_temporary = 8u8;
+    let mut next_saved_float = 8u8;
+    let mut next_saved_integer = 19u8;
+    let mut saved_float = Vec::<Gpr>::new();
+    let mut saved_integer = Vec::<Gpr>::new();
+    for block in &function.blocks {
+        for &value in &block.insts {
+            let Some(inst) = function.insts.get(value.0 as usize) else {
+                return Err(format!("block references missing instruction {value:?}"));
+            };
+            let register = match inst {
+                Inst::Param { index, ty } => {
+                    let Some((_, declared_ty)) = function.params.get(*index as usize) else {
+                        return Err(format!("parameter index {index} is out of range"));
+                    };
+                    if declared_ty != ty {
+                        return Err(format!("parameter {index} has inconsistent IR type"));
+                    }
+                    let ordinal = function.params[..*index as usize]
+                        .iter()
+                        .filter(|(_, candidate)| candidate == ty)
+                        .count();
+                    if ordinal >= 8 {
+                        return Err(format!(
+                            "AArch64 emitter supports at most 8 {ty:?} parameters"
+                        ));
+                    }
+                    match ty {
+                        Ty::F64 => Gpr::new_d(ordinal as u8),
+                        Ty::I64 | Ty::Bool => Gpr::new(ordinal as u8),
+                    }
+                }
+                _ => match function.types.get(value.0 as usize) {
+                    Some(Ty::F64) => {
+                        let index = if next_float_temporary <= 31 {
+                            let index = next_float_temporary;
+                            next_float_temporary += 1;
+                            index
+                        } else if next_saved_float <= 15 {
+                            let index = next_saved_float;
+                            next_saved_float += 1;
+                            saved_float.push(Gpr::new_d(index));
+                            index
+                        } else {
+                            return Err(
+                                "AArch64 emitter ran out of D-register temporaries".to_string()
+                            );
+                        };
+                        Gpr::new_d(index)
+                    }
+                    Some(Ty::I64 | Ty::Bool) => {
+                        let index = if next_integer_temporary <= 18 {
+                            let index = next_integer_temporary;
+                            next_integer_temporary += 1;
+                            index
+                        } else if next_saved_integer <= 28 {
+                            let index = next_saved_integer;
+                            next_saved_integer += 1;
+                            saved_integer.push(Gpr::new(index));
+                            index
+                        } else {
+                            return Err(
+                                "AArch64 emitter ran out of X-register temporaries".to_string()
+                            );
+                        };
+                        Gpr::new(index)
+                    }
+                    None => return Err(format!("value {value:?} has no AArch64 IR type")),
+                },
+            };
+            registers.insert(value, register);
+        }
+    }
+    Ok(LinearAllocation {
+        registers,
+        saved_float,
+        saved_integer,
+    })
+}
+
 /// Establishes the conventional AAPCS64 frame record before the backend's
 /// SP-relative local area. Leaf functions with no local area remain frameless;
 /// every generated spill/call frame has `x29`/`x30` saved as a pair and keeps
@@ -897,7 +1155,23 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
         })
         && function.params.iter().all(|(_, ty)| *ty == Ty::F64);
     let has_stack_params = aarch64_has_stack_params(&function.params);
-    if stack_spill_f64 && (non_param_count > 24 || contains_f64_call || has_stack_params) {
+    let contains_mixed_call = function
+        .insts
+        .iter()
+        .any(|inst| {
+            matches!(inst, Inst::Call { .. })
+                || matches!(inst, Inst::Rem(lhs, _) if function.types.get(lhs.0 as usize) == Some(&Ty::F64))
+        });
+    let reuse_allocation = if has_stack_params || contains_f64_call || contains_mixed_call {
+        None
+    } else {
+        linear_allocate_scalar(function)?
+    };
+    if stack_spill_f64
+        && ((non_param_count > 24 && reuse_allocation.is_none())
+            || contains_f64_call
+            || has_stack_params)
+    {
         return if has_stack_params {
             emit_mixed_f64_with_stack_spills(function)
         } else {
@@ -955,89 +1229,21 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
         };
         instructions_supported && terminator_supported
     });
-    let contains_mixed_call = function
-        .insts
-        .iter()
-        .any(|inst| {
-            matches!(inst, Inst::Call { .. })
-                || matches!(inst, Inst::Rem(lhs, _) if function.types.get(lhs.0 as usize) == Some(&Ty::F64))
-        });
-    if mixed_stack_spill && (non_param_count > 24 || contains_mixed_call || has_stack_params) {
+    if mixed_stack_spill
+        && ((non_param_count > 24 && reuse_allocation.is_none())
+            || contains_mixed_call
+            || has_stack_params)
+    {
         return emit_mixed_f64_with_stack_spills(function);
     }
 
-    let mut registers = HashMap::<Value, Gpr>::new();
-    let mut next_float_temporary = 16u8;
-    let mut next_integer_temporary = 8u8;
-    let mut next_saved_float = 8u8;
-    let mut next_saved_integer = 19u8;
-    let mut saved_float = Vec::<Gpr>::new();
-    let mut saved_integer = Vec::<Gpr>::new();
-    for block in &function.blocks {
-        for &value in &block.insts {
-            let Some(inst) = function.insts.get(value.0 as usize) else {
-                return Err(format!("block references missing instruction {value:?}"));
-            };
-            let register = match inst {
-                Inst::Param { index, ty } => {
-                    let Some((_, declared_ty)) = function.params.get(*index as usize) else {
-                        return Err(format!("parameter index {index} is out of range"));
-                    };
-                    if declared_ty != ty {
-                        return Err(format!("parameter {index} has inconsistent IR type"));
-                    }
-                    let ordinal = function.params[..*index as usize]
-                        .iter()
-                        .filter(|(_, candidate)| candidate == ty)
-                        .count();
-                    if ordinal >= 8 {
-                        return Err(format!(
-                            "AArch64 emitter supports at most 8 {ty:?} parameters"
-                        ));
-                    }
-                    Gpr::new(ordinal as u8)
-                }
-                _ => match function.types.get(value.0 as usize) {
-                    Some(Ty::F64) => {
-                        let index = if next_float_temporary <= 31 {
-                            let index = next_float_temporary;
-                            next_float_temporary += 1;
-                            index
-                        } else if next_saved_float <= 15 {
-                            let index = next_saved_float;
-                            next_saved_float += 1;
-                            saved_float.push(Gpr::new_d(index));
-                            index
-                        } else {
-                            return Err(
-                                "AArch64 emitter ran out of D-register temporaries".to_string()
-                            );
-                        };
-                        Gpr::new_d(index)
-                    }
-                    Some(Ty::I64 | Ty::Bool) => {
-                        let index = if next_integer_temporary <= 18 {
-                            let index = next_integer_temporary;
-                            next_integer_temporary += 1;
-                            index
-                        } else if next_saved_integer <= 28 {
-                            let index = next_saved_integer;
-                            next_saved_integer += 1;
-                            saved_integer.push(Gpr::new(index));
-                            index
-                        } else {
-                            return Err(
-                                "AArch64 emitter ran out of X-register temporaries".to_string()
-                            );
-                        };
-                        Gpr::new(index)
-                    }
-                    None => return Err(format!("value {value:?} has no AArch64 IR type")),
-                },
-            };
-            registers.insert(value, register);
-        }
-    }
+    let allocation = match reuse_allocation {
+        Some(allocation) => allocation,
+        None => monotonic_allocate_scalar(function)?,
+    };
+    let registers = allocation.registers;
+    let saved_float = allocation.saved_float;
+    let saved_integer = allocation.saved_integer;
 
     let register_of = |value: Value| {
         registers
@@ -2906,6 +3112,29 @@ fn condition_for_cmp(function: &Function, value: Value) -> Result<Condition, Str
 mod tests {
     use super::*;
 
+    fn live_f64_sum(count: usize) -> String {
+        let sum = (0..count)
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        (0..count).rev().fold(sum, |body, index| {
+            format!("let v{index} = x + {index}.0 in {body}")
+        })
+    }
+
+    fn live_mixed_sum(count: usize) -> String {
+        let sum = (0..count)
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let with_floats = (0..count).rev().fold(sum, |body, index| {
+            format!("let v{index} = x + q{index} in {body}")
+        });
+        (0..count).rev().fold(with_floats, |body, index| {
+            format!("let q{index} = n & {index} in {body}")
+        })
+    }
+
     #[test]
     fn emits_fixed_width_little_endian_words() {
         let mut asm = Assembler::new();
@@ -3113,6 +3342,36 @@ mod tests {
     }
 
     #[test]
+    fn linear_allocator_reuses_registers_for_a_long_dead_value_chain() {
+        let source = std::iter::repeat_n("x", 100)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let allocation = linear_allocate_scalar(&function)
+            .unwrap()
+            .expect("straight-line chain should fit with live-range reuse");
+        let temporary_registers = allocation
+            .registers
+            .iter()
+            .filter(|(value, _)| {
+                !matches!(
+                    function.insts.get(value.0 as usize),
+                    Some(Inst::Param { .. })
+                )
+            })
+            .map(|(_, register)| *register)
+            .fold(Vec::new(), |mut registers, register| {
+                if !registers.contains(&register) {
+                    registers.push(register);
+                }
+                registers
+            });
+        assert!(temporary_registers.len() <= 2);
+        assert!(allocation.saved_float.is_empty());
+        assert!(allocation.saved_integer.is_empty());
+    }
+
+    #[test]
     fn mixed_scalar_emitter_keeps_integer_temporaries_in_caller_saved_x_registers() {
         let function = forge_runtime::lower_source("x + (n & 3)").unwrap();
         let bytes = emit_f64(&function).unwrap();
@@ -3130,27 +3389,30 @@ mod tests {
 
     #[test]
     fn scalar_emitter_uses_a_frame_before_spilling_excess_temporaries() {
-        let source = std::iter::repeat_n("x", 18).collect::<Vec<_>>().join(" + ");
+        let source = live_f64_sum(18);
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
         assert!(bytes.chunks(4).any(
             |chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == str_d(Gpr::new(8), SP, 0)
         ));
 
-        let source = std::iter::repeat_n("x", 26).collect::<Vec<_>>().join(" + ");
+        let source = live_f64_sum(26);
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
-        assert!(bytes.chunks(4).any(
-            |chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == ldr_d(Gpr::new(29), SP, 0)
-        ));
-        assert!(bytes.chunks(4).any(
-            |chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == str_d(Gpr::new(29), SP, 0)
-        ));
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words.first(),
+            Some(&stp_pre(Gpr::new(29), Gpr::new(30), SP, -16))
+        );
+        assert!(words.contains(&ldp_post(Gpr::new(29), Gpr::new(30), SP, 16)));
     }
 
     #[test]
     fn generated_spill_paths_use_aapcs64_frame_record_pairs() {
-        let f64_source = std::iter::repeat_n("x", 26).collect::<Vec<_>>().join(" + ");
+        let f64_source = live_f64_sum(26);
         let f64_words = emit_f64(&forge_runtime::lower_source(&f64_source).unwrap())
             .unwrap()
             .chunks(4)
@@ -3198,9 +3460,7 @@ mod tests {
 
     #[test]
     fn emits_mixed_f64_stack_spills_for_both_register_banks() {
-        let source = std::iter::repeat_n("x + (n & 1)", 14)
-            .collect::<Vec<_>>()
-            .join(" + ");
+        let source = live_mixed_sum(22);
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
         let words = bytes
@@ -3208,12 +3468,14 @@ mod tests {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(words.iter().any(|word| *word == str_(Gpr::new(28), SP, 32)));
+        let float_load_opcode = ldr_d(Gpr::new(0), SP, 0) & 0xffc0_0000;
+        let float_store_opcode = str_d(Gpr::new(0), SP, 0) & 0xffc0_0000;
         assert!(words
             .iter()
-            .any(|word| *word == ldr_d(Gpr::new(30), SP, 40)));
+            .any(|word| *word & 0xffc0_0000 == float_load_opcode));
         assert!(words
             .iter()
-            .any(|word| *word == str_d(Gpr::new(29), SP, 40)));
+            .any(|word| *word & 0xffc0_0000 == float_store_opcode));
     }
 
     #[test]
@@ -3386,14 +3648,14 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn executes_aarch64_f64_function_with_stack_spills() {
-        let source = std::iter::repeat_n("x", 26).collect::<Vec<_>>().join(" + ");
+        let source = live_f64_sum(26);
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
         let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
         buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
         buffer.make_executable().unwrap();
         let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
-        assert_eq!(compiled.call_args(&[3.0]), 78.0);
+        assert_eq!(compiled.call_args(&[3.0]), 403.0);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3844,13 +4106,13 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn executes_aarch64_function_with_a_callee_saved_temporary_frame() {
-        let source = std::iter::repeat_n("x", 18).collect::<Vec<_>>().join(" + ");
+        let source = live_f64_sum(18);
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
         let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
         buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
         buffer.make_executable().unwrap();
         let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
-        assert_eq!(compiled.call_args(&[3.0]), 54.0);
+        assert_eq!(compiled.call_args(&[3.0]), 207.0);
     }
 }
