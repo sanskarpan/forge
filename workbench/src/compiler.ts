@@ -119,7 +119,10 @@ export async function compileCurrent(source: string, target: Target): Promise<vo
     const wasmHex = artifact.wasm_bytes_hex ?? artifact.bytes_hex;
     if (!wasmHex) throw new Error('WASM artifact did not include executable bytes');
     const bytes = hexBytes(wasmHex);
-    const instance = await WebAssembly.instantiate(bytes, {});
+    const imports = artifact.required_imports?.includes('forge.fmod')
+      ? { forge: { fmod: (lhs: number, rhs: number) => lhs % rhs } }
+      : {};
+    const instance = await WebAssembly.instantiate(bytes, imports);
     const evaluate = instance.exports.eval;
     if (typeof evaluate !== 'function') throw new Error('compiled module does not export eval');
     const invoke = (...values: number[]) => Number((evaluate as (...values: number[]) => number)(...values));

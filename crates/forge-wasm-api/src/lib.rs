@@ -121,8 +121,14 @@ pub fn compile_artifact_json(source: &str) -> String {
                 .map(|ty| json_string(ty))
                 .collect::<Vec<_>>()
                 .join(",");
+            let imports = artifact
+                .required_imports
+                .iter()
+                .map(|import| json_string(import))
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
-                r#"{{"ok":true,"parameter_types":[{params}],"result_type":{},"wasm_bytes_hex":{},"wasm_bytes_len":{},{} }}"#,
+                r#"{{"ok":true,"parameter_types":[{params}],"result_type":{},"required_imports":[{imports}],"wasm_bytes_hex":{},"wasm_bytes_len":{},{} }}"#,
                 json_string(&artifact.result_type),
                 json_string(&artifact.wasm_hex),
                 artifact.wasm_bytes.len(),
@@ -566,6 +572,7 @@ mod tests {
         let artifact = compile_artifact_json("x + y");
         assert!(artifact.contains(r#""ok":true"#));
         assert!(artifact.contains(r#""parameter_types":["f64","f64"]"#));
+        assert!(artifact.contains(r#""required_imports":[]"#));
         assert!(artifact.contains(r#""wasm_bytes_len":"#));
         assert!(artifact.contains(r#""ir_stages":["#));
         assert!(artifact.contains(r#""cfg":"digraph forge_cfg"#));
@@ -575,6 +582,9 @@ mod tests {
         let error = compile_artifact_json("x +");
         assert!(error.contains(r#""ok":false"#));
         assert!(error.contains(r#""error":"#));
+
+        let remainder = compile_artifact_json("x % y");
+        assert!(remainder.contains(r#""required_imports":["forge.fmod"]"#));
     }
 
     #[test]

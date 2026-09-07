@@ -16,7 +16,8 @@ const args = process.argv[2] === '' ? [] : process.argv[2].split(',').map((token
     return Number(token);
 });
 const resultType = process.argv[3];
-WebAssembly.instantiate(wasm).then(({ instance }) => {
+const imports = { forge: { fmod: (lhs, rhs) => lhs % rhs } };
+WebAssembly.instantiate(wasm, imports).then(({ instance }) => {
     const result = instance.exports.eval(...args);
     if (resultType === 'i64') {
         if (typeof result !== 'bigint') throw new Error(`expected BigInt result, got ${typeof result}`);
@@ -133,6 +134,12 @@ fn native_and_wasm_backends_match_interpreter_for_supported_f64_cases() {
         ("x + 0.0", vec![-0.0]),
         ("sqrt(abs(x))", vec![f64::INFINITY]),
         ("x * 1.0", vec![f64::NAN]),
+        ("x % y", vec![5.5, 2.0]),
+        ("x % y", vec![-0.0, 3.0]),
+        ("x % y", vec![f64::MAX, 3.0]),
+        ("x % y", vec![f64::MIN_POSITIVE, 2.0]),
+        ("x % y", vec![f64::INFINITY, 2.0]),
+        ("x % y", vec![f64::NAN, 2.0]),
     ];
 
     for (source, args) in cases {
