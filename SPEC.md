@@ -167,11 +167,14 @@ pub enum RtValue {
 like `CompiledExpr::call1`/`call2` (§11) stay `f64`-specific shortcuts for
 the common all-float case. The public typed entry point is
 `forge_runtime::evaluate_typed(source, args)`: on x86-64 it uses an
-ABI-aware executable trampoline for supported System V signatures and Win64
-register/stack signatures (through eight parameters). On AArch64 it uses an
-AArch64 trampoline for supported mixed signatures returning `f64` and
-straight-line all-`i64` signatures. Other targets and unsupported shapes use
-the verified interpreter fallback.
+ABI-aware executable trampoline for supported System V register/stack
+signatures and Win64 register/stack signatures (through eight parameters).
+The x86 emitter materializes entry parameters with parallel copies so
+allocator destinations may safely overlap incoming ABI registers, and the
+trampoline packs exhausted SysV integer/XMM banks into aligned caller stack
+slots. On AArch64 it uses an AArch64 trampoline for supported mixed signatures
+returning `f64` and straight-line all-`i64` signatures. Other targets and
+unsupported shapes use the verified interpreter fallback.
 
 ---
 
