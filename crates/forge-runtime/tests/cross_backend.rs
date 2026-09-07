@@ -136,6 +136,10 @@ fn native_and_wasm_backends_match_interpreter_for_supported_f64_cases() {
         ("x * 1.0", vec![f64::NAN]),
         ("x % y", vec![5.5, 2.0]),
         ("x % y", vec![-0.0, 3.0]),
+        ("x % y", vec![f64::MAX, 3.0]),
+        ("x % y", vec![f64::MIN_POSITIVE, 2.0]),
+        ("x % y", vec![f64::INFINITY, 2.0]),
+        ("x % y", vec![f64::NAN, 2.0]),
     ];
 
     for (source, args) in cases {
