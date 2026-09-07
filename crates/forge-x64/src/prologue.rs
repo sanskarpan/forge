@@ -2,10 +2,9 @@ use crate::{AluOp, Assembler, PhysReg};
 
 /// Callee-saved GPRs per System V AMD64 -- does NOT include Rbp, whose
 /// save/restore is handled unconditionally by emit_prologue/emit_epilogue
-/// themselves, never by the caller passing it in this list. Win64 support
-/// (a different, larger callee-saved set including XMM6-15, which need a
-/// movsd-to-memory save sequence rather than push/pop) is deliberately
-/// not built here -- see the design doc for why.
+/// themselves, never by the caller passing it in this list. On Windows the
+/// active callee-saved list also contains XMM6-XMM15; the Windows prologue
+/// stores those registers in the frame because XMM registers cannot be pushed.
 pub const SYSV_CALLEE_SAVED: &[PhysReg] = &[
     PhysReg::Rbx,
     PhysReg::R12,
@@ -50,10 +49,38 @@ pub fn emit_prologue(asm: &mut Assembler, callee_saved: &[PhysReg], spill_bytes:
     );
     asm.push_reg(PhysReg::Rbp);
     asm.mov_reg_reg(PhysReg::Rbp, PhysReg::Rsp);
+
+    #[cfg(windows)]
+    {
+        let gpr_count = callee_saved.iter().filter(|reg| !is_xmm(**reg)).count();
+        let xmm_saved: Vec<PhysReg> = callee_saved
+            .iter()
+            .copied()
+            .filter(|reg| is_xmm(*reg))
+            .collect();
+        for &reg in callee_saved.iter().filter(|reg| !is_xmm(**reg)) {
+            asm.push_reg(reg);
+        }
+        let xmm_bytes = (xmm_saved.len() as u32) * 8;
+        let n = padded_spill_bytes(gpr_count, spill_bytes + xmm_bytes);
+        if n > 0 {
+            asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, n as i32);
+        }
+        for (index, reg) in xmm_saved.iter().enumerate() {
+            let offset = -i32::try_from((gpr_count + index + 1) * 8)
+                .expect("Win64 nonvolatile XMM frame is too large");
+            asm.movsd_mem_reg(PhysReg::Rbp, offset, *reg);
+        }
+        return;
+    }
+
+    #[cfg(not(windows))]
     for &reg in callee_saved {
         asm.push_reg(reg);
     }
+    #[cfg(not(windows))]
     let n = padded_spill_bytes(callee_saved.len(), spill_bytes);
+    #[cfg(not(windows))]
     if n > 0 {
         asm.alu_reg_imm(AluOp::Sub, PhysReg::Rsp, n as i32);
     }
@@ -70,15 +97,85 @@ pub fn emit_epilogue(asm: &mut Assembler, callee_saved: &[PhysReg], spill_bytes:
         "Rbp must not appear in callee_saved -- its save/restore is \
          handled unconditionally by emit_prologue/emit_epilogue themselves"
     );
+    #[cfg(windows)]
+    {
+        let gpr_count = callee_saved.iter().filter(|reg| !is_xmm(**reg)).count();
+        let xmm_saved: Vec<PhysReg> = callee_saved
+            .iter()
+            .copied()
+            .filter(|reg| is_xmm(*reg))
+            .collect();
+        let xmm_bytes = (xmm_saved.len() as u32) * 8;
+        for (index, reg) in xmm_saved.iter().enumerate().rev() {
+            let offset = -i32::try_from((gpr_count + index + 1) * 8)
+                .expect("Win64 nonvolatile XMM frame is too large");
+            asm.movsd_reg_mem(*reg, PhysReg::Rbp, offset);
+        }
+        let n = padded_spill_bytes(gpr_count, spill_bytes + xmm_bytes);
+        if n > 0 {
+            asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, n as i32);
+        }
+        for &reg in callee_saved.iter().filter(|reg| !is_xmm(**reg)).rev() {
+            asm.pop_reg(reg);
+        }
+        asm.pop_reg(PhysReg::Rbp);
+        asm.ret();
+        return;
+    }
+
+    #[cfg(not(windows))]
     let n = padded_spill_bytes(callee_saved.len(), spill_bytes);
+    #[cfg(not(windows))]
     if n > 0 {
         asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, n as i32);
     }
+    #[cfg(not(windows))]
     for &reg in callee_saved.iter().rev() {
         asm.pop_reg(reg);
     }
+    #[cfg(not(windows))]
     asm.pop_reg(PhysReg::Rbp);
+    #[cfg(not(windows))]
     asm.ret();
+}
+
+#[cfg(windows)]
+fn is_xmm(reg: PhysReg) -> bool {
+    matches!(
+        reg,
+        PhysReg::Xmm0
+            | PhysReg::Xmm1
+            | PhysReg::Xmm2
+            | PhysReg::Xmm3
+            | PhysReg::Xmm4
+            | PhysReg::Xmm5
+            | PhysReg::Xmm6
+            | PhysReg::Xmm7
+            | PhysReg::Xmm8
+            | PhysReg::Xmm9
+            | PhysReg::Xmm10
+            | PhysReg::Xmm11
+            | PhysReg::Xmm12
+            | PhysReg::Xmm13
+            | PhysReg::Xmm14
+            | PhysReg::Xmm15
+            | PhysReg::Xmm16
+            | PhysReg::Xmm17
+            | PhysReg::Xmm18
+            | PhysReg::Xmm19
+            | PhysReg::Xmm20
+            | PhysReg::Xmm21
+            | PhysReg::Xmm22
+            | PhysReg::Xmm23
+            | PhysReg::Xmm24
+            | PhysReg::Xmm25
+            | PhysReg::Xmm26
+            | PhysReg::Xmm27
+            | PhysReg::Xmm28
+            | PhysReg::Xmm29
+            | PhysReg::Xmm30
+            | PhysReg::Xmm31
+    )
 }
 
 #[cfg(test)]
