@@ -3136,7 +3136,7 @@ mod tests {
 
     #[test]
     fn emits_aarch64_libm_calls_with_aligned_indirect_dispatch() {
-        let function = forge_runtime::lower_source("sin(x) + pow(y, 2.0) + (z % 2.0)").unwrap();
+        let function = forge_runtime::lower_source("sin(x) + pow(y, 2.0)").unwrap();
         let bytes = emit_f64(&function).unwrap();
         let words = bytes
             .chunks(4)
@@ -3145,6 +3145,18 @@ mod tests {
         assert!(words.iter().any(|word| *word == blr(Gpr::new(16))));
         assert!(words.iter().any(|word| *word == str_d(Gpr::new(0), SP, 8)));
         assert!(words.iter().any(|word| *word == str_d(Gpr::new(1), SP, 16)));
+        assert!(words.contains(&0xd65f_03c0));
+    }
+
+    #[test]
+    fn emits_aarch64_fmod_as_an_aligned_indirect_call() {
+        let function = forge_runtime::lower_source("x % y").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&blr(Gpr::new(16))));
         assert!(words.contains(&0xd65f_03c0));
     }
 
