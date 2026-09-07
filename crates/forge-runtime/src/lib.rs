@@ -171,17 +171,6 @@ fn validate_typed_arguments(function: &Function, args: &[RtValue]) -> Result<(),
 
 #[cfg(target_arch = "x86_64")]
 fn supports_native_typed_signature(function: &Function) -> bool {
-    let integer_args = function
-        .params
-        .iter()
-        .filter(|(_, ty)| *ty != forge_ir::Ty::F64)
-        .count();
-    let float_args = function
-        .params
-        .iter()
-        .filter(|(_, ty)| *ty == forge_ir::Ty::F64)
-        .count();
-
     if cfg!(windows) {
         // The emitter supports the four register positions followed by the
         // caller-provided stack argument area. Keep the trampoline boundary
@@ -733,21 +722,41 @@ mod tests {
 
     #[test]
     fn typed_runtime_marshals_stack_backed_sysv_shape() {
+        let args = [
+            RtValue::I64(1),
+            RtValue::I64(2),
+            RtValue::I64(3),
+            RtValue::I64(4),
+            RtValue::I64(5),
+            RtValue::I64(6),
+            RtValue::I64(7),
+        ];
+        for target in 0..7 {
+            let source = (0..7)
+                .map(|index| format!("(p{index} & {})", if index == target { "-1" } else { "0" }))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            assert_eq!(
+                evaluate_typed(&source, &args).unwrap(),
+                RtValue::I64((target + 1) as i64),
+                "failed to marshal parameter {target}"
+            );
+        }
+
+        let float_args = [
+            RtValue::F64(1.0),
+            RtValue::F64(2.0),
+            RtValue::F64(3.0),
+            RtValue::F64(4.0),
+            RtValue::F64(5.0),
+            RtValue::F64(6.0),
+            RtValue::F64(7.0),
+            RtValue::F64(8.0),
+            RtValue::F64(9.0),
+        ];
         assert_eq!(
-            evaluate_typed(
-                "(p0 & -1) + (p1 & -1) + (p2 & -1) + (p3 & -1) + (p4 & -1) + (p5 & -1) + (p6 & -1)",
-                &[
-                    RtValue::I64(1),
-                    RtValue::I64(2),
-                    RtValue::I64(3),
-                    RtValue::I64(4),
-                    RtValue::I64(5),
-                    RtValue::I64(6),
-                    RtValue::I64(7),
-                ],
-            )
-            .unwrap(),
-            RtValue::I64(28)
+            evaluate_typed("p0 + p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8", &float_args,).unwrap(),
+            RtValue::F64(45.0)
         );
     }
 
