@@ -828,7 +828,8 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     #[test]
     fn win64_high_pressure_jit_uses_and_preserves_nonvolatile_registers() {
-        let integer_source = "a + b + c + d + e + f + g + h";
+        let integer_source =
+            "(a & 1) | ((b & 2) | ((c & 4) | ((d & 8) | ((e & 16) | ((f & 32) | ((g & 64) | (h & 128)))))))";
         let integer_artifacts = compile_artifacts(integer_source).unwrap();
         assert!(integer_artifacts
             .assignment
@@ -852,7 +853,7 @@ mod tests {
             RtValue::I64(255)
         );
 
-        let float_source = "a + b + c + d + e + f + g + h";
+        let float_source = "a + (b + (c + (d + (e + (f + (g + h))))))";
         let float_artifacts = compile_artifacts(float_source).unwrap();
         assert!(float_artifacts
             .assignment
