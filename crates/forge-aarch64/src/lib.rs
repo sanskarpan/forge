@@ -927,10 +927,11 @@ fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation
             if !saved_float.contains(&register) {
                 saved_float.push(register);
             }
-        } else if matches!(ty, Ty::I64 | Ty::Bool) && register.index() >= 19 {
-            if !saved_integer.contains(&register) {
-                saved_integer.push(register);
-            }
+        } else if matches!(ty, Ty::I64 | Ty::Bool)
+            && register.index() >= 19
+            && !saved_integer.contains(&register)
+        {
+            saved_integer.push(register);
         }
     }
 
