@@ -21,6 +21,10 @@ pub enum VectorInst {
     Neg(Value),
     Sqrt(Value),
     Abs(Value),
+    Floor(Value),
+    Ceil(Value),
+    Round(Value),
+    Trunc(Value),
     Fma {
         a: Value,
         b: Value,
@@ -155,6 +159,10 @@ fn lower_vector_inst(
         Inst::Neg(operand) => VectorInst::Neg(*operand),
         Inst::Sqrt(operand) => VectorInst::Sqrt(*operand),
         Inst::Abs(operand) => VectorInst::Abs(*operand),
+        Inst::Floor(operand) => VectorInst::Floor(*operand),
+        Inst::Ceil(operand) => VectorInst::Ceil(*operand),
+        Inst::Round(operand) => VectorInst::Round(*operand),
+        Inst::Trunc(operand) => VectorInst::Trunc(*operand),
         Inst::Fma { a, b, c } => VectorInst::Fma {
             a: *a,
             b: *b,
@@ -723,6 +731,22 @@ trait PackedOps {
     unsafe fn max(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
     unsafe fn sqrt(value: Self::Vector) -> Self::Vector;
     unsafe fn abs(value: Self::Vector) -> Self::Vector;
+    unsafe fn floor(value: Self::Vector) -> Result<Self::Vector, ()> {
+        let _ = value;
+        Err(())
+    }
+    unsafe fn ceil(value: Self::Vector) -> Result<Self::Vector, ()> {
+        let _ = value;
+        Err(())
+    }
+    unsafe fn round(value: Self::Vector) -> Result<Self::Vector, ()> {
+        let _ = value;
+        Err(())
+    }
+    unsafe fn trunc(value: Self::Vector) -> Result<Self::Vector, ()> {
+        let _ = value;
+        Err(())
+    }
     unsafe fn cmp(op: CmpOp, lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
     unsafe fn select(mask: Self::Vector, then_: Self::Vector, else_: Self::Vector) -> Self::Vector;
     unsafe fn fma(lhs: Self::Vector, rhs: Self::Vector, addend: Self::Vector) -> Self::Vector {
@@ -857,6 +881,10 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
             VectorInst::Neg(value) => V::sub(V::splat(0.0), get_packed::<V>(&values, value)?),
             VectorInst::Sqrt(value) => V::sqrt(get_packed::<V>(&values, value)?),
             VectorInst::Abs(value) => V::abs(get_packed::<V>(&values, value)?),
+            VectorInst::Floor(value) => V::floor(get_packed::<V>(&values, value)?)?,
+            VectorInst::Ceil(value) => V::ceil(get_packed::<V>(&values, value)?)?,
+            VectorInst::Round(value) => V::round(get_packed::<V>(&values, value)?)?,
+            VectorInst::Trunc(value) => V::trunc(get_packed::<V>(&values, value)?)?,
             VectorInst::Fma { a, b, c } => {
                 if !V::HAS_FMA {
                     return Err(());
@@ -1052,6 +1080,24 @@ mod x86_packed {
         };
     }
 
+    macro_rules! avx512_rounding {
+        ($name:ident, $mode:literal) => {
+            unsafe fn $name(value: Self::Vector) -> Result<Self::Vector, ()> {
+                let mut output = [0.0; 8];
+                asm!(
+                    "vmovupd zmm0, [{value}]",
+                    concat!("vrndscalepd zmm0, zmm0, ", $mode),
+                    "vmovupd [{out}], zmm0",
+                    value = in(reg) value.as_ptr(),
+                    out = in(reg) output.as_mut_ptr(),
+                    out("zmm0") _,
+                    options(nostack, preserves_flags),
+                );
+                Ok(output)
+            }
+        };
+    }
+
     impl PackedOps for Avx512 {
         type Vector = [f64; 8];
         const LANES: usize = 8;
@@ -1130,6 +1176,9 @@ mod x86_packed {
         avx512_binary!(sub, "vsubpd");
         avx512_binary!(mul, "vmulpd");
         avx512_binary!(div, "vdivpd");
+        avx512_rounding!(floor, "1");
+        avx512_rounding!(ceil, "2");
+        avx512_rounding!(trunc, "3");
 
         // AVX-512F is reached through stable inline assembly for arithmetic,
         // but exact Forge min/max semantics are intentionally kept in the
@@ -1285,12 +1334,42 @@ mod x86_packed {
         }};
     }
 
+    unsafe fn unavailable_128(value: __m128d) -> Result<__m128d, ()> {
+        let _ = value;
+        Err(())
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_floor(value: __m256d) -> Result<__m256d, ()> {
+        Ok(_mm256_round_pd(
+            value,
+            _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC,
+        ))
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_ceil(value: __m256d) -> Result<__m256d, ()> {
+        Ok(_mm256_round_pd(
+            value,
+            _MM_FROUND_TO_POS_INF | _MM_FROUND_NO_EXC,
+        ))
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_trunc(value: __m256d) -> Result<__m256d, ()> {
+        Ok(_mm256_round_pd(
+            value,
+            _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC,
+        ))
+    }
+
     macro_rules! impl_x86_ops {
         ($name:ident, $vector:ty, $lanes:expr, $set1:ident, $load:ident, $store:ident,
          $add:ident, $sub:ident, $mul:ident, $div:ident, $sqrt:ident, $and:ident,
          $cmp:ident, $andnot:ident, $or:ident, $setzero:ident, $cast_si:ident,
          $cast_pd:ident, $and_si:ident, $andnot_si:ident, $or_si:ident,
-         $set1_epi64x:ident, $mask:expr, $feature:literal) => {
+         $set1_epi64x:ident, $mask:expr, $feature:literal,
+         $floor:ident, $ceil:ident, $trunc:ident) => {
             impl PackedOps for $name {
                 type Vector = $vector;
                 const LANES: usize = $lanes;
@@ -1371,6 +1450,18 @@ mod x86_packed {
                     $and(value, $mask)
                 }
                 #[target_feature(enable = $feature)]
+                unsafe fn floor(value: Self::Vector) -> Result<Self::Vector, ()> {
+                    $floor(value)
+                }
+                #[target_feature(enable = $feature)]
+                unsafe fn ceil(value: Self::Vector) -> Result<Self::Vector, ()> {
+                    $ceil(value)
+                }
+                #[target_feature(enable = $feature)]
+                unsafe fn trunc(value: Self::Vector) -> Result<Self::Vector, ()> {
+                    $trunc(value)
+                }
+                #[target_feature(enable = $feature)]
                 unsafe fn cmp(op: CmpOp, lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
                     let comparison = match op {
                         CmpOp::Eq => $cmp(lhs, rhs, _CMP_EQ_OQ),
@@ -1427,7 +1518,10 @@ mod x86_packed {
         _mm_or_si128,
         _mm_set1_epi64x,
         _mm_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)),
-        "sse2"
+        "sse2",
+        unavailable_128,
+        unavailable_128,
+        unavailable_128
     );
 
     impl_x86_ops!(
@@ -1454,7 +1548,10 @@ mod x86_packed {
         _mm256_or_si256,
         _mm256_set1_epi64x,
         _mm256_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)),
-        "avx2"
+        "avx2",
+        avx2_floor,
+        avx2_ceil,
+        avx2_trunc
     );
 
     pub struct Avx2Fma;
@@ -1537,6 +1634,18 @@ mod x86_packed {
         #[target_feature(enable = "avx2")]
         unsafe fn abs(value: Self::Vector) -> Self::Vector {
             _mm256_and_pd(value, _mm256_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)))
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn floor(value: Self::Vector) -> Result<Self::Vector, ()> {
+            avx2_floor(value)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn ceil(value: Self::Vector) -> Result<Self::Vector, ()> {
+            avx2_ceil(value)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn trunc(value: Self::Vector) -> Result<Self::Vector, ()> {
+            avx2_trunc(value)
         }
         #[target_feature(enable = "avx2")]
         unsafe fn cmp(op: CmpOp, lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
@@ -1653,6 +1762,18 @@ mod neon_packed {
         }
         unsafe fn abs(value: Self::Vector) -> Self::Vector {
             vabsq_f64(value)
+        }
+        unsafe fn floor(value: Self::Vector) -> Result<Self::Vector, ()> {
+            Ok(vrndmq_f64(value))
+        }
+        unsafe fn ceil(value: Self::Vector) -> Result<Self::Vector, ()> {
+            Ok(vrndpq_f64(value))
+        }
+        unsafe fn round(value: Self::Vector) -> Result<Self::Vector, ()> {
+            Ok(vrndaq_f64(value))
+        }
+        unsafe fn trunc(value: Self::Vector) -> Result<Self::Vector, ()> {
+            Ok(vrndq_f64(value))
         }
         unsafe fn cmp(op: CmpOp, lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
             let mask = match op {
@@ -2020,6 +2141,49 @@ mod tests {
             .insts
             .iter()
             .any(|(_, inst)| matches!(inst, VectorInst::Sqrt(_))));
+    }
+
+    #[test]
+    fn packed_rounding_operations_match_scalar_bits_and_fallback_explicitly() {
+        let input = [
+            -3.75,
+            -2.5,
+            -0.5,
+            -0.0,
+            0.0,
+            0.5,
+            2.5,
+            3.75,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        for (source, expected, x86_packed) in [
+            ("floor(x)", input.map(f64::floor), true),
+            ("ceil(x)", input.map(f64::ceil), true),
+            ("trunc(x)", input.map(f64::trunc), true),
+            ("round(x)", input.map(f64::round), false),
+        ] {
+            let result = evaluate_array(source, &[&input]).unwrap();
+            let actual_bits = result
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            let expected_bits = expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            assert_eq!(actual_bits, expected_bits, "{source}");
+
+            let has_full_chunk =
+                result.plan.width != SimdWidth::Scalar && result.plan.full_chunks > 0;
+            let expected_packed = if cfg!(target_arch = "aarch64") {
+                has_full_chunk
+            } else {
+                x86_packed && has_full_chunk
+            };
+            assert_eq!(result.used_packed_backend, expected_packed, "{source}");
+        }
     }
 
     #[test]
