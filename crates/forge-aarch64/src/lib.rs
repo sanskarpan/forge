@@ -273,6 +273,14 @@ impl Assembler {
     pub fn cmp_reg(&mut self, lhs: Gpr, rhs: Gpr) {
         self.words.push(cmp_reg(lhs, rhs));
     }
+
+    /// Emits the canonical boolean materialization `cset Xd, condition`.
+    /// AArch64 encodes this as `csinc Xd, XZR, XZR, invert(condition)`;
+    /// callers can therefore use the same condition mapping for branches and
+    /// for values that must be returned or consumed by another boolean op.
+    pub fn cset(&mut self, dst: Gpr, condition: Condition) {
+        self.words.push(cset(dst, condition));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,6 +397,17 @@ pub fn fcmp_d(lhs: Gpr, rhs: Gpr) -> u32 {
 
 pub fn cmp_reg(lhs: Gpr, rhs: Gpr) -> u32 {
     0xeb00_001f | (u32::from(rhs.index()) << 16) | (u32::from(lhs.index()) << 5)
+}
+
+pub fn cset(dst: Gpr, condition: Condition) -> u32 {
+    // CSET is the CSINC alias with both inputs set to XZR and the condition
+    // inverted. The condition encodings are paired (EQ/NE, LT/GE, ...), so
+    // toggling bit zero performs the architectural inversion.
+    0x9a80_0400
+        | (31 << 16)
+        | (u32::from((condition as u8) ^ 1) << 12)
+        | (31 << 5)
+        | u32::from(dst.index())
 }
 
 pub fn blr(target: Gpr) -> u32 {
@@ -664,11 +683,22 @@ fn aarch64_has_stack_params(params: &[(String, Ty)]) -> bool {
 /// are exhausted, the emitter allocates D8..D15 or X19..X28 and preserves the
 /// selected callee-saved registers in a 16-byte-aligned stack frame.
 pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
+    if function.types.last() != Some(&Ty::F64) {
+        return Err("AArch64 emitter requires an f64 result".to_string());
+    }
+    emit_scalar(function)
+}
+
+/// Emits a complete AAPCS64 scalar function for the supported IR subset and
+/// any scalar result type. `emit_f64` remains the strongly-typed public entry
+/// point used by existing callers; this entry point is used by typed runtime
+/// calls that return `i64` or `bool` as well as by mixed-parameter f64 calls.
+pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
     if function.blocks.is_empty() {
         return Err("AArch64 emitter requires at least one block".to_string());
     }
-    if function.types.last() != Some(&Ty::F64) {
-        return Err("AArch64 mixed scalar emitter requires an f64 result".to_string());
+    if function.types.last().is_none() {
+        return Err("AArch64 emitter requires a result type".to_string());
     }
 
     let stack_spill_f64 = function.params.iter().all(|(_, ty)| *ty == Ty::F64)
@@ -733,7 +763,7 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         };
     }
 
-    let mixed_stack_spill_f64 = function.blocks.iter().all(|block| {
+    let mixed_stack_spill = function.blocks.iter().all(|block| {
         let instructions_supported = block.insts.iter().all(|value| {
             matches!(
                 function.insts.get(value.0 as usize),
@@ -765,7 +795,10 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         });
         let terminator_supported = match block.term.as_ref() {
             Some(Terminator::Return(result)) => {
-                function.types.get(result.0 as usize) == Some(&Ty::F64)
+                matches!(
+                    function.types.get(result.0 as usize),
+                    Some(Ty::F64 | Ty::I64 | Ty::Bool)
+                )
             }
             Some(Terminator::Jump(_)) => true,
             Some(Terminator::Branch { cond, .. }) => {
@@ -780,7 +813,7 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
         .insts
         .iter()
         .any(|inst| matches!(inst, Inst::Call { .. }));
-    if mixed_stack_spill_f64 && (non_param_count > 24 || contains_mixed_call || has_stack_params) {
+    if mixed_stack_spill && (non_param_count > 24 || contains_mixed_call || has_stack_params) {
         return emit_mixed_f64_with_stack_spills(function);
     }
 
@@ -1003,13 +1036,24 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                 Inst::Shl(lhs, rhs) => asm.lsl(dst, register_of(*lhs)?, register_of(*rhs)?),
                 Inst::Shr(lhs, rhs) => asm.lsr(dst, register_of(*lhs)?, register_of(*rhs)?),
                 Inst::Sar(lhs, rhs) => asm.asr(dst, register_of(*lhs)?, register_of(*rhs)?),
-                Inst::Cmp { lhs, rhs, .. } => match function.types.get(lhs.0 as usize) {
-                    Some(Ty::F64) => asm.fcmp_d(register_of(*lhs)?, register_of(*rhs)?),
-                    Some(Ty::I64) | Some(Ty::Bool) => {
-                        asm.cmp_reg(register_of(*lhs)?, register_of(*rhs)?)
-                    }
-                    _ => return Err("AArch64 comparison has an invalid operand".to_string()),
-                },
+                Inst::Cmp { op, lhs, rhs } => {
+                    let condition = match function.types.get(lhs.0 as usize) {
+                        Some(Ty::F64) => {
+                            asm.fcmp_d(register_of(*lhs)?, register_of(*rhs)?);
+                            f64_condition_for_cmp(*op)
+                        }
+                        Some(Ty::I64) | Some(Ty::Bool) => {
+                            asm.cmp_reg(register_of(*lhs)?, register_of(*rhs)?);
+                            integer_condition_for_cmp(*op)
+                        }
+                        _ => return Err("AArch64 comparison has an invalid operand".to_string()),
+                    };
+                    // Comparison flags are still re-evaluated at a Branch
+                    // terminator, but materializing here makes a comparison
+                    // a real canonical bool value when it is returned, fed to
+                    // a boolean operation, or copied through a phi.
+                    asm.cset(dst, condition);
+                }
                 Inst::IToF(value) => asm.scvtf(dst, register_of(*value)?),
                 Inst::FToI(value) => asm.fcvtzs(dst, register_of(*value)?),
                 Inst::Floor(..)
@@ -1027,12 +1071,18 @@ pub fn emit_f64(function: &Function) -> Result<Vec<u8>, String> {
                 let Some(result_ty) = function.types.get(result.0 as usize) else {
                     return Err(format!("return value {result:?} has no type"));
                 };
-                if *result_ty != Ty::F64 {
-                    return Err("AArch64 mixed scalar emitter requires an f64 result".to_string());
-                }
                 let result_register = register_of(*result)?;
-                if result_register != Gpr::new(0) {
-                    asm.fmov_d(Gpr::new(0), result_register);
+                match result_ty {
+                    Ty::F64 => {
+                        if result_register != Gpr::new_d(0) {
+                            asm.fmov_d(Gpr::new_d(0), result_register);
+                        }
+                    }
+                    Ty::I64 | Ty::Bool => {
+                        if result_register != Gpr::new(0) {
+                            asm.orr_reg(Gpr::new(0), XZR, result_register);
+                        }
+                    }
                 }
                 if frame_bytes != 0 {
                     for &(register, offset) in saved_integer_slots.iter().rev() {
@@ -1503,9 +1553,14 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                     if function.types.get(value.0 as usize) != Some(&Ty::Bool) {
                         return Err(format!("comparison {value:?} does not produce bool"));
                     }
-                    // A comparison is represented by condition flags at a
-                    // branch and therefore has no materialized stack value.
-                    continue;
+                    // Branches re-evaluate direct comparisons, but retaining
+                    // a stack location here also supports returned and
+                    // composed boolean values.
+                    let slot = next_slot;
+                    next_slot = next_slot
+                        .checked_add(8)
+                        .ok_or_else(|| "AArch64 mixed spill frame is too large".to_string())?;
+                    MixedLocation::Stack(slot)
                 }
                 _ => {
                     if function.types.get(value.0 as usize).is_none() {
@@ -1671,7 +1726,15 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                     emit_i64_constant(&mut asm, int_a, u64::from(*boolean));
                     store_int(&mut asm, value, int_a)?;
                 }
-                Inst::Param { .. } | Inst::Cmp { .. } | Inst::Phi { .. } => {}
+                Inst::Param { .. } | Inst::Phi { .. } => {}
+                Inst::Cmp { op, lhs, rhs } => {
+                    let condition = emit_mixed_stack_compare(
+                        function, *lhs, *rhs, *op, &locations, &mut asm, float_a, float_b, int_a,
+                        int_b,
+                    )?;
+                    asm.cset(int_a, condition);
+                    store_int(&mut asm, value, int_a)?;
+                }
                 Inst::Add(lhs, rhs)
                 | Inst::Sub(lhs, rhs)
                 | Inst::Mul(lhs, rhs)
@@ -1821,12 +1884,20 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
 
         match block.term.as_ref() {
             Some(Terminator::Return(result)) => {
-                if function.types.get(result.0 as usize) != Some(&Ty::F64) {
-                    return Err("AArch64 mixed spill emitter requires an f64 result".to_string());
+                let Some(result_ty) = function.types.get(result.0 as usize) else {
+                    return Err(format!("return value {result:?} has no type"));
+                };
+                match result_ty {
+                    Ty::F64 => load_f64(&mut asm, *result, Gpr::new_d(0))?,
+                    Ty::I64 | Ty::Bool => {
+                        load_int(&mut asm, *result, Gpr::new(16))?;
+                    }
                 }
-                load_f64(&mut asm, *result, Gpr::new_d(0))?;
                 for (register, offset) in [(int_c, 16), (int_b, 8), (int_a, 0)] {
                     asm.ldr(register, SP, offset);
+                }
+                if matches!(result_ty, Ty::I64 | Ty::Bool) {
+                    asm.orr_reg(Gpr::new(0), XZR, Gpr::new(16));
                 }
                 asm.add_imm(SP, SP, frame_bytes, false);
                 asm.ret();
@@ -2009,6 +2080,33 @@ fn emit_mixed_stack_branch_condition(
     if function.types.get(cond.0 as usize) != Some(&Ty::Bool) {
         return Err("AArch64 mixed spill branch comparison must produce bool".to_string());
     }
+    emit_mixed_stack_compare(
+        function,
+        *lhs,
+        *rhs,
+        *op,
+        locations,
+        asm,
+        lhs_float_scratch,
+        rhs_float_scratch,
+        lhs_int_scratch,
+        rhs_int_scratch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_mixed_stack_compare(
+    function: &Function,
+    lhs: Value,
+    rhs: Value,
+    op: CmpOp,
+    locations: &HashMap<Value, MixedLocation>,
+    asm: &mut Assembler,
+    lhs_float_scratch: Gpr,
+    rhs_float_scratch: Gpr,
+    lhs_int_scratch: Gpr,
+    rhs_int_scratch: Gpr,
+) -> Result<Condition, String> {
     let Some(lhs_ty) = function.types.get(lhs.0 as usize) else {
         return Err(format!("comparison operand {lhs:?} has no AArch64 IR type"));
     };
@@ -2020,7 +2118,7 @@ fn emit_mixed_stack_branch_condition(
     }
     match lhs_ty {
         Ty::F64 => {
-            for (value, scratch) in [(*lhs, lhs_float_scratch), (*rhs, rhs_float_scratch)] {
+            for (value, scratch) in [(lhs, lhs_float_scratch), (rhs, rhs_float_scratch)] {
                 match locations
                     .get(&value)
                     .copied()
@@ -2037,7 +2135,7 @@ fn emit_mixed_stack_branch_condition(
             asm.fcmp_d(lhs_float_scratch, rhs_float_scratch);
         }
         Ty::I64 | Ty::Bool => {
-            for (value, scratch) in [(*lhs, lhs_int_scratch), (*rhs, rhs_int_scratch)] {
+            for (value, scratch) in [(lhs, lhs_int_scratch), (rhs, rhs_int_scratch)] {
                 match locations
                     .get(&value)
                     .copied()
@@ -2055,16 +2153,9 @@ fn emit_mixed_stack_branch_condition(
         }
     }
     if *lhs_ty == Ty::F64 {
-        return Ok(f64_condition_for_cmp(*op));
+        return Ok(f64_condition_for_cmp(op));
     }
-    Ok(match op {
-        CmpOp::Eq => Condition::Eq,
-        CmpOp::Ne => Condition::Ne,
-        CmpOp::Lt => Condition::Lt,
-        CmpOp::Le => Condition::Le,
-        CmpOp::Gt => Condition::Gt,
-        CmpOp::Ge => Condition::Ge,
-    })
+    Ok(integer_condition_for_cmp(op))
 }
 
 /// Emits a complete AAPCS64 scalar i64 function for straight-line IR.
@@ -2505,6 +2596,17 @@ fn f64_condition_for_cmp(op: CmpOp) -> Condition {
     }
 }
 
+fn integer_condition_for_cmp(op: CmpOp) -> Condition {
+    match op {
+        CmpOp::Eq => Condition::Eq,
+        CmpOp::Ne => Condition::Ne,
+        CmpOp::Lt => Condition::Lt,
+        CmpOp::Le => Condition::Le,
+        CmpOp::Gt => Condition::Gt,
+        CmpOp::Ge => Condition::Ge,
+    }
+}
+
 fn emit_phi_edge_copies(
     function: &Function,
     target: usize,
@@ -2552,14 +2654,7 @@ fn condition_for_cmp(function: &Function, value: Value) -> Result<Condition, Str
     if function.types.get(lhs.0 as usize) == Some(&Ty::F64) {
         return Ok(f64_condition_for_cmp(*op));
     }
-    Ok(match op {
-        CmpOp::Eq => Condition::Eq,
-        CmpOp::Ne => Condition::Ne,
-        CmpOp::Lt => Condition::Lt,
-        CmpOp::Le => Condition::Le,
-        CmpOp::Gt => Condition::Gt,
-        CmpOp::Ge => Condition::Ge,
-    })
+    Ok(integer_condition_for_cmp(*op))
 }
 
 #[cfg(test)]
@@ -2679,6 +2774,65 @@ mod tests {
         asm.sub_reg(Gpr::new(8), XZR, Gpr::new(0));
         assert_eq!(asm.words(), &[sub_reg(Gpr::new(8), XZR, Gpr::new(0))]);
         assert_eq!(XZR.index(), 31);
+    }
+
+    #[test]
+    fn cset_materializes_a_canonical_bool() {
+        let mut asm = Assembler::new();
+        asm.cset(Gpr::new(8), Condition::Eq);
+        assert_eq!(asm.words(), &[0x9a9f_17e8]);
+        assert_eq!(cset(Gpr::new(8), Condition::Gt), 0x9a9f_d7e8);
+    }
+
+    #[test]
+    fn scalar_emitter_materializes_comparison_results() {
+        let function = forge_runtime::lower_source("x > 0.0").unwrap();
+        let bytes = emit_scalar(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&cset(Gpr::new(8), Condition::Gt)));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_typed_bool_result_on_native_aarch64() {
+        let function = forge_runtime::lower_source("x > 0.0").unwrap();
+        let bytes = emit_scalar(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        // SAFETY: the emitted body follows the AAPCS64 fn(f64) -> bool-word
+        // convention and the executable buffer remains alive for both calls.
+        let function: unsafe extern "C" fn(f64) -> i64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        assert_eq!(unsafe { function(3.0) }, 1);
+        assert_eq!(unsafe { function(-3.0) }, 0);
+        assert_eq!(unsafe { function(f64::NAN) }, 0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_stack_backed_typed_bool_result_on_native_aarch64() {
+        let source = "f8 + f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7 > 0.0";
+        let function_ir = forge_runtime::lower_source(source).unwrap();
+        let bytes = emit_scalar(&function_ir).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        // SAFETY: the emitted body follows the AAPCS64 fn(f64 x 9) ->
+        // bool-word convention, including f8's incoming stack slot.
+        let function: unsafe extern "C" fn(f64, f64, f64, f64, f64, f64, f64, f64, f64) -> i64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        assert_eq!(
+            unsafe { function(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0) },
+            1
+        );
+        assert_eq!(
+            unsafe { function(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -2.0) },
+            0
+        );
     }
 
     #[test]
