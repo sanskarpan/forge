@@ -1268,10 +1268,12 @@ runtime's typed entry point, `forge_runtime::evaluate_typed(source, args)`
 raw representation, and uses a private executable trampoline to marshal
 supported signatures into the right ABI locations: GPR for `i64`/`bool`, XMM
 for `f64`, and the Win64 caller stack for positions five through eight. On
-AArch64 the trampoline loads the separate AAPCS64 GPR and D-register banks
-and preserves the link register across the target call. Unsupported shapes
-fall back to the interpreter rather than being called through an unverifiable
-function pointer type.
+AArch64 the trampoline loads the separate AAPCS64 GPR and D-register banks,
+places values beyond either eight-register bank in aligned stack argument
+slots, and preserves the link register across the target call. The AArch64
+body accounts for its local frame when loading those incoming stack values.
+Unsupported shapes fall back to the interpreter rather than being called
+through an unverifiable function pointer type.
 
 ---
 
