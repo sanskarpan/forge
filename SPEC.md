@@ -114,6 +114,7 @@ multiply sequence: native x86-64 and AArch64 emission calls the process-local
 `fmod` symbol so large-magnitude inputs retain the interpreter's remainder
 semantics. WASM has no scalar `f64.rem` instruction, so its artifact emitter
 rejects this shape and portable runtime/array evaluation uses the interpreter.
+This boundary is implemented and validated by PR #345.
 
 ### Type system
 
