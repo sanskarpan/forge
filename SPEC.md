@@ -112,9 +112,12 @@ n / 7                                   # → magic-number multiply
 The floating-point `%` operator is not approximated with a divide/truncate/
 multiply sequence: native x86-64 and AArch64 emission calls the process-local
 `fmod` symbol so large-magnitude inputs retain the interpreter's remainder
-semantics. WASM has no scalar `f64.rem` instruction, so its artifact emitter
-rejects this shape and portable runtime/array evaluation uses the interpreter.
-This boundary is implemented and validated by PR #345.
+semantics. WASM has no scalar `f64.rem` instruction, so remainder-containing
+artifacts import `forge.fmod` with the exact `(f64, f64) -> f64` signature;
+the browser and Node hosts provide that import with their native `%` operation.
+Modules that do not use f64 remainder remain dependency-free. Portable
+runtime/array evaluation continues to use the interpreter. This boundary is
+implemented and validated by the WASM remainder artifact batch for issue #362.
 
 ### Type system
 
@@ -1165,7 +1168,7 @@ conform to the same prologue/epilogue convention.
 
 ## §10 WASM Backend (for the workbench)
 
-The workbench runs in a browser, where we obviously cannot execute generated x86. So there's a third backend emitting **WebAssembly bytes**, assembled at runtime via `WebAssembly.instantiate`. Same IR, same optimizer, same register allocation *(skipped — WASM is a stack machine)*, real measurable speedup over the interpreter.
+The workbench runs in a browser, where we obviously cannot execute generated x86. So there's a third backend emitting **WebAssembly bytes**, assembled at runtime via `WebAssembly.instantiate`. Same IR, same optimizer, same register allocation *(skipped — WASM is a stack machine)*, real measurable speedup over the interpreter. The MVP instruction set has no scalar f64 remainder opcode; an artifact using `%` declares the typed `forge.fmod` host import and the browser supplies `{ forge: { fmod: (lhs, rhs) => lhs % rhs } }`. Other artifacts declare no imports.
 
 ```rust
 /// WASM is a stack machine, so instruction selection is trivial: post-order
