@@ -2097,7 +2097,7 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
             )
         })
         .count();
-    if non_param_count > 21 {
+    if non_param_count > 21 || aarch64_has_stack_params(&function.params) {
         return emit_i64_with_stack_spills(function, *result);
     }
 
@@ -2112,8 +2112,10 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
             };
             let register = match inst {
                 Inst::Param { index, ty: Ty::I64 } => {
-                    if *index as usize >= function.params.len() || *index >= 8 {
-                        return Err("AArch64 i64 emitter supports at most 8 parameters".to_string());
+                    if *index as usize >= function.params.len() {
+                        return Err(
+                            "AArch64 i64 emitter parameter index is out of range".to_string()
+                        );
                     }
                     Gpr::new(*index as u8)
                 }
@@ -2211,6 +2213,7 @@ pub fn emit_i64(function: &Function) -> Result<Vec<u8>, String> {
 enum I64Location {
     Register(Gpr),
     Stack(u16),
+    IncomingStack(u16),
 }
 
 /// Emits the straight-line i64 subset with every non-parameter value in a
@@ -2228,10 +2231,19 @@ fn emit_i64_with_stack_spills(function: &Function, result: Value) -> Result<Vec<
             };
             let location = match inst {
                 Inst::Param { index, ty: Ty::I64 } => {
-                    if *index as usize >= function.params.len() || *index >= 8 {
-                        return Err("AArch64 i64 emitter supports at most 8 parameters".to_string());
+                    if *index as usize >= function.params.len() {
+                        return Err(
+                            "AArch64 i64 emitter parameter index is out of range".to_string()
+                        );
                     }
-                    I64Location::Register(Gpr::new(*index as u8))
+                    match stack_param_ordinal(&function.params, *index as usize) {
+                        Some(ordinal) => I64Location::IncomingStack(
+                            u16::try_from(ordinal * 8).map_err(|_| {
+                                "AArch64 i64 incoming stack arguments are too far away".to_string()
+                            })?,
+                        ),
+                        None => I64Location::Register(Gpr::new(*index as u8)),
+                    }
                 }
                 Inst::Param { .. } => {
                     return Err("AArch64 i64 emitter requires i64 parameters only".to_string())
@@ -2270,6 +2282,12 @@ fn emit_i64_with_stack_spills(function: &Function, result: Value) -> Result<Vec<
                 }
             }
             I64Location::Stack(offset) => asm.ldr(scratch, SP, offset),
+            I64Location::IncomingStack(offset) => {
+                let incoming_offset = frame_bytes
+                    .checked_add(offset)
+                    .ok_or_else(|| "AArch64 i64 incoming stack offset is too large".to_string())?;
+                asm.ldr(scratch, SP, incoming_offset);
+            }
         }
         Ok(())
     };
@@ -2281,6 +2299,11 @@ fn emit_i64_with_stack_spills(function: &Function, result: Value) -> Result<Vec<
                 }
             }
             I64Location::Stack(offset) => asm.str(source, SP, offset),
+            I64Location::IncomingStack(_) => {
+                return Err(
+                    "cannot store a value into an incoming AArch64 stack argument".to_string(),
+                )
+            }
         }
         Ok(())
     };
@@ -2348,7 +2371,7 @@ fn emit_i64_with_stack_spills(function: &Function, result: Value) -> Result<Vec<
             asm.orr_reg(Gpr::new(0), XZR, register);
         }
         I64Location::Stack(offset) => asm.ldr(Gpr::new(0), SP, offset),
-        I64Location::Register(_) => {}
+        I64Location::Register(_) | I64Location::IncomingStack(_) => {}
     }
     for (register, offset) in [(Gpr::new(30), 16), (Gpr::new(29), 8), (Gpr::new(28), 0)] {
         asm.ldr(register, SP, offset);
@@ -2736,7 +2759,6 @@ mod tests {
             .chunks(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert!(words.iter().any(|word| *word == ldr(Gpr::new(28), SP, 32)));
         assert!(words.iter().any(|word| *word == str_(Gpr::new(28), SP, 32)));
         assert!(words
             .iter()
@@ -3066,6 +3088,25 @@ mod tests {
     }
 
     #[test]
+    fn emits_i64_stack_backed_parameters_relative_to_the_entry_stack() {
+        let source = (0..9)
+            .map(|index| format!("(p{index} & -1)"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_i64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        // This expression has 35 non-parameter values, so the aligned spill
+        // frame is 304 bytes and the first incoming stack parameter is at
+        // SP+304 in the body.
+        assert!(words.iter().any(|word| *word == ldr(Gpr::new(28), SP, 304)));
+        assert_eq!(words.last(), Some(&0xd65f_03c0));
+    }
+
+    #[test]
     fn i64_emitter_preserves_callee_saved_temporaries_in_a_frame() {
         let source = (1..=6)
             .map(|mask| format!("(n & {mask})"))
@@ -3143,6 +3184,25 @@ mod tests {
         let function: unsafe extern "C" fn(i64) -> i64 =
             unsafe { std::mem::transmute(buffer.as_ptr()) };
         assert_eq!(unsafe { function(3) }, 15);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_i64_function_with_a_stack_backed_parameter() {
+        let source = (0..9)
+            .map(|index| format!("(p{index} & -1)"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_i64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        // SAFETY: the emitted body follows the AAPCS64 fn(i64 x 9) -> i64
+        // convention, and the executable buffer remains alive for the call.
+        let function: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        assert_eq!(unsafe { function(1, 2, 3, 4, 5, 6, 7, 8, 9) }, 45);
     }
 
     #[test]
