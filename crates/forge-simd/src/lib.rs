@@ -578,10 +578,12 @@ mod x86_packed {
 
     #[inline]
     fn forge_min_scalar(lhs: f64, rhs: f64) -> f64 {
-        if lhs.is_nan() {
-            rhs
-        } else if rhs.is_nan() {
-            lhs
+        if lhs.is_nan() || rhs.is_nan() {
+            if lhs.is_nan() {
+                rhs
+            } else {
+                lhs
+            }
         } else if lhs < rhs {
             lhs
         } else if rhs < lhs {
@@ -595,10 +597,12 @@ mod x86_packed {
 
     #[inline]
     fn forge_max_scalar(lhs: f64, rhs: f64) -> f64 {
-        if lhs.is_nan() {
-            rhs
-        } else if rhs.is_nan() {
-            lhs
+        if lhs.is_nan() || rhs.is_nan() {
+            if lhs.is_nan() {
+                rhs
+            } else {
+                lhs
+            }
         } else if lhs > rhs {
             lhs
         } else if rhs > lhs {
