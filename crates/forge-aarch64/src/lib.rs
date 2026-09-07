@@ -172,6 +172,26 @@ impl Assembler {
         self.words.push(fmax_d(dst, lhs, rhs));
     }
 
+    pub fn frintm_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(frintm_d(dst, src));
+    }
+
+    pub fn frintp_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(frintp_d(dst, src));
+    }
+
+    pub fn frintn_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(frintn_d(dst, src));
+    }
+
+    pub fn frinta_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(frinta_d(dst, src));
+    }
+
+    pub fn frintz_d(&mut self, dst: Gpr, src: Gpr) {
+        self.words.push(frintz_d(dst, src));
+    }
+
     pub fn fcvtzs(&mut self, dst: Gpr, src: Gpr) {
         self.words.push(fcvtzs(dst, src));
     }
@@ -460,6 +480,32 @@ pub fn fmax_d(dst: Gpr, lhs: Gpr, rhs: Gpr) -> u32 {
     rr(0x1e60_6800, dst, lhs, rhs)
 }
 
+/// Round toward negative infinity (`floor`).
+pub fn frintm_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e65_4000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
+/// Round toward positive infinity (`ceil`).
+pub fn frintp_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e64_c000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
+/// Round to nearest integral value, using the architectural ties-to-even mode.
+pub fn frintn_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e64_4000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
+/// Round to nearest integral value, with halfway cases away from zero. This
+/// matches Rust's `f64::round`, which is Forge's interpreter semantics.
+pub fn frinta_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e66_4000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
+/// Round toward zero (`trunc`).
+pub fn frintz_d(dst: Gpr, src: Gpr) -> u32 {
+    0x1e65_c000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
+}
+
 pub fn fcvtzs(dst: Gpr, src: Gpr) -> u32 {
     0x9e78_0000 | (u32::from(src.index()) << 5) | u32::from(dst.index())
 }
@@ -719,6 +765,10 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
                             | Inst::Fma { .. }
                             | Inst::Min(_, _)
                             | Inst::Max(_, _)
+                            | Inst::Floor(_)
+                            | Inst::Ceil(_)
+                            | Inst::Round(_)
+                            | Inst::Trunc(_)
                             | Inst::Cmp { .. }
                             | Inst::Phi { .. }
                             | Inst::Call { .. }
@@ -785,6 +835,10 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
                         | Inst::Shl(_, _)
                         | Inst::Shr(_, _)
                         | Inst::Sar(_, _)
+                        | Inst::Floor(_)
+                        | Inst::Ceil(_)
+                        | Inst::Round(_)
+                        | Inst::Trunc(_)
                         | Inst::Cmp { .. }
                         | Inst::IToF(_)
                         | Inst::FToI(_)
@@ -1026,6 +1080,30 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
                     }
                     asm.fmax_d(dst, register_of(*lhs)?, register_of(*rhs)?);
                 }
+                Inst::Floor(operand) => {
+                    if function.types[value.0 as usize] != Ty::F64 {
+                        return Err("AArch64 floor requires an f64 operand".to_string());
+                    }
+                    asm.frintm_d(dst, register_of(*operand)?);
+                }
+                Inst::Ceil(operand) => {
+                    if function.types[value.0 as usize] != Ty::F64 {
+                        return Err("AArch64 ceil requires an f64 operand".to_string());
+                    }
+                    asm.frintp_d(dst, register_of(*operand)?);
+                }
+                Inst::Round(operand) => {
+                    if function.types[value.0 as usize] != Ty::F64 {
+                        return Err("AArch64 round requires an f64 operand".to_string());
+                    }
+                    asm.frinta_d(dst, register_of(*operand)?);
+                }
+                Inst::Trunc(operand) => {
+                    if function.types[value.0 as usize] != Ty::F64 {
+                        return Err("AArch64 trunc requires an f64 operand".to_string());
+                    }
+                    asm.frintz_d(dst, register_of(*operand)?);
+                }
                 Inst::And(lhs, rhs) => asm.and_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
                 Inst::Or(lhs, rhs) => asm.orr_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
                 Inst::Xor(lhs, rhs) => asm.eor_reg(dst, register_of(*lhs)?, register_of(*rhs)?),
@@ -1056,11 +1134,7 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
                 }
                 Inst::IToF(value) => asm.scvtf(dst, register_of(*value)?),
                 Inst::FToI(value) => asm.fcvtzs(dst, register_of(*value)?),
-                Inst::Floor(..)
-                | Inst::Ceil(..)
-                | Inst::Round(..)
-                | Inst::Trunc(..)
-                | Inst::Call { .. } => {
+                Inst::Call { .. } => {
                     return Err(format!("AArch64 f64 emitter does not support {:?}", inst))
                 }
             }
@@ -1351,6 +1425,26 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
                 Some(Inst::Sqrt(operand)) => {
                     load(&mut asm, *operand, scratch_a)?;
                     asm.fsqrt_d(scratch_a, scratch_a);
+                    store(&mut asm, value, scratch_a)?;
+                }
+                Some(Inst::Floor(operand)) => {
+                    load(&mut asm, *operand, scratch_a)?;
+                    asm.frintm_d(scratch_a, scratch_a);
+                    store(&mut asm, value, scratch_a)?;
+                }
+                Some(Inst::Ceil(operand)) => {
+                    load(&mut asm, *operand, scratch_a)?;
+                    asm.frintp_d(scratch_a, scratch_a);
+                    store(&mut asm, value, scratch_a)?;
+                }
+                Some(Inst::Round(operand)) => {
+                    load(&mut asm, *operand, scratch_a)?;
+                    asm.frinta_d(scratch_a, scratch_a);
+                    store(&mut asm, value, scratch_a)?;
+                }
+                Some(Inst::Trunc(operand)) => {
+                    load(&mut asm, *operand, scratch_a)?;
+                    asm.frintz_d(scratch_a, scratch_a);
                     store(&mut asm, value, scratch_a)?;
                 }
                 Some(Inst::Fma { a, b, c }) => {
@@ -1844,6 +1938,38 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                     load_f64(&mut asm, *operand, float_a)?;
                     asm.fcvtzs(int_a, float_a);
                     store_int(&mut asm, value, int_a)?;
+                }
+                Inst::Floor(operand) => {
+                    if function.types.get(value.0 as usize) != Some(&Ty::F64) {
+                        return Err("AArch64 mixed spill floor requires an f64 result".to_string());
+                    }
+                    load_f64(&mut asm, *operand, float_a)?;
+                    asm.frintm_d(float_a, float_a);
+                    store_f64(&mut asm, value, float_a)?;
+                }
+                Inst::Ceil(operand) => {
+                    if function.types.get(value.0 as usize) != Some(&Ty::F64) {
+                        return Err("AArch64 mixed spill ceil requires an f64 result".to_string());
+                    }
+                    load_f64(&mut asm, *operand, float_a)?;
+                    asm.frintp_d(float_a, float_a);
+                    store_f64(&mut asm, value, float_a)?;
+                }
+                Inst::Round(operand) => {
+                    if function.types.get(value.0 as usize) != Some(&Ty::F64) {
+                        return Err("AArch64 mixed spill round requires an f64 result".to_string());
+                    }
+                    load_f64(&mut asm, *operand, float_a)?;
+                    asm.frinta_d(float_a, float_a);
+                    store_f64(&mut asm, value, float_a)?;
+                }
+                Inst::Trunc(operand) => {
+                    if function.types.get(value.0 as usize) != Some(&Ty::F64) {
+                        return Err("AArch64 mixed spill trunc requires an f64 result".to_string());
+                    }
+                    load_f64(&mut asm, *operand, float_a)?;
+                    asm.frintz_d(float_a, float_a);
+                    store_f64(&mut asm, value, float_a)?;
                 }
                 Inst::Call { func, args } => {
                     let expected = match func {
@@ -2687,6 +2813,11 @@ mod tests {
         assert_eq!(fadd_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_2820);
         assert_eq!(fmin_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_7820);
         assert_eq!(fmax_d(Gpr::new(0), Gpr::new(1), Gpr::new(2)), 0x1e62_6820);
+        assert_eq!(frintm_d(Gpr::new(0), Gpr::new(1)), 0x1e65_4020);
+        assert_eq!(frintp_d(Gpr::new(2), Gpr::new(3)), 0x1e64_c062);
+        assert_eq!(frintn_d(Gpr::new(4), Gpr::new(5)), 0x1e64_40a4);
+        assert_eq!(frinta_d(Gpr::new(4), Gpr::new(5)), 0x1e66_40a4);
+        assert_eq!(frintz_d(Gpr::new(6), Gpr::new(7)), 0x1e65_c0e6);
         assert_eq!(fcmp_d(Gpr::new(1), Gpr::new(2)), 0x1e62_2020);
         assert_eq!(fsqrt_d(Gpr::new(0), Gpr::new(1)), 0x1e61_c020);
         assert_eq!(
@@ -3455,6 +3586,48 @@ mod tests {
         buffer.make_executable().unwrap();
         let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
         assert_eq!(compiled.call_args(&[3.0]), 10.0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_native_aarch64_rounding_intrinsics_with_interpreter_semantics() {
+        for (source, input, expected) in [
+            ("floor(x)", 2.75f64, 2.0f64),
+            ("floor(x)", -2.25, -3.0),
+            ("ceil(x)", 2.25, 3.0),
+            ("ceil(x)", -2.75, -2.0),
+            ("round(x)", 2.5, 3.0),
+            ("round(x)", -2.5, -3.0),
+            ("trunc(x)", 2.75, 2.0),
+            ("trunc(x)", -2.75, -2.0),
+        ] {
+            let function = forge_runtime::lower_source(source).unwrap();
+            let bytes = emit_f64(&function).unwrap();
+            let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+            buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+            buffer.make_executable().unwrap();
+            let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
+            assert_eq!(
+                compiled.call_args(&[input]).to_bits(),
+                expected.to_bits(),
+                "{source}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_native_aarch64_rounding_through_f64_stack_spills() {
+        let source = std::iter::repeat_n("floor(x)", 26)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let function = forge_runtime::lower_source(&source).unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+        buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+        buffer.make_executable().unwrap();
+        let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
+        assert_eq!(compiled.call_args(&[2.75]), 52.0);
     }
 
     #[cfg(target_arch = "aarch64")]
