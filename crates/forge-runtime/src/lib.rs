@@ -189,7 +189,7 @@ fn supports_native_typed_signature(function: &Function) -> bool {
         // limit; larger signatures remain on the interpreter fallback.
         function.params.len() <= 8
     } else {
-        integer_args <= 6 && float_args <= 8
+        function.params.len() <= 16
     }
 }
 
@@ -280,6 +280,10 @@ fn emit_typed_trampoline(
             continue;
         }
         if *ty == forge_ir::Ty::F64 {
+            if !cfg!(windows) && float_ordinal >= forge_regalloc::SYSV_FLOAT_ARGS.len() {
+                float_ordinal += 1;
+                continue;
+            }
             let dst = if cfg!(windows) {
                 [PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3][index]
             } else {
@@ -297,6 +301,10 @@ fn emit_typed_trampoline(
             asm.movsd_reg_mem(dst, PhysReg::R10, offset);
             float_ordinal += 1;
         } else {
+            if !cfg!(windows) && integer_ordinal >= forge_regalloc::SYSV_INT_ARGS.len() {
+                integer_ordinal += 1;
+                continue;
+            }
             let dst = if cfg!(windows) {
                 [PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8, PhysReg::R9][index]
             } else {
@@ -319,6 +327,11 @@ fn emit_typed_trampoline(
     // arguments before CALL. The target's framed Win64 parameter loads use
     // [RBP + 48 + (index - 4) * 8], which corresponds to [RSP + 32 + ...]
     // immediately before CALL.
+    let sysv_stack_params = if cfg!(windows) {
+        Vec::new()
+    } else {
+        sysv_stack_param_offsets(params)
+    };
     let call_stack_bytes = if cfg!(windows) {
         let stack_args = params.len().saturating_sub(4);
         let mut bytes = 32 + stack_args * 8;
@@ -327,7 +340,11 @@ fn emit_typed_trampoline(
         }
         bytes
     } else {
-        8
+        let mut bytes = sysv_stack_params.len() * 8;
+        if bytes % 16 != 8 {
+            bytes += 8;
+        }
+        bytes
     };
     let call_stack_bytes = i32::try_from(call_stack_bytes)
         .expect("typed trampoline stack area is too large for an x86 displacement");
@@ -339,6 +356,13 @@ fn emit_typed_trampoline(
             asm.mov_reg_mem(PhysReg::R11, PhysReg::R10, packed_offset);
             asm.mov_mem_reg(PhysReg::Rsp, stack_offset, PhysReg::R11);
         }
+    } else {
+        for (index, stack_ordinal) in sysv_stack_params {
+            let packed_offset = (index * 8) as i32;
+            let stack_offset = (stack_ordinal * 8) as i32;
+            asm.mov_reg_mem(PhysReg::R11, PhysReg::R10, packed_offset);
+            asm.mov_mem_reg(PhysReg::Rsp, stack_offset, PhysReg::R11);
+        }
     }
     asm.mov_reg_imm(PhysReg::R11, target);
     asm.call_reg(PhysReg::R11);
@@ -347,6 +371,30 @@ fn emit_typed_trampoline(
         asm.movq_xmm_to_gpr(PhysReg::Rax, PhysReg::Xmm0);
     }
     asm.ret();
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sysv_stack_param_offsets(params: &[(String, forge_ir::Ty)]) -> Vec<(usize, usize)> {
+    let mut integer_ordinal = 0usize;
+    let mut float_ordinal = 0usize;
+    let mut stack_ordinal = 0usize;
+    let mut offsets = Vec::new();
+    for (index, (_, ty)) in params.iter().enumerate() {
+        let (ordinal, capacity) = if *ty == forge_ir::Ty::F64 {
+            let ordinal = float_ordinal;
+            float_ordinal += 1;
+            (ordinal, forge_regalloc::SYSV_FLOAT_ARGS.len())
+        } else {
+            let ordinal = integer_ordinal;
+            integer_ordinal += 1;
+            (ordinal, forge_regalloc::SYSV_INT_ARGS.len())
+        };
+        if ordinal >= capacity {
+            offsets.push((index, stack_ordinal));
+            stack_ordinal += 1;
+        }
+    }
+    offsets
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -680,6 +728,26 @@ mod tests {
             )
             .unwrap(),
             RtValue::F64(4.5)
+        );
+    }
+
+    #[test]
+    fn typed_runtime_marshals_stack_backed_sysv_shape() {
+        assert_eq!(
+            evaluate_typed(
+                "(p0 & -1) + (p1 & -1) + (p2 & -1) + (p3 & -1) + (p4 & -1) + (p5 & -1) + (p6 & -1)",
+                &[
+                    RtValue::I64(1),
+                    RtValue::I64(2),
+                    RtValue::I64(3),
+                    RtValue::I64(4),
+                    RtValue::I64(5),
+                    RtValue::I64(6),
+                    RtValue::I64(7),
+                ],
+            )
+            .unwrap(),
+            RtValue::I64(28)
         );
     }
 
