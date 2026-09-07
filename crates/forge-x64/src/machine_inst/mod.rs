@@ -412,9 +412,11 @@ impl<'a> Selector<'a> {
             },
             Inst::Rem(a, b) => match self.ty_of(*a) {
                 Ty::I64 => self.insts.push(MachineInst::IntRem { dst, lhs: *a, rhs: *b }),
-                Ty::F64 => panic!(
-                    "forge-x64: float remainder is unsupported: x86 has no scalar f64 remainder instruction; use a future fmod/libm lowering"
-                ),
+                Ty::F64 => self.insts.push(MachineInst::CallLibm {
+                    dst,
+                    func: forge_ir::LibFunc::Fmod,
+                    args: smallvec::smallvec![*a, *b],
+                }),
                 Ty::Bool => unreachable!("Rem never applies to Bool"),
             },
             Inst::Neg(a) => match self.ty_of(*a) {
