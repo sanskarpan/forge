@@ -424,6 +424,26 @@ impl CpuFeatures {
         detect_impl()
     }
 
+    /// Intersects this requested mask with the capabilities of the current
+    /// host. This is deliberately separate from [`CpuFeatures::best_width`]:
+    /// width selection must never turn a caller-provided mask into an unsafe
+    /// ISA claim.
+    pub fn supported_by_host(self) -> Self {
+        let host = Self::detect();
+        Self {
+            sse2: self.sse2 && host.sse2,
+            sse41: self.sse41 && host.sse41,
+            avx: self.avx && host.avx,
+            avx2: self.avx2 && host.avx2,
+            fma: self.fma && host.fma,
+            avx512f: self.avx512f && host.avx512f,
+            avx512dq: self.avx512dq && host.avx512dq,
+            bmi2: self.bmi2 && host.bmi2,
+            neon: self.neon && host.neon,
+            sve: self.sve && host.sve,
+        }
+    }
+
     pub fn best_width(self, ty: Ty) -> u8 {
         match ty {
             Ty::F64 if self.avx512f => 8,
@@ -463,7 +483,16 @@ pub struct ArrayPlan {
 
 impl ArrayPlan {
     pub fn for_len(elements: usize) -> Self {
-        let width = best_width();
+        Self::for_len_with_features(elements, CpuFeatures::detect())
+    }
+
+    pub fn for_len_with_features(elements: usize, features: CpuFeatures) -> Self {
+        let width = match features.best_width(Ty::F64) {
+            8 => SimdWidth::F64x8,
+            4 => SimdWidth::F64x4,
+            2 => SimdWidth::F64x2,
+            _ => SimdWidth::Scalar,
+        };
         let lanes = width.lanes();
         Self {
             width,
@@ -491,7 +520,11 @@ pub struct ReductionResult {
     pub used_packed_backend: bool,
 }
 
-fn prepare_array(source: &str, columns: &[&[f64]]) -> Result<(Function, ArrayPlan), String> {
+fn prepare_array(
+    source: &str,
+    columns: &[&[f64]],
+    features: CpuFeatures,
+) -> Result<(Function, ArrayPlan), String> {
     let function = forge_runtime::lower_source(source).map_err(|error| error.to_string())?;
     if function.params.len() != columns.len()
         || function.params.iter().any(|(_, ty)| *ty != Ty::F64)
@@ -506,7 +539,10 @@ fn prepare_array(source: &str, columns: &[&[f64]]) -> Result<(Function, ArrayPla
     if columns.iter().any(|column| column.len() != elements) {
         return Err("array columns must have equal lengths".to_string());
     }
-    Ok((function, ArrayPlan::for_len(elements)))
+    Ok((
+        function,
+        ArrayPlan::for_len_with_features(elements, features),
+    ))
 }
 
 /// Evaluates a pure expression over one column per free f64 parameter. Full
@@ -517,12 +553,27 @@ fn prepare_array(source: &str, columns: &[&[f64]]) -> Result<(Function, ArrayPla
 /// fallback for loops, libm calls, and operations whose hardware
 /// NaN/rounding behavior does not exactly match the oracle.
 pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, String> {
-    let (function, plan) = prepare_array(source, columns)?;
+    evaluate_array_with_features(source, columns, CpuFeatures::detect())
+}
+
+/// Evaluates an array expression after applying an explicit CPU feature mask.
+/// Requested features are intersected with the host snapshot before width
+/// selection, so callers can disable packed backends for testing or policy
+/// reasons without accidentally enabling instructions the current CPU cannot
+/// execute. `CpuFeatures::scalar()` therefore provides a deterministic,
+/// bit-for-bit interpreter fallback.
+pub fn evaluate_array_with_features(
+    source: &str,
+    columns: &[&[f64]],
+    requested: CpuFeatures,
+) -> Result<ArrayResult, String> {
+    let features = requested.supported_by_host();
+    let (function, plan) = prepare_array(source, columns, features)?;
     let elements = plan.elements;
     if plan.width != SimdWidth::Scalar {
         let mut values = Vec::with_capacity(elements);
         let lanes = plan.width.lanes();
-        if let Some(chunks) = try_evaluate_packed_loop(&function, columns, plan) {
+        if let Some(chunks) = try_evaluate_packed_loop(&function, columns, plan, features) {
             let mut used_packed = plan.full_chunks > 0;
             values.extend(chunks);
             if plan.tail > 0 {
@@ -532,6 +583,7 @@ pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, S
                     plan.full_chunks * lanes,
                     plan.width,
                     plan.tail,
+                    features,
                 ) {
                     values.extend(tail);
                     used_packed = true;
@@ -576,10 +628,21 @@ pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, S
 /// deterministic. Loops, libm calls, and unsupported operations use the
 /// scalar interpreter for the complete reduction.
 pub fn reduce_sum(source: &str, columns: &[&[f64]]) -> Result<ReductionResult, String> {
-    let (function, plan) = prepare_array(source, columns)?;
+    reduce_sum_with_features(source, columns, CpuFeatures::detect())
+}
+
+/// Reduces an array expression using the requested, host-safe CPU feature
+/// mask. The reduction order remains the same source order as [`reduce_sum`].
+pub fn reduce_sum_with_features(
+    source: &str,
+    columns: &[&[f64]],
+    requested: CpuFeatures,
+) -> Result<ReductionResult, String> {
+    let features = requested.supported_by_host();
+    let (function, plan) = prepare_array(source, columns, features)?;
     if plan.width != SimdWidth::Scalar {
         let lanes = plan.width.lanes();
-        if let Some(chunks) = try_evaluate_packed_loop(&function, columns, plan) {
+        if let Some(chunks) = try_evaluate_packed_loop(&function, columns, plan, features) {
             let mut used_packed = plan.full_chunks > 0;
             let mut values = chunks;
             if plan.tail > 0 {
@@ -589,6 +652,7 @@ pub fn reduce_sum(source: &str, columns: &[&[f64]]) -> Result<ReductionResult, S
                     plan.full_chunks * lanes,
                     plan.width,
                     plan.tail,
+                    features,
                 ) {
                     values.extend(tail);
                     used_packed = true;
@@ -845,18 +909,23 @@ fn try_evaluate_packed_loop(
     function: &Function,
     columns: &[&[f64]],
     plan: ArrayPlan,
+    features: CpuFeatures,
 ) -> Option<Vec<f64>> {
     #[cfg(target_arch = "x86_64")]
-    if plan.width == SimdWidth::F64x8 && std::is_x86_feature_detected!("avx512f") {
+    if plan.width == SimdWidth::F64x8
+        && features.avx512f
+        && (!function_uses_fma(function) || features.fma)
+        && std::is_x86_feature_detected!("avx512f")
+    {
         // SAFETY: runtime feature detection proves AVX-512F is available.
         return unsafe { evaluate_packed_loop::<x86_packed::Avx512>(function, columns, plan) }.ok();
     }
     #[cfg(target_arch = "x86_64")]
-    if plan.width == SimdWidth::F64x4 && std::is_x86_feature_detected!("avx2") {
+    if plan.width == SimdWidth::F64x4 && features.avx2 && std::is_x86_feature_detected!("avx2") {
         // SAFETY: runtime feature detection proves AVX2 is available. FMA is
         // selected separately because fused multiply-add changes rounding.
         if function_uses_fma(function) {
-            if !std::is_x86_feature_detected!("fma") {
+            if !features.fma || !std::is_x86_feature_detected!("fma") {
                 return None;
             }
             return unsafe { evaluate_packed_loop::<x86_packed::Avx2Fma>(function, columns, plan) }
@@ -865,13 +934,13 @@ fn try_evaluate_packed_loop(
         return unsafe { evaluate_packed_loop::<x86_packed::Avx2>(function, columns, plan) }.ok();
     }
     #[cfg(target_arch = "x86_64")]
-    if plan.width == SimdWidth::F64x2 && std::is_x86_feature_detected!("sse2") {
+    if plan.width == SimdWidth::F64x2 && features.sse2 && std::is_x86_feature_detected!("sse2") {
         // SAFETY: SSE2 is guaranteed by the runtime check and lane ranges
         // were checked inside evaluate_packed.
         return unsafe { evaluate_packed_loop::<x86_packed::Sse2>(function, columns, plan) }.ok();
     }
     #[cfg(target_arch = "aarch64")]
-    if plan.width == SimdWidth::F64x2 {
+    if plan.width == SimdWidth::F64x2 && features.neon {
         // AArch64 always provides the NEON register set used here.
         return unsafe { evaluate_packed_loop::<neon_packed::Neon>(function, columns, plan) }.ok();
     }
@@ -884,12 +953,13 @@ fn try_evaluate_packed_tail(
     start: usize,
     width: SimdWidth,
     active: usize,
+    features: CpuFeatures,
 ) -> Option<Vec<f64>> {
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (function, columns, start, width, active);
+    let _ = (function, columns, start, width, active, features);
 
     #[cfg(target_arch = "x86_64")]
-    if width == SimdWidth::F64x8 && std::is_x86_feature_detected!("avx512f") {
+    if width == SimdWidth::F64x8 && features.avx512f && std::is_x86_feature_detected!("avx512f") {
         // SAFETY: AVX-512F is runtime-gated and the masked load/store only
         // accesses the `active` elements that remain in each input column.
         return unsafe {
@@ -1666,6 +1736,97 @@ mod tests {
         features.avx512f = true;
         assert_eq!(features.best_width(Ty::F64), 8);
         assert_eq!(features.best_width(Ty::I64), 1);
+    }
+
+    #[test]
+    fn scalar_feature_mask_forces_exact_interpreter_fallback() {
+        let input = [-3.0, -0.0, 1.5, f64::INFINITY, f64::NAN];
+        let result = evaluate_array_with_features(
+            "if x < 0.0 then x * x + 1.0 else x - 1.0",
+            &[&input],
+            CpuFeatures::scalar(),
+        )
+        .unwrap();
+        let expected = input
+            .iter()
+            .map(|&x| if x < 0.0 { x * x + 1.0 } else { x - 1.0 })
+            .collect::<Vec<_>>();
+        assert_eq!(result.plan.width, SimdWidth::Scalar);
+        assert!(!result.used_packed_backend);
+        assert_eq!(
+            result
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn feature_mask_is_intersected_with_host_capabilities() {
+        let requested = CpuFeatures {
+            sse2: true,
+            sse41: true,
+            avx: true,
+            avx2: true,
+            fma: true,
+            avx512f: true,
+            avx512dq: true,
+            bmi2: true,
+            neon: true,
+            sve: true,
+        };
+        let host = CpuFeatures::detect();
+        assert_eq!(requested.supported_by_host(), host);
+        assert_eq!(
+            CpuFeatures::scalar().supported_by_host(),
+            CpuFeatures::scalar()
+        );
+    }
+
+    #[test]
+    fn masked_reduction_matches_the_unmasked_result() {
+        let input = (0..11).map(|value| value as f64 - 4.0).collect::<Vec<_>>();
+        let masked = reduce_sum_with_features(
+            "if x < 0.0 then x * x else x + 0.5",
+            &[&input],
+            CpuFeatures::scalar(),
+        )
+        .unwrap();
+        let expected = input
+            .iter()
+            .fold(0.0, |sum, &x| sum + if x < 0.0 { x * x } else { x + 0.5 });
+        assert_eq!(masked.value.to_bits(), expected.to_bits());
+        assert_eq!(masked.plan.width, SimdWidth::Scalar);
+        assert!(!masked.used_packed_backend);
+    }
+
+    #[test]
+    fn disabling_fma_prevents_fma_packed_execution() {
+        let mut features = CpuFeatures::detect();
+        features.fma = false;
+        let input = [1.25, -2.0, 3.5, 4.0];
+        let result = evaluate_array_with_features("fma(x, x, 1.0)", &[&input], features).unwrap();
+        let expected = input
+            .iter()
+            .map(|&value| value.mul_add(value, 1.0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert!(!result.used_packed_backend);
     }
 
     #[cfg(target_arch = "x86_64")]
