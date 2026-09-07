@@ -109,6 +109,12 @@ result[i] = a[i] * b[i] + c[i]          # → vfmadd231pd
 n / 7                                   # → magic-number multiply
 ```
 
+The floating-point `%` operator is not approximated with a divide/truncate/
+multiply sequence: native x86-64 and AArch64 emission calls the process-local
+`fmod` symbol so large-magnitude inputs retain the interpreter's remainder
+semantics. WASM has no scalar `f64.rem` instruction, so its artifact emitter
+rejects this shape and portable runtime/array evaluation uses the interpreter.
+
 ### Type system
 
 Deliberately minimal: `f64`, `i64`, `bool`, plus `vec<f64, N>` / `vec<i64, N>` introduced by the vectorizer. Implicit widening `i64 → f64` where unambiguous; everything else is a type error with a span.
@@ -121,6 +127,7 @@ Deliberately minimal: `f64`, `i64`, `bool`, plus `vec<f64, N>` / `vec<i64, N>` i
 
 - `sqrt`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `trunc` → **single instructions** (`vsqrtsd`, `vandpd`, `vminsd`, `vroundsd`)
 - `sin`, `cos`, `exp`, `log`, `pow` → **calls into libm**, which forces the project to handle a real call sequence: caller-saved spilling, stack alignment, and the difference between the System V and Win64 ABIs
+- floating-point `%` → an exact process-local `fmod` call on native x86-64 and AArch64; WASM artifact emission rejects it because the WASM scalar instruction set has no `f64.rem` opcode
 - `fma` → scalar `vfmadd231sd` when x86 FMA3 is available; on x86 without FMA3 the runtime uses the interpreter fallback so the result remains exact relative to Forge's defined semantics. Packed AVX2+FMA and AVX-512F+FMA use the corresponding vector instructions; AVX-512F array tails use k-masked zeroing loads/stores; AArch64 has native `fmadd` and scalar FRINTM/FRINTP/FRINTA/FRINTZ paths for `floor`, `ceil`, Rust-compatible ties-away-from-zero `round`, and `trunc`. Stable EVEX byte forms are encoded separately and round-trip tested.
 
 ### Operators & precedence
