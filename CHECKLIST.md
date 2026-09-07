@@ -26,7 +26,7 @@ implemented lower-level work is absent.
 | WASM | Tested typed scalar byte emitter for `f64`, `i64`, and bool values, including arithmetic, comparisons, conditionals, lets, min/max, and fma lowering; generated artifacts are executed in a real Node WebAssembly runtime with exact i64 and canonical bool result checks; structured artifact JSON exposes bytes, hex, parameter types, result type, lowered/optimized IR, and CFG; parse/type diagnostics now include source spans and a serialized AST; `benchmark(source, sizes)` exposes portable baseline timings and results; reproducible `wasm-pack --target web --release` plus `wasm-opt -Oz` packaging is CI-validated under the documented gzip-size boundary; native interval/assembly artifacts remain open because this target is stack-machine WASM | `crates/forge-wasm`, `crates/forge-runtime/tests/cross_backend.rs`, `crates/forge-wasm-api`, `.github/workflows/ci-containers.yml`, `containers/Dockerfile.wasm-ci` |
 | Benchmarks | Reusable compiled-expression benchmark helper exists; allocator Criterion benchmark now measures about 42–43 µs for its 1000-value workload, below the 50 µs target on the validation machine | `crates/forge-bench`, `crates/forge-regalloc/benches` |
 | Workbench | React/Vite/TypeScript workbench now provides CodeMirror expression editing with syntax highlighting and source-span squiggles, 200 ms debounced compilation, shared Zustand artifact state, D3 AST and dagre CFG views, IR stepper/diff, target-aware native interval/assembly panels, WASM bytes, Recharts benchmark samples, tier labels, and x86-64/AArch64/WASM plus scalar/array selectors; WASM is executable in the browser, while x86-64/AArch64 are serialized inspection artifacts and native bytes are never executed in the browser | `workbench/`, `crates/forge-wasm-api`, `containers/Dockerfile.workbench` |
-| Windows executable memory | Implemented `VirtualAlloc`/`VirtualProtect`/`FlushInstructionCache`/`VirtualFree` backend; Win64 register/stack parameters, shadow space, caller-preserved scratch, live-value preservation across libm, register- and stack-backed typed runtime calls, and native `windows-latest` workspace/clippy/rustfmt coverage are implemented; nonvolatile-register allocation and broader external-ABI coverage remain open | `crates/forge-mem`, `crates/forge-emit`, `crates/forge-runtime`, `.github/workflows/ci.yml` |
+| Windows executable memory | Implemented `VirtualAlloc`/`VirtualProtect`/`FlushInstructionCache`/`VirtualFree` backend; Win64 register/stack parameters, shadow space, caller-preserved scratch, live-value preservation across libm, register- and stack-backed typed runtime calls, allocation of RBX/RSI/RDI/R12-R15 and XMM6-XMM15, aligned nonvolatile save/restore frames, spill-slot disjointness, and native `windows-latest` high-pressure coverage are implemented; broader external-ABI coverage remains open | `crates/forge-mem`, `crates/forge-emit`, `crates/forge-regalloc`, `crates/forge-runtime`, `.github/workflows/ci.yml` |
 
 The remaining open rows are intentional scope boundaries, not silent stubs.
 
@@ -151,6 +151,12 @@ The remaining open rows are intentional scope boundaries, not silent stubs.
   AAPCS64 f64-result signatures and straight-line all-i64 signatures, with
   separate floating/integer bank loading and link-register preservation; its
   complete platform matrix passed before merge to `codex/integration`.
+- PR #318 completes Win64 nonvolatile register handling: the Windows allocator
+  can use RBX/RSI/RDI/R12-R15 and XMM6-XMM15, generated frames preserve the
+  active set with aligned saves/restores, and local spills are placed below the
+  saved-register area. High-pressure native Windows tests exercise RBX and
+  XMM6 allocation and execution; the complete platform matrix passed before
+  merge to `codex/integration`.
 - The historical phase checkboxes below remain design-history markers. Open
   scope is tracked explicitly in the table above and in each phase’s notes;
   this section must not be read as claiming completion of full AArch64 ABI/code

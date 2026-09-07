@@ -176,6 +176,13 @@ slots. On AArch64 it uses an AArch64 trampoline for supported mixed signatures
 returning `f64` and straight-line all-`i64` signatures. Other targets and
 unsupported shapes use the verified interpreter fallback.
 
+On Windows, the native x86 allocator may use the nonvolatile GPRs RBX, RSI,
+RDI, and R12-R15 plus XMM6-XMM15. The emitted frame saves the active GPR set
+with pushes and the active XMM set in aligned RBP-relative scalar slots, then
+restores both before returning. Local spill slots are biased below this saved
+area, so spills cannot overwrite nonvolatile values. High-pressure native
+Windows tests verify RBX/XMM6 allocation and execution through the runtime.
+
 ---
 
 ## §4 Architecture
@@ -924,17 +931,10 @@ pub const SYSV_CALLEE_SAVED: &[PhysReg] = &[RBX, RBP, R12, R13, R14, R15];
 /// clobbers every float register. This is why `sin(x) + cos(y)` needs spills
 /// and `sqrt(x) + sqrt(y)` doesn't.
 ///
-/// NOTE (Phase 7d): this is the ABI-level full callee-saved set, for this
-/// section's register-allocation bookkeeping. forge-x64's actual, shipped
-/// `prologue::SYSV_CALLEE_SAVED` (`crates/forge-x64/src/prologue.rs`) is a
-/// narrower, same-named constant covering only `RBX, R12-R15` — it
-/// deliberately EXCLUDES `RBP`, because `RBP`'s save/restore is baked
-/// unconditionally into `emit_prologue`/`emit_epilogue`'s own `push rbp`/
-/// `pop rbp`, never passed in by the caller. This isn't a bug in either
-/// place — `RBP` is never a register the Phase 8 allocator would hand out
-/// anyway — but don't conflate the two lists by name when Phase 8 wires
-/// real allocator output into `emit_prologue`/`emit_epilogue`'s
-/// `callee_saved` parameter.
+/// NOTE: this is the ABI-level full callee-saved set, for this section's
+/// bookkeeping. forge-x64's shipped `SYSV_CALLEE_SAVED` is the active
+/// allocator-facing subset `RBX, R12-R15`; it deliberately excludes `RBP`,
+/// whose save/restore is unconditional in `emit_prologue`/`emit_epilogue`.
 
 /// Microsoft x64 (Windows)
 pub const WIN64_INT_ARGS:  &[PhysReg] = &[RCX, RDX, R8, R9];
@@ -944,6 +944,10 @@ pub const WIN64_CALLEE_SAVED: &[PhysReg] =
 /// Win64 additionally requires 32 bytes of SHADOW SPACE allocated by the
 /// caller, and XMM6-15 are callee-saved. Forgetting the shadow space produces
 /// a crash inside libm that is very hard to trace back.
+/// The shipped Windows frame implementation pushes only the active
+/// nonvolatile GPRs and stores active XMM6-15 values below them with `movsd`;
+/// spill slots are below that save area and the total frame is padded to keep
+/// the call-site alignment contract intact.
 
 /// AAPCS64 (AArch64)
 pub const AAPCS_INT_ARGS:  &[PhysReg] = &[X0, X1, X2, X3, X4, X5, X6, X7];
