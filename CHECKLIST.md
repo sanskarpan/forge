@@ -176,10 +176,10 @@ The remaining open rows are intentional scope boundaries, not silent stubs.
   uses FRINTA because Forge's interpreter follows Rust's ties-away-from-zero
   `f64::round` semantics. Encoder, native ARM64, runtime, and complete
   platform-matrix coverage pass.
-- The current floating-remainder feature branch adds exact process-local
-  `fmod` lowering for native x86-64 and AArch64 paths, constant folding, and
-  native/runtime bit checks. WASM retains an explicit interpreter fallback for
-  portable evaluation because its scalar instruction set has no `f64.rem`.
+- PR #345 adds exact process-local `fmod` lowering for native x86-64 and
+  AArch64 paths, constant folding, and native/runtime bit checks. WASM retains
+  an explicit interpreter fallback for portable evaluation because its scalar
+  instruction set has no `f64.rem`.
 - The historical phase checkboxes below remain design-history markers. Open
   scope is tracked explicitly in the table above and in each phase’s notes;
   this section must not be read as claiming completion of full AArch64 ABI/code
