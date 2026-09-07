@@ -905,6 +905,16 @@ mod tests {
         assert_eq!(compiled.call(&[3.0]), 10.0);
     }
 
+    #[test]
+    fn typed_runtime_preserves_floating_remainder_bits() {
+        for (x, y) in [(-7.5, 2.0), (f64::MAX, 3.0), (-0.0, 2.0)] {
+            let actual = evaluate_typed("x % y", &[RtValue::F64(x), RtValue::F64(y)])
+                .unwrap()
+                .as_f64();
+            assert_eq!(actual.to_bits(), (x % y).to_bits(), "x={x}, y={y}");
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn evaluate_runs_supported_code_natively_and_keeps_libm_fallback() {

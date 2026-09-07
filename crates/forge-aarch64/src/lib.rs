@@ -12,6 +12,7 @@ unsafe extern "C" {
     fn exp(x: f64) -> f64;
     fn log(x: f64) -> f64;
     fn pow(x: f64, y: f64) -> f64;
+    fn fmod(x: f64, y: f64) -> f64;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -448,6 +449,7 @@ pub fn libm_address(func: forge_ir::LibFunc) -> usize {
         forge_ir::LibFunc::Exp => exp as Unary as usize,
         forge_ir::LibFunc::Log => log as Unary as usize,
         forge_ir::LibFunc::Pow => pow as Binary as usize,
+        forge_ir::LibFunc::Fmod => fmod as Binary as usize,
     }
 }
 
@@ -802,7 +804,10 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
     let contains_f64_call = function
         .insts
         .iter()
-        .any(|inst| matches!(inst, Inst::Call { .. }))
+        .any(|inst| {
+            matches!(inst, Inst::Call { .. })
+                || matches!(inst, Inst::Rem(lhs, _) if function.types.get(lhs.0 as usize) == Some(&Ty::F64))
+        })
         && function.params.iter().all(|(_, ty)| *ty == Ty::F64);
     let has_stack_params = aarch64_has_stack_params(&function.params);
     if stack_spill_f64 && (non_param_count > 24 || contains_f64_call || has_stack_params) {
@@ -866,7 +871,10 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
     let contains_mixed_call = function
         .insts
         .iter()
-        .any(|inst| matches!(inst, Inst::Call { .. }));
+        .any(|inst| {
+            matches!(inst, Inst::Call { .. })
+                || matches!(inst, Inst::Rem(lhs, _) if function.types.get(lhs.0 as usize) == Some(&Ty::F64))
+        });
     if mixed_stack_spill && (non_param_count > 24 || contains_mixed_call || has_stack_params) {
         return emit_mixed_f64_with_stack_spills(function);
     }
@@ -1454,9 +1462,22 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
                     asm.fmadd_d(scratch_a, scratch_a, scratch_b, scratch_c);
                     store(&mut asm, value, scratch_a)?;
                 }
+                Some(Inst::Rem(lhs, rhs)) => {
+                    load(&mut asm, *lhs, scratch_a)?;
+                    asm.fmov_d(Gpr::new_d(0), scratch_a);
+                    load(&mut asm, *rhs, scratch_b)?;
+                    asm.fmov_d(Gpr::new_d(1), scratch_b);
+                    emit_i64_constant(
+                        &mut asm,
+                        Gpr::new(16),
+                        libm_address(forge_ir::LibFunc::Fmod) as u64,
+                    );
+                    asm.blr(Gpr::new(16));
+                    store(&mut asm, value, Gpr::new_d(0))?;
+                }
                 Some(Inst::Call { func, args }) => {
                     let expected = match func {
-                        forge_ir::LibFunc::Pow => 2,
+                        forge_ir::LibFunc::Pow | forge_ir::LibFunc::Fmod => 2,
                         forge_ir::LibFunc::Sin
                         | forge_ir::LibFunc::Cos
                         | forge_ir::LibFunc::Tan
@@ -1863,16 +1884,29 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                         ))
                     }
                 },
-                Inst::Rem(lhs, rhs) => {
-                    if function.types.get(value.0 as usize) != Some(&Ty::I64) {
-                        return Err("AArch64 mixed remainder requires an i64 result".to_string());
+                Inst::Rem(lhs, rhs) => match function.types.get(value.0 as usize) {
+                    Some(Ty::I64) => {
+                        load_int(&mut asm, *lhs, int_a)?;
+                        load_int(&mut asm, *rhs, int_b)?;
+                        asm.sdiv(int_c, int_a, int_b);
+                        asm.msub(int_a, int_c, int_b, int_a);
+                        store_int(&mut asm, value, int_a)?;
                     }
-                    load_int(&mut asm, *lhs, int_a)?;
-                    load_int(&mut asm, *rhs, int_b)?;
-                    asm.sdiv(int_c, int_a, int_b);
-                    asm.msub(int_a, int_c, int_b, int_a);
-                    store_int(&mut asm, value, int_a)?;
-                }
+                    Some(Ty::F64) => {
+                        load_f64(&mut asm, *lhs, float_a)?;
+                        asm.fmov_d(Gpr::new_d(0), float_a);
+                        load_f64(&mut asm, *rhs, float_b)?;
+                        asm.fmov_d(Gpr::new_d(1), float_b);
+                        emit_i64_constant(
+                            &mut asm,
+                            Gpr::new(16),
+                            libm_address(forge_ir::LibFunc::Fmod) as u64,
+                        );
+                        asm.blr(Gpr::new(16));
+                        store_f64(&mut asm, value, Gpr::new_d(0))?;
+                    }
+                    _ => return Err("AArch64 remainder has an invalid result type".to_string()),
+                },
                 Inst::Neg(operand) => match function.types.get(value.0 as usize) {
                     Some(Ty::F64) => {
                         load_f64(&mut asm, *operand, float_a)?;
@@ -1973,7 +2007,7 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                 }
                 Inst::Call { func, args } => {
                     let expected = match func {
-                        forge_ir::LibFunc::Pow => 2,
+                        forge_ir::LibFunc::Pow | forge_ir::LibFunc::Fmod => 2,
                         forge_ir::LibFunc::Sin
                         | forge_ir::LibFunc::Cos
                         | forge_ir::LibFunc::Tan
@@ -3115,6 +3149,18 @@ mod tests {
     }
 
     #[test]
+    fn emits_aarch64_fmod_as_an_aligned_indirect_call() {
+        let function = forge_runtime::lower_source("x % y").unwrap();
+        let bytes = emit_f64(&function).unwrap();
+        let words = bytes
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&blr(Gpr::new(16))));
+        assert!(words.contains(&0xd65f_03c0));
+    }
+
+    #[test]
     fn emits_mixed_signature_libm_calls_with_both_parameter_banks_spilled() {
         let function = forge_runtime::lower_source("sin(x) + (n & 1)").unwrap();
         let bytes = emit_f64(&function).unwrap();
@@ -3611,6 +3657,24 @@ mod tests {
                 compiled.call_args(&[input]).to_bits(),
                 expected.to_bits(),
                 "{source}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_native_aarch64_floating_remainder_with_interpreter_semantics() {
+        for (x, y) in [(-7.5, 2.0), (f64::MAX, 3.0), (-0.0, 2.0)] {
+            let function = forge_runtime::lower_source("x % y").unwrap();
+            let bytes = emit_f64(&function).unwrap();
+            let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+            buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+            buffer.make_executable().unwrap();
+            let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 2);
+            assert_eq!(
+                compiled.call_args(&[x, y]).to_bits(),
+                (x % y).to_bits(),
+                "x={x}, y={y}"
             );
         }
     }

@@ -242,6 +242,10 @@ fn try_fold(f: &Function, v: Value) -> Option<Inst> {
                     ConstVal::F64(b) => a.powf(b),
                     _ => return None,
                 },
+                LibFunc::Fmod => match as_const(f, args[1])? {
+                    ConstVal::F64(b) => a % b,
+                    _ => return None,
+                },
             };
             Some(f64_inst(result))
         }

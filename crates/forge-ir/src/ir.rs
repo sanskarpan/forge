@@ -32,6 +32,7 @@ pub enum LibFunc {
     Exp,
     Log,
     Pow,
+    Fmod,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
