@@ -1368,26 +1368,30 @@ impl CpuFeatures {
 ### Vectorizer
 
 The current packed implementation supports SSE2, AVX2, AVX-512F, and NEON
-widths. `forge-simd` lowers each supported straight-line function into a
-typed vector body and an explicit `VectorLoop` plan: the plan records the
-induction start, lane-sized step, full-chunk count, tail count, and output
-store. Each f64 parameter is represented as a `VecLoad`, and the same body is
-reused at each induction offset. SSE2, AVX2, and NEON use scalar epilogues for
-incomplete chunks; AVX-512F uses stable inline assembly with k-masked zeroing
-loads/stores for the tail. Packed `min` and `max` are lowered with Forge's
-exact NaN and signed-zero rules: SSE2, AVX2, and NEON use compare/select plus
-bitwise sign handling, while AVX-512F uses an exact lane helper because its
-native minimum/maximum instructions have different NaN behavior. The
-separate EVEX byte encoders remain round-trip tested; the runtime AVX-512F
-path is implemented in `forge-simd` because the packed evaluator operates on
-runtime-detected CPU features rather than compile-time target-feature
-specialization.
+widths. `forge-simd` lowers each supported straight-line or pure acyclic
+structured-control-flow function into a typed vector body and an explicit
+`VectorLoop` plan: the plan records the induction start, lane-sized step,
+full-chunk count, tail count, and output store. Each f64 parameter is
+represented as a `VecLoad`, and the same body is reused at each induction
+offset. Structured `if` expressions use canonical lane masks, mask algebra
+for nested paths, and bit-preserving predicated selects for φ values. SSE2,
+AVX2, and NEON use scalar epilogues for incomplete chunks; AVX-512F uses
+stable inline assembly with k-masked zeroing loads/stores for the tail. Packed
+`min` and `max` are lowered with Forge's exact NaN and signed-zero rules:
+SSE2, AVX2, and NEON use compare/select plus bitwise sign handling, while
+AVX-512F uses an exact lane helper because its native minimum/maximum
+instructions have different NaN behavior. The separate EVEX byte encoders
+remain round-trip tested; the runtime AVX-512F path is implemented in
+`forge-simd` because the packed evaluator operates on runtime-detected CPU
+features rather than compile-time target-feature specialization. Loops,
+libm calls, and general array-mode memory IR remain scalar fallback scope.
 
 ```rust
-/// The expression is already a pure dataflow DAG over element i, so
-/// vectorization is a straight rewrite: every scalar op becomes a lane-wise
-/// op, loads become vector loads, and one typed body is reused by the loop at
-/// each induction offset.
+/// A pure expression over element i becomes a lane-wise dataflow graph:
+/// scalar ops become vector ops, loads become vector loads, and one typed body
+/// is reused by the loop at each induction offset. Acyclic `if` expressions
+/// become lane masks and predicated selects, preserving inactive-lane values
+/// even when they are NaN or infinity.
 ///
 /// Three things must be handled:
 ///   1. TAIL: N % width leftover elements. Either a scalar epilogue, or a
