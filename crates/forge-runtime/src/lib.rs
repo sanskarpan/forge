@@ -802,6 +802,17 @@ mod tests {
         assert_eq!(evaluate_typed(&source, &args).unwrap(), RtValue::F64(54.0));
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn typed_runtime_marshals_aapcs64_stack_backed_i64_parameters() {
+        let source = (0..9)
+            .map(|index| format!("(p{index} & -1)"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let args = (1..=9).map(RtValue::I64).collect::<Vec<_>>();
+        assert_eq!(evaluate_typed(&source, &args).unwrap(), RtValue::I64(45));
+    }
+
     #[test]
     fn depth_100_expression_compiles_and_runs() {
         let source = (0..100).fold("x".to_string(), |expression, _| {
