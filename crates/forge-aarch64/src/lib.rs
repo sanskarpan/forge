@@ -794,27 +794,18 @@ struct LinearAllocation {
 /// established stack-spill emitters responsible for genuine register
 /// pressure, calls, and stack-backed ABI shapes.
 fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation>, String> {
-    // The existing edge-copy emitter has a deliberately conservative spill
-    // implementation for structured CFGs. Keep this first reuse slice
-    // restricted to straight-line code until edge-specific interval splitting
-    // is added; sharing a flat interval across two control-flow arms would be
-    // unsound for a value whose last use differs by edge.
-    if function.blocks.len() != 1 {
-        return Ok(None);
-    }
-    let mut starts = HashMap::<Value, u32>::new();
-    let mut ends = HashMap::<Value, u32>::new();
+    let mut registers = HashMap::<Value, Gpr>::new();
     let mut param_values = HashMap::<Value, (u32, Ty)>::new();
+    let mut definition_block = HashMap::<Value, usize>::new();
 
-    let mut position = 0u32;
-    let mut block_ends = Vec::with_capacity(function.blocks.len());
-    for block in &function.blocks {
+    for (block_index, block) in function.blocks.iter().enumerate() {
         for &value in &block.insts {
             let Some(inst) = function.insts.get(value.0 as usize) else {
                 return Err(format!("block references missing instruction {value:?}"));
             };
-            starts.entry(value).or_insert(position);
-            ends.entry(value).or_insert(position);
+            if definition_block.insert(value, block_index).is_some() {
+                return Err(format!("value {value:?} is defined in more than one block"));
+            }
             if let Inst::Param { index, ty } = inst {
                 let Some((_, declared_ty)) = function.params.get(*index as usize) else {
                     return Err(format!("parameter index {index} is out of range"));
@@ -823,51 +814,10 @@ fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation
                     return Err(format!("parameter {index} has inconsistent IR type"));
                 }
                 param_values.insert(value, (*index, *ty));
-                starts.insert(value, 0);
-            }
-            for used in uses_of(inst) {
-                ends.entry(used)
-                    .and_modify(|end| *end = (*end).max(position))
-                    .or_insert(position);
-            }
-            position += 1;
-        }
-        let terminator_position = position;
-        match block.term.as_ref() {
-            Some(Terminator::Return(value)) => {
-                ends.entry(*value)
-                    .and_modify(|end| *end = (*end).max(terminator_position))
-                    .or_insert(terminator_position);
-            }
-            Some(Terminator::Branch { cond, .. }) => {
-                ends.entry(*cond)
-                    .and_modify(|end| *end = (*end).max(terminator_position))
-                    .or_insert(terminator_position);
-            }
-            Some(Terminator::Jump(_)) | None => {}
-        }
-        block_ends.push(terminator_position);
-        position += 1;
-    }
-
-    // A φ's incoming values are consumed on the predecessor edge. Keeping
-    // them live through the φ position is conservative and makes edge-copy
-    // emission safe even for hand-built CFGs whose blocks are not laid out in
-    // the usual front-end order.
-    for block in &function.blocks {
-        for &value in &block.insts {
-            let Some(Inst::Phi { incoming }) = function.insts.get(value.0 as usize) else {
-                continue;
-            };
-            for &(source, incoming_value) in incoming {
-                if let Some(end) = ends.get_mut(&incoming_value) {
-                    *end = (*end).max(block_ends[source.0 as usize]);
-                }
             }
         }
     }
 
-    let mut registers = HashMap::<Value, Gpr>::new();
     for (&value, &(index, ty)) in &param_values {
         let ordinal = function.params[..index as usize]
             .iter()
@@ -887,58 +837,179 @@ fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation
         );
     }
 
-    let mut intervals = starts
-        .into_iter()
-        .filter_map(|(value, start)| {
-            let ty = *function.types.get(value.0 as usize)?;
-            Some((value, start, *ends.get(&value).unwrap_or(&start), ty))
-        })
-        .filter(|(value, _, _, _)| !param_values.contains_key(value))
-        .collect::<Vec<_>>();
-    intervals.sort_by_key(|(value, start, end, _)| (*start, *end, value.0));
+    // Values used by another block need one stable home for every possible
+    // path. Phi edge copies additionally need a distinct home for every source
+    // and destination: otherwise two copies can form a parallel-move cycle
+    // (a -> b, b -> a), while the emitter's simple sequential moves would lose
+    // one of the source values. Phi operands are consumed on the predecessor
+    // edge, so those uses are attributed to their predecessor rather than the
+    // laid-out phi block.
+    let mut stable_values = Vec::<Value>::new();
+    let mut phi_values = Vec::<Value>::new();
+    let mut add_stable = |value: Value| {
+        if !param_values.contains_key(&value) && !stable_values.contains(&value) {
+            stable_values.push(value);
+        }
+    };
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        let mut record_use = |used: Value, use_block: usize| -> Result<(), String> {
+            let Some(&definition) = definition_block.get(&used) else {
+                return Err(format!("use references missing definition {used:?}"));
+            };
+            if definition != use_block {
+                add_stable(used);
+            }
+            Ok(())
+        };
+        for &value in &block.insts {
+            let inst = &function.insts[value.0 as usize];
+            if let Inst::Phi { incoming } = inst {
+                phi_values.push(value);
+                for &(predecessor, incoming_value) in incoming {
+                    let predecessor = predecessor.0 as usize;
+                    if predecessor >= function.blocks.len() {
+                        return Err(format!(
+                            "phi {value:?} references missing block {predecessor}"
+                        ));
+                    }
+                    phi_values.push(incoming_value);
+                    record_use(incoming_value, predecessor)?;
+                }
+            } else {
+                for used in uses_of(inst) {
+                    record_use(used, block_index)?;
+                }
+            }
+        }
+        match block.term.as_ref() {
+            Some(Terminator::Return(value)) | Some(Terminator::Branch { cond: value, .. }) => {
+                record_use(*value, block_index)?;
+            }
+            Some(Terminator::Jump(_)) | None => {}
+        }
+    }
+    for value in phi_values {
+        add_stable(value);
+    }
 
     let float_pool = (16..=31).chain(8..=15).map(Gpr::new_d).collect::<Vec<_>>();
     let integer_pool = (8..=18).chain(19..=28).map(Gpr::new).collect::<Vec<_>>();
-    let mut active_float = Vec::<(u32, Gpr)>::new();
-    let mut active_integer = Vec::<(u32, Gpr)>::new();
     let mut saved_float = Vec::new();
     let mut saved_integer = Vec::new();
+    let mut reserved_float = Vec::<Gpr>::new();
+    let mut reserved_integer = Vec::<Gpr>::new();
 
-    for (value, start, end, ty) in intervals {
-        let (pool, active) = match ty {
-            Ty::F64 => (&float_pool, &mut active_float),
-            Ty::I64 | Ty::Bool => (&integer_pool, &mut active_integer),
+    // Allocate edge-crossing and phi-edge values first and never recycle these
+    // homes. This is conservative for sibling branches, but it makes the
+    // result valid for structured CFGs without requiring parallel edge moves.
+    stable_values.sort_by_key(|value| value.0);
+    for value in stable_values {
+        let ty = *function
+            .types
+            .get(value.0 as usize)
+            .ok_or_else(|| format!("value {value:?} has no AArch64 IR type"))?;
+        let (pool, reserved) = match ty {
+            Ty::F64 => (&float_pool, &mut reserved_float),
+            Ty::I64 | Ty::Bool => (&integer_pool, &mut reserved_integer),
         };
-        active.retain(|(active_end, _)| *active_end >= start);
-        let used = active
-            .iter()
-            .map(|(_, register)| *register)
-            .collect::<Vec<_>>();
         let Some(register) = pool
             .iter()
             .copied()
-            .find(|register| !used.contains(register))
+            .find(|register| !reserved.contains(register))
         else {
             return Ok(None);
         };
         registers.insert(value, register);
-        active.push((end, register));
+        reserved.push(register);
         if ty == Ty::F64 && register.index() < 16 {
-            if !saved_float.contains(&register) {
-                saved_float.push(register);
-            }
-        } else if matches!(ty, Ty::I64 | Ty::Bool)
-            && register.index() >= 19
-            && !saved_integer.contains(&register)
-        {
+            saved_float.push(register);
+        } else if matches!(ty, Ty::I64 | Ty::Bool) && register.index() >= 19 {
             saved_integer.push(register);
         }
     }
 
-    // Keep the local above intentionally tied to interval construction so a
-    // future CFG shape cannot silently make the terminator-position data dead
-    // code while the allocator still appears to work.
-    debug_assert_eq!(block_ends.len(), function.blocks.len());
+    // Reuse only intervals whose complete lifetime is inside one block. A
+    // local value can safely share a home with a value in another block because
+    // the former has no edge use; the branch/jump has already consumed it.
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        let mut positions = HashMap::<Value, (u32, u32)>::new();
+        let mut position = 0u32;
+        for &value in &block.insts {
+            if !param_values.contains_key(&value) && !registers.contains_key(&value) {
+                positions.insert(value, (position, position));
+            }
+            let inst = &function.insts[value.0 as usize];
+            if !matches!(inst, Inst::Phi { .. }) {
+                for used in uses_of(inst) {
+                    if definition_block.get(&used) == Some(&block_index) {
+                        if let Some((_, end)) = positions.get_mut(&used) {
+                            *end = (*end).max(position);
+                        }
+                    }
+                }
+            }
+            position += 1;
+        }
+        let terminator_position = position;
+        if let Some(Terminator::Return(value) | Terminator::Branch { cond: value, .. }) =
+            block.term.as_ref()
+        {
+            if let Some((_, end)) = positions.get_mut(value) {
+                *end = (*end).max(terminator_position);
+            }
+        }
+        for target in &function.blocks {
+            for &value in &target.insts {
+                let Inst::Phi { incoming } = &function.insts[value.0 as usize] else {
+                    continue;
+                };
+                for &(predecessor, incoming_value) in incoming {
+                    if predecessor.0 as usize == block_index {
+                        if let Some((_, end)) = positions.get_mut(&incoming_value) {
+                            *end = (*end).max(terminator_position);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut intervals = positions
+            .into_iter()
+            .map(|(value, (start, end))| {
+                let ty = function.types[value.0 as usize];
+                (value, start, end, ty)
+            })
+            .collect::<Vec<_>>();
+        intervals.sort_by_key(|(value, start, end, _)| (*start, *end, value.0));
+        let mut active_float = Vec::<(u32, Gpr)>::new();
+        let mut active_integer = Vec::<(u32, Gpr)>::new();
+        for (value, start, end, ty) in intervals {
+            let (pool, reserved, active) = match ty {
+                Ty::F64 => (&float_pool, &reserved_float, &mut active_float),
+                Ty::I64 | Ty::Bool => (&integer_pool, &reserved_integer, &mut active_integer),
+            };
+            active.retain(|(active_end, _)| *active_end >= start);
+            let Some(register) = pool.iter().copied().find(|register| {
+                !reserved.contains(register)
+                    && !active
+                        .iter()
+                        .any(|(_, active_register)| active_register == register)
+            }) else {
+                return Ok(None);
+            };
+            registers.insert(value, register);
+            active.push((end, register));
+            if ty == Ty::F64 && register.index() < 16 && !saved_float.contains(&register) {
+                saved_float.push(register);
+            } else if matches!(ty, Ty::I64 | Ty::Bool)
+                && register.index() >= 19
+                && !saved_integer.contains(&register)
+            {
+                saved_integer.push(register);
+            }
+        }
+    }
+
     Ok(Some(LinearAllocation {
         registers,
         saved_float,
@@ -3372,6 +3443,34 @@ mod tests {
     }
 
     #[test]
+    fn linear_allocator_keeps_phi_edge_homes_stable_in_a_cfg() {
+        let function = forge_runtime::lower_source("if x > 0.0 then x + 1.0 else x - 1.0").unwrap();
+        let allocation = linear_allocate_scalar(&function)
+            .unwrap()
+            .expect("small CFG should fit with stable phi homes");
+        let mut phi_values = Vec::new();
+        for block in &function.blocks {
+            for &value in &block.insts {
+                let Inst::Phi { incoming } = &function.insts[value.0 as usize] else {
+                    continue;
+                };
+                phi_values.push(value);
+                phi_values.extend(incoming.iter().map(|(_, source)| *source));
+            }
+        }
+        phi_values.sort_by_key(|value| value.0);
+        phi_values.dedup();
+        let phi_registers = phi_values
+            .iter()
+            .map(|value| allocation.registers[value])
+            .collect::<Vec<_>>();
+        let mut unique_phi_registers = phi_registers.clone();
+        unique_phi_registers.sort_by_key(|register| register.index());
+        unique_phi_registers.dedup();
+        assert_eq!(phi_registers.len(), unique_phi_registers.len());
+    }
+
+    #[test]
     fn mixed_scalar_emitter_keeps_integer_temporaries_in_caller_saved_x_registers() {
         let function = forge_runtime::lower_source("x + (n & 3)").unwrap();
         let bytes = emit_f64(&function).unwrap();
@@ -3442,10 +3541,8 @@ mod tests {
 
     #[test]
     fn emits_cfg_f64_stack_spills_and_phi_edge_stores() {
-        let then_expr = std::iter::repeat_n("x", 14).collect::<Vec<_>>().join(" + ");
-        let else_expr = std::iter::repeat_n("-x", 14)
-            .collect::<Vec<_>>()
-            .join(" + ");
+        let then_expr = live_f64_sum(26);
+        let else_expr = live_f64_sum(26);
         let source = format!("if x > 0.0 then {then_expr} else {else_expr}");
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
@@ -3453,8 +3550,14 @@ mod tests {
             .chunks(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert!(words.iter().any(|word| *word == ldr_d(Gpr::new(29), SP, 8)));
-        assert!(words.iter().any(|word| *word == str_d(Gpr::new(29), SP, 0)));
+        let scratch_load_opcode = ldr_d(Gpr::new(29), SP, 0) & 0xffc0_0000;
+        let scratch_store_opcode = str_d(Gpr::new(29), SP, 0) & 0xffc0_0000;
+        assert!(words
+            .iter()
+            .any(|word| *word & 0xffc0_0000 == scratch_load_opcode));
+        assert!(words
+            .iter()
+            .any(|word| *word & 0xffc0_0000 == scratch_store_opcode));
         assert!(words.iter().any(|word| *word & 0x7f00_0000 == 0x5400_0000));
     }
 
@@ -3480,12 +3583,8 @@ mod tests {
 
     #[test]
     fn emits_mixed_cfg_stack_spills_and_typed_phi_edge_stores() {
-        let then_expr = std::iter::repeat_n("x + (n & 1)", 14)
-            .collect::<Vec<_>>()
-            .join(" + ");
-        let else_expr = std::iter::repeat_n("x - (n & 1)", 14)
-            .collect::<Vec<_>>()
-            .join(" + ");
+        let then_expr = live_mixed_sum(22);
+        let else_expr = live_mixed_sum(22);
         let source = format!("if (n & 1) > 0 then {then_expr} else {else_expr}");
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
@@ -3661,10 +3760,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn executes_aarch64_cfg_f64_function_with_stack_spills() {
-        let then_expr = std::iter::repeat_n("x", 14).collect::<Vec<_>>().join(" + ");
-        let else_expr = std::iter::repeat_n("-x", 14)
-            .collect::<Vec<_>>()
-            .join(" + ");
+        let then_expr = live_f64_sum(26);
+        let else_expr = live_f64_sum(26);
         let source = format!("if x > 0.0 then {then_expr} else {else_expr}");
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
@@ -3672,8 +3769,8 @@ mod tests {
         buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
         buffer.make_executable().unwrap();
         let compiled = forge_mem::CompiledExpr::from_buffer(buffer, 1);
-        assert_eq!(compiled.call_args(&[3.0]), 42.0);
-        assert_eq!(compiled.call_args(&[-3.0]), 42.0);
+        assert_eq!(compiled.call_args(&[3.0]), 403.0);
+        assert_eq!(compiled.call_args(&[-3.0]), 247.0);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3698,12 +3795,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn executes_aarch64_mixed_cfg_function_with_stack_spills() {
-        let then_expr = std::iter::repeat_n("x + (n & 1)", 14)
-            .collect::<Vec<_>>()
-            .join(" + ");
-        let else_expr = std::iter::repeat_n("x - (n & 1)", 14)
-            .collect::<Vec<_>>()
-            .join(" + ");
+        let then_expr = live_mixed_sum(22);
+        let else_expr = live_mixed_sum(22);
         let source = format!("if (n & 1) > 0 then {then_expr} else {else_expr}");
         let function = forge_runtime::lower_source(&source).unwrap();
         let bytes = emit_f64(&function).unwrap();
@@ -3714,8 +3807,8 @@ mod tests {
         // convention, and the executable buffer remains alive for both calls.
         let function: unsafe extern "C" fn(f64, i64) -> f64 =
             unsafe { std::mem::transmute(buffer.as_ptr()) };
-        assert_eq!(unsafe { function(2.0, 3) }, 42.0);
-        assert_eq!(unsafe { function(2.0, 4) }, 28.0);
+        assert_eq!(unsafe { function(2.0, 3) }, 75.0);
+        assert_eq!(unsafe { function(2.0, 4) }, 84.0);
     }
 
     #[cfg(target_arch = "aarch64")]

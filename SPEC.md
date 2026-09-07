@@ -1166,16 +1166,22 @@ conform to the same prologue/epilogue convention.
 
 ### AArch64 scalar live-range reuse
 
-Eligible straight-line scalar programs without calls, stack-backed parameters,
-or unsupported operations use an inclusive liveness-based allocator. D16..D31
-and X8..X18 are preferred because they are caller-saved; D8..D15 and X19..X28
-are selected only when simultaneous live values require them, and the existing
-aligned frame-record machinery preserves those registers. A value whose last
-use has ended is eligible for reuse, while touching intervals remain distinct.
-Structured CFGs continue to use the established monotonic assignment and
-edge-copy/spill paths until edge-aware interval splitting is available. This
-boundary improves allocation of long straight-line chains without claiming
-general spill insertion or arbitrary external-call ABI support.
+Scalar programs without calls, stack-backed parameters, or unsupported
+operations use an inclusive liveness-based allocator. D16..D31 and X8..X18
+are preferred because they are caller-saved; D8..D15 and X19..X28 are selected
+only when simultaneous live values require them, and the existing aligned
+frame-record machinery preserves those registers. A value whose last use has
+ended is eligible for reuse, while touching intervals remain distinct.
+
+The allocator also handles structured CFGs conservatively: values crossing a
+block edge and every value participating in a phi edge copy receive stable,
+unique homes, while values defined and consumed entirely within one block may
+reuse homes after their local live interval ends. This keeps the existing
+sequential phi-copy emitter correct, including move-cycle cases, without
+claiming path-sensitive sibling-block coalescing. Genuine pressure, calls,
+stack-backed parameters, and unsupported CFG shapes continue through the
+established spill/ABI fallbacks. Arbitrary external-call ABI support and fully
+edge-aware/general live-range allocation remain open boundaries.
 
 ---
 
