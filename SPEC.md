@@ -1167,21 +1167,24 @@ conform to the same prologue/epilogue convention.
 ### AArch64 scalar live-range reuse
 
 Scalar programs without calls, stack-backed parameters, or unsupported
-operations use an inclusive liveness-based allocator. D16..D31 and X8..X18
-are preferred because they are caller-saved; D8..D15 and X19..X28 are selected
-only when simultaneous live values require them, and the existing aligned
-frame-record machinery preserves those registers. A value whose last use has
-ended is eligible for reuse, while touching intervals remain distinct.
+operations use a CFG-aware interference-coloring allocator. D16..D30 and
+X8..X18 are preferred because they are caller-saved; D8..D15 and X19..X27 are
+selected only when simultaneous live values require them, and the existing
+aligned frame-record machinery preserves those registers. Straight-line dead
+values and non-interfering values in sibling or nested CFG regions may reuse a
+home.
 
-The allocator also handles structured CFGs conservatively: values crossing a
-block edge and every value participating in a phi edge copy receive stable,
-unique homes, while values defined and consumed entirely within one block may
-reuse homes after their local live interval ends. This keeps the existing
-sequential phi-copy emitter correct, including move-cycle cases, without
-claiming path-sensitive sibling-block coalescing. Genuine pressure, calls,
+Phi definitions are modeled as block-entry values even when the IR stores them
+among ordinary instructions. Phi operands are edge uses, and each incoming
+edge adds interference between its phi destinations and values that remain
+live on that edge. The emitter lowers each edge's register assignments as a
+parallel move, using reserved D31 or X28 as a cycle breaker; conditional
+branches are emitted before either edge's copies, so copies cannot invalidate
+the comparison flags. Integer and boolean values share the AAPCS64 GPR class
+for both allocation and parameter-bank ordinals. Genuine pressure, calls,
 stack-backed parameters, and unsupported CFG shapes continue through the
-established spill/ABI fallbacks. Arbitrary external-call ABI support and fully
-edge-aware/general live-range allocation remain open boundaries.
+established spill/ABI fallbacks. Arbitrary mixed-signature external-call ABI
+support remains an open boundary.
 
 ---
 
@@ -1322,9 +1325,9 @@ X0..X7 and supported bool-returning bodies whose comparison operands overflow a
 register bank. Native AArch64 scalar `floor`, `ceil`, `round`, and `trunc`
 also use the corresponding FRINT instruction in both register and supported
 stack-spill bodies. Control-flow phi spilling beyond the supported typed spill
-shapes, edge-aware/general live-range allocation across structured CFGs, and
-broader external calls remain
-outside this typed trampoline boundary.
+shapes and broader external calls remain outside this typed trampoline
+boundary; supported no-call structured CFGs use the scalar backend's
+CFG-aware register allocator before selecting a spill fallback.
 Unsupported shapes fall back to the interpreter rather than being called
 through an unverifiable function pointer type.
 

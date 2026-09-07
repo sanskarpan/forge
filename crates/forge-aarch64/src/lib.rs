@@ -3,7 +3,7 @@
 //! serializes them in architectural little-endian order.
 
 use forge_ir::{uses_of, CmpOp, Function, Inst, Terminator, Ty, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 unsafe extern "C" {
     fn sin(x: f64) -> f64;
@@ -731,7 +731,7 @@ pub fn is_native_target() -> bool {
 fn aarch64_param_bank_ordinal(params: &[(String, Ty)], index: usize, ty: Ty) -> usize {
     params[..index]
         .iter()
-        .filter(|(_, candidate)| *candidate == ty)
+        .filter(|(_, candidate)| same_register_class(*candidate, ty))
         .count()
 }
 
@@ -781,14 +781,18 @@ struct LinearAllocation {
     saved_integer: Vec<Gpr>,
 }
 
-/// Allocates the supported scalar IR with inclusive live intervals. The
-/// emitter has historically used monotonically increasing temporary numbers,
-/// which is correct but needlessly reaches the spill fallback for long
-/// dependency chains whose values are dead. This pass reuses a register only
-/// after its previous interval has ended strictly before the next interval's
-/// start. Parameter registers stay in their AAPCS64 banks; temporary pools
-/// keep caller-saved registers first and report the callee-saved registers that
-/// need the existing frame preservation path.
+fn same_register_class(left: Ty, right: Ty) -> bool {
+    matches!(
+        (left, right),
+        (Ty::F64, Ty::F64) | (Ty::I64, Ty::I64 | Ty::Bool) | (Ty::Bool, Ty::I64 | Ty::Bool)
+    )
+}
+
+/// Allocates supported scalar IR with CFG liveness and interference coloring.
+/// Phi definitions are treated as block-entry values, and phi operands are
+/// modeled as edge uses. Parameter registers stay in their AAPCS64 banks;
+/// temporary pools keep caller-saved registers first and report any
+/// callee-saved registers that need the existing frame preservation path.
 ///
 /// This is intentionally a no-spill allocator. Returning `None` leaves the
 /// established stack-spill emitters responsible for genuine register
@@ -821,7 +825,7 @@ fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation
     for (&value, &(index, ty)) in &param_values {
         let ordinal = function.params[..index as usize]
             .iter()
-            .filter(|(_, candidate)| *candidate == ty)
+            .filter(|(_, candidate)| same_register_class(*candidate, ty))
             .count();
         if ordinal >= 8 {
             return Err(format!(
@@ -837,34 +841,20 @@ fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation
         );
     }
 
-    // Values used by another block need one stable home for every possible
-    // path. Phi edge copies additionally need a distinct home for every source
-    // and destination: otherwise two copies can form a parallel-move cycle
-    // (a -> b, b -> a), while the emitter's simple sequential moves would lose
-    // one of the source values. Phi operands are consumed on the predecessor
-    // edge, so those uses are attributed to their predecessor rather than the
-    // laid-out phi block.
-    let mut stable_values = Vec::<Value>::new();
-    let mut phi_values = Vec::<Value>::new();
-    let mut add_stable = |value: Value| {
-        if !param_values.contains_key(&value) && !stable_values.contains(&value) {
-            stable_values.push(value);
-        }
-    };
+    // Validate every use and collect phi definitions. Phi operands are edge
+    // uses, not uses at the merge block; the interference pass below models
+    // those copies explicitly.
     for (block_index, block) in function.blocks.iter().enumerate() {
-        let mut record_use = |used: Value, use_block: usize| -> Result<(), String> {
-            let Some(&definition) = definition_block.get(&used) else {
+        let record_use = |used: Value, use_block: usize| -> Result<(), String> {
+            if !definition_block.contains_key(&used) {
                 return Err(format!("use references missing definition {used:?}"));
-            };
-            if definition != use_block {
-                add_stable(used);
             }
+            let _ = use_block;
             Ok(())
         };
         for &value in &block.insts {
             let inst = &function.insts[value.0 as usize];
             if let Inst::Phi { incoming } = inst {
-                phi_values.push(value);
                 for &(predecessor, incoming_value) in incoming {
                     let predecessor = predecessor.0 as usize;
                     if predecessor >= function.blocks.len() {
@@ -872,7 +862,6 @@ fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation
                             "phi {value:?} references missing block {predecessor}"
                         ));
                     }
-                    phi_values.push(incoming_value);
                     record_use(incoming_value, predecessor)?;
                 }
             } else {
@@ -888,125 +877,224 @@ fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation
             Some(Terminator::Jump(_)) | None => {}
         }
     }
-    for value in phi_values {
-        add_stable(value);
-    }
 
-    let float_pool = (16..=31).chain(8..=15).map(Gpr::new_d).collect::<Vec<_>>();
-    let integer_pool = (8..=18).chain(19..=28).map(Gpr::new).collect::<Vec<_>>();
+    // D31 and X28 are reserved for cycle-breaking phi copies. They are saved
+    // in the ordinary framed path when needed, but never handed to an SSA
+    // value by this no-spill allocator.
+    let float_pool = (16..=30).chain(8..=15).map(Gpr::new_d).collect::<Vec<_>>();
+    let integer_pool = (8..=18).chain(19..=27).map(Gpr::new).collect::<Vec<_>>();
     let mut saved_float = Vec::new();
     let mut saved_integer = Vec::new();
-    let mut reserved_float = Vec::<Gpr>::new();
-    let mut reserved_integer = Vec::<Gpr>::new();
-
-    // Allocate edge-crossing and phi-edge values first and never recycle these
-    // homes. This is conservative for sibling branches, but it makes the
-    // result valid for structured CFGs without requiring parallel edge moves.
-    stable_values.sort_by_key(|value| value.0);
-    for value in stable_values {
-        let ty = *function
-            .types
-            .get(value.0 as usize)
-            .ok_or_else(|| format!("value {value:?} has no AArch64 IR type"))?;
-        let (pool, reserved) = match ty {
-            Ty::F64 => (&float_pool, &mut reserved_float),
-            Ty::I64 | Ty::Bool => (&integer_pool, &mut reserved_integer),
-        };
-        let Some(register) = pool
-            .iter()
-            .copied()
-            .find(|register| !reserved.contains(register))
-        else {
-            return Ok(None);
-        };
-        registers.insert(value, register);
-        reserved.push(register);
-        if ty == Ty::F64 && register.index() < 16 {
-            saved_float.push(register);
-        } else if matches!(ty, Ty::I64 | Ty::Bool) && register.index() >= 19 {
-            saved_integer.push(register);
+    let block_count = function.blocks.len();
+    let mut block_defs = vec![HashSet::<Value>::new(); block_count];
+    let mut block_uses = vec![HashSet::<Value>::new(); block_count];
+    let mut successors = vec![Vec::<usize>::new(); block_count];
+    let mut edge_phi_uses = vec![vec![HashSet::<Value>::new(); block_count]; block_count];
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        let mut seen_defs = HashSet::new();
+        for &value in &block.insts {
+            block_defs[block_index].insert(value);
+            seen_defs.insert(value);
+            let inst = &function.insts[value.0 as usize];
+            if let Inst::Phi { incoming } = inst {
+                for &(predecessor, incoming_value) in incoming {
+                    edge_phi_uses[predecessor.0 as usize][block_index].insert(incoming_value);
+                }
+            } else {
+                for used in uses_of(inst) {
+                    if !seen_defs.contains(&used) {
+                        block_uses[block_index].insert(used);
+                    }
+                }
+            }
+        }
+        match block.term.as_ref() {
+            Some(Terminator::Return(value)) => {
+                if !seen_defs.contains(value) {
+                    block_uses[block_index].insert(*value);
+                }
+            }
+            Some(Terminator::Jump(target)) => {
+                let target = target.0 as usize;
+                if target >= block_count {
+                    return Err(format!(
+                        "block {block_index} jumps to missing block {target}"
+                    ));
+                }
+                successors[block_index].push(target);
+            }
+            Some(Terminator::Branch { cond, then_, else_ }) => {
+                if !seen_defs.contains(cond) {
+                    block_uses[block_index].insert(*cond);
+                }
+                for target in [then_.0 as usize, else_.0 as usize] {
+                    if target >= block_count {
+                        return Err(format!(
+                            "block {block_index} branches to missing block {target}"
+                        ));
+                    }
+                    successors[block_index].push(target);
+                }
+            }
+            None => {}
         }
     }
-
-    // Reuse only intervals whose complete lifetime is inside one block. A
-    // local value can safely share a home with a value in another block because
-    // the former has no edge use; the branch/jump has already consumed it.
+    let mut live_in = vec![HashSet::<Value>::new(); block_count];
+    let mut live_out = vec![HashSet::<Value>::new(); block_count];
+    loop {
+        let mut changed = false;
+        for block_index in (0..block_count).rev() {
+            let mut out = HashSet::new();
+            for &successor in &successors[block_index] {
+                out.extend(live_in[successor].iter().copied());
+                out.extend(edge_phi_uses[block_index][successor].iter().copied());
+            }
+            let mut input = block_uses[block_index].clone();
+            input.extend(
+                out.iter()
+                    .copied()
+                    .filter(|value| !block_defs[block_index].contains(value)),
+            );
+            changed |= live_in[block_index] != input || live_out[block_index] != out;
+            live_in[block_index] = input;
+            live_out[block_index] = out;
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut interference = vec![HashSet::<Value>::new(); function.insts.len()];
+    let mut add_interference = |left: Value, right: Value| {
+        if left != right {
+            interference[left.0 as usize].insert(right);
+            interference[right.0 as usize].insert(left);
+        }
+    };
     for (block_index, block) in function.blocks.iter().enumerate() {
-        let mut positions = HashMap::<Value, (u32, u32)>::new();
-        let mut position = 0u32;
-        for &value in &block.insts {
-            if !param_values.contains_key(&value) && !registers.contains_key(&value) {
-                positions.insert(value, (position, position));
+        let mut live = live_out[block_index].clone();
+        for &successor in &successors[block_index] {
+            live.extend(edge_phi_uses[block_index][successor].iter().copied());
+        }
+        match block.term.as_ref() {
+            Some(Terminator::Return(value)) => {
+                live.insert(*value);
+            }
+            Some(Terminator::Branch { cond, .. }) => {
+                live.insert(*cond);
+            }
+            Some(Terminator::Jump(_)) | None => {}
+        }
+        for &successor in &successors[block_index] {
+            let mut edge_live = live_in[successor].clone();
+            edge_live.extend(edge_phi_uses[block_index][successor].iter().copied());
+            if let Some(Terminator::Branch { cond, .. }) = block.term.as_ref() {
+                edge_live.insert(*cond);
+            }
+            for &phi in &function.blocks[successor].insts {
+                if !matches!(function.insts[phi.0 as usize], Inst::Phi { .. }) {
+                    continue;
+                }
+                let phi_ty = function.types[phi.0 as usize];
+                for &other in &edge_live {
+                    if function
+                        .types
+                        .get(other.0 as usize)
+                        .is_some_and(|other_ty| same_register_class(phi_ty, *other_ty))
+                    {
+                        add_interference(phi, other);
+                    }
+                }
+            }
+        }
+        for &value in block.insts.iter().rev() {
+            let ty = *function
+                .types
+                .get(value.0 as usize)
+                .ok_or_else(|| format!("value {value:?} has no AArch64 IR type"))?;
+            for &other in &live {
+                if function
+                    .types
+                    .get(other.0 as usize)
+                    .is_some_and(|other_ty| same_register_class(ty, *other_ty))
+                {
+                    add_interference(value, other);
+                }
             }
             let inst = &function.insts[value.0 as usize];
             if !matches!(inst, Inst::Phi { .. }) {
                 for used in uses_of(inst) {
-                    if definition_block.get(&used) == Some(&block_index) {
-                        if let Some((_, end)) = positions.get_mut(&used) {
-                            *end = (*end).max(position);
+                    if function
+                        .types
+                        .get(used.0 as usize)
+                        .is_some_and(|used_ty| same_register_class(ty, *used_ty))
+                    {
+                        add_interference(value, used);
+                    }
+                }
+                live.remove(&value);
+                live.extend(uses_of(inst));
+            }
+        }
+        if let Some(Terminator::Branch { cond, .. }) = block.term.as_ref() {
+            let mut condition_values = vec![*cond];
+            if let Some(Inst::Cmp { lhs, rhs, .. }) = function.insts.get(cond.0 as usize) {
+                condition_values.extend([*lhs, *rhs]);
+            }
+            for &successor in &successors[block_index] {
+                for &phi in &function.blocks[successor].insts {
+                    if matches!(function.insts[phi.0 as usize], Inst::Phi { .. }) {
+                        for &condition_value in &condition_values {
+                            if function
+                                .types
+                                .get(phi.0 as usize)
+                                .zip(function.types.get(condition_value.0 as usize))
+                                .is_some_and(|(phi_ty, condition_ty)| {
+                                    same_register_class(*phi_ty, *condition_ty)
+                                })
+                            {
+                                add_interference(phi, condition_value);
+                            }
                         }
                     }
                 }
             }
-            position += 1;
         }
-        let terminator_position = position;
-        if let Some(Terminator::Return(value) | Terminator::Branch { cond: value, .. }) =
-            block.term.as_ref()
+    }
+    let mut color_values = definition_block
+        .keys()
+        .copied()
+        .filter(|value| !registers.contains_key(value))
+        .collect::<Vec<_>>();
+    color_values.sort_by_key(|value| {
+        (
+            std::cmp::Reverse(interference[value.0 as usize].len()),
+            value.0,
+        )
+    });
+    for value in color_values {
+        let ty = *function
+            .types
+            .get(value.0 as usize)
+            .ok_or_else(|| format!("value {value:?} has no AArch64 IR type"))?;
+        let pool = match ty {
+            Ty::F64 => &float_pool,
+            Ty::I64 | Ty::Bool => &integer_pool,
+        };
+        let Some(register) = pool.iter().copied().find(|register| {
+            !interference[value.0 as usize]
+                .iter()
+                .any(|neighbor| registers.get(neighbor) == Some(register))
+        }) else {
+            return Ok(None);
+        };
+        registers.insert(value, register);
+        if ty == Ty::F64 && register.index() < 16 && !saved_float.contains(&register) {
+            saved_float.push(register);
+        } else if matches!(ty, Ty::I64 | Ty::Bool)
+            && register.index() >= 19
+            && !saved_integer.contains(&register)
         {
-            if let Some((_, end)) = positions.get_mut(value) {
-                *end = (*end).max(terminator_position);
-            }
-        }
-        for target in &function.blocks {
-            for &value in &target.insts {
-                let Inst::Phi { incoming } = &function.insts[value.0 as usize] else {
-                    continue;
-                };
-                for &(predecessor, incoming_value) in incoming {
-                    if predecessor.0 as usize == block_index {
-                        if let Some((_, end)) = positions.get_mut(&incoming_value) {
-                            *end = (*end).max(terminator_position);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut intervals = positions
-            .into_iter()
-            .map(|(value, (start, end))| {
-                let ty = function.types[value.0 as usize];
-                (value, start, end, ty)
-            })
-            .collect::<Vec<_>>();
-        intervals.sort_by_key(|(value, start, end, _)| (*start, *end, value.0));
-        let mut active_float = Vec::<(u32, Gpr)>::new();
-        let mut active_integer = Vec::<(u32, Gpr)>::new();
-        for (value, start, end, ty) in intervals {
-            let (pool, reserved, active) = match ty {
-                Ty::F64 => (&float_pool, &reserved_float, &mut active_float),
-                Ty::I64 | Ty::Bool => (&integer_pool, &reserved_integer, &mut active_integer),
-            };
-            active.retain(|(active_end, _)| *active_end >= start);
-            let Some(register) = pool.iter().copied().find(|register| {
-                !reserved.contains(register)
-                    && !active
-                        .iter()
-                        .any(|(_, active_register)| active_register == register)
-            }) else {
-                return Ok(None);
-            };
-            registers.insert(value, register);
-            active.push((end, register));
-            if ty == Ty::F64 && register.index() < 16 && !saved_float.contains(&register) {
-                saved_float.push(register);
-            } else if matches!(ty, Ty::I64 | Ty::Bool)
-                && register.index() >= 19
-                && !saved_integer.contains(&register)
-            {
-                saved_integer.push(register);
-            }
+            saved_integer.push(register);
         }
     }
 
@@ -1017,10 +1105,9 @@ fn linear_allocate_scalar(function: &Function) -> Result<Option<LinearAllocation
     }))
 }
 
-/// Preserves the original deterministic assignment for structured CFGs. The
-/// spill emitters already handle high-pressure CFGs; this fallback keeps the
-/// existing register-per-definition behavior for small CFGs until edge-aware
-/// interval splitting is implemented.
+/// Preserves the original deterministic assignment when the graph allocator
+/// cannot color the function or when the existing stack-backed ABI paths are
+/// selected.
 fn monotonic_allocate_scalar(function: &Function) -> Result<LinearAllocation, String> {
     let mut registers = HashMap::<Value, Gpr>::new();
     let mut next_float_temporary = 16u8;
@@ -1044,7 +1131,7 @@ fn monotonic_allocate_scalar(function: &Function) -> Result<LinearAllocation, St
                     }
                     let ordinal = function.params[..*index as usize]
                         .iter()
-                        .filter(|(_, candidate)| candidate == ty)
+                        .filter(|(_, candidate)| same_register_class(*candidate, *ty))
                         .count();
                     if ordinal >= 8 {
                         return Err(format!(
@@ -1142,7 +1229,7 @@ fn emit_standard_epilogue(asm: &mut Assembler, local_bytes: u16) {
 /// banks. Temporaries use the corresponding register number in their class;
 /// constants are loaded from an aligned literal pool or materialized with
 /// MOVZ/MOVK. Branch edges materialize typed SSA φ values before transfer.
-/// Temporaries use caller-saved D16..D31 or X8..X18 registers first. If those
+/// Temporaries use caller-saved D16..D30 or X8..X18 registers first. If those
 /// are exhausted, the emitter allocates D8..D15 or X19..X28 and preserves the
 /// selected callee-saved registers in a 16-byte-aligned stack frame with the
 /// conventional AAPCS64 x29/x30 frame record.
@@ -1549,19 +1636,22 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
                 branch_fixups.push((instruction_index, target, None));
             }
             Some(Terminator::Branch { cond, then_, else_ }) => {
-                let condition = condition_for_cmp(function, *cond)?;
                 let then_target = then_.0 as usize;
                 let else_target = else_.0 as usize;
                 validate_target(function, then_target)?;
                 validate_target(function, else_target)?;
-                emit_phi_edge_copies(function, then_target, block_index, &registers, &mut asm)?;
                 let conditional_index = asm.words.len();
+                let condition = emit_branch_compare(function, *cond, &registers, &mut asm)?;
                 asm.b_cond(condition, 0);
                 branch_fixups.push((conditional_index, then_target, Some(condition)));
                 emit_phi_edge_copies(function, else_target, block_index, &registers, &mut asm)?;
                 let else_index = asm.words.len();
                 asm.b(0);
                 branch_fixups.push((else_index, else_target, None));
+                emit_phi_edge_copies(function, then_target, block_index, &registers, &mut asm)?;
+                let then_index = asm.words.len();
+                asm.b(0);
+                branch_fixups.push((then_index, then_target, None));
             }
             None => return Err(format!("AArch64 block {block_index} has no terminator")),
         }
@@ -1612,8 +1702,8 @@ enum MixedLocation {
 /// register save area is needed. This path also handles structured CFGs:
 /// f64 phi values are written on each incoming edge, and direct f64 compare
 /// conditions are re-evaluated immediately before their branch. Mixed-value
-/// spilling, calls/libm, and a general live-range allocator remain separate
-/// work.
+/// spilling and the CFG-aware register allocator are handled by the scalar
+/// and mixed spill paths respectively.
 fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
     if function.blocks.is_empty() {
         return Err("AArch64 emitter requires at least one block".to_string());
@@ -1980,8 +2070,7 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
 /// registers. Structured CFGs are supported by storing typed phi values on
 /// incoming edges and re-evaluating direct comparisons before branches.
 /// Supported scalar f64 libm calls preserve both AAPCS64 parameter banks in
-/// the same frame. Broader external calls and general live-range allocation
-/// remain separate work.
+/// the same frame. Broader external calls remain separate work.
 fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
     let contains_call = function
         .insts
@@ -2832,8 +2921,8 @@ enum I64Location {
 /// Emits the straight-line i64 subset with every non-parameter value in a
 /// stack slot. This deliberately simple spill path provides a correctness
 /// fallback once the compact register-preserving path runs out of registers;
-/// control-flow phi spilling and a general live-range allocator remain
-/// separate work.
+/// control-flow phi spilling remains separate from this dedicated
+/// straight-line entry point.
 fn emit_i64_with_stack_spills(function: &Function, result: Value) -> Result<Vec<u8>, String> {
     let mut locations = HashMap::<Value, I64Location>::new();
     let mut next_slot = 24u16;
@@ -3136,6 +3225,8 @@ fn emit_phi_edge_copies(
     registers: &HashMap<Value, Gpr>,
     asm: &mut Assembler,
 ) -> Result<(), String> {
+    let mut float_copies = Vec::<(Gpr, Gpr)>::new();
+    let mut integer_copies = Vec::<(Gpr, Gpr)>::new();
     for &value in &function.blocks[target].insts {
         let Inst::Phi { incoming } = &function.insts[value.0 as usize] else {
             continue;
@@ -3155,28 +3246,90 @@ fn emit_phi_edge_copies(
             .copied()
             .ok_or_else(|| format!("missing phi source register for {source:?}"))?;
         if destination != source {
-            if phi_type == Ty::F64 {
-                asm.fmov_d(destination, source);
+            let copies = if phi_type == Ty::F64 {
+                &mut float_copies
             } else {
-                asm.orr_reg(destination, XZR, source);
-            }
+                &mut integer_copies
+            };
+            copies.push((source, destination));
         }
     }
+    emit_parallel_phi_copies(asm, &mut float_copies, Ty::F64);
+    emit_parallel_phi_copies(asm, &mut integer_copies, Ty::I64);
     Ok(())
 }
 
-fn condition_for_cmp(function: &Function, value: Value) -> Result<Condition, String> {
-    let Inst::Cmp { op, lhs, .. } = function
+fn emit_parallel_phi_copies(asm: &mut Assembler, copies: &mut Vec<(Gpr, Gpr)>, ty: Ty) {
+    while !copies.is_empty() {
+        let safe = (0..copies.len()).find(|&index| {
+            !copies
+                .iter()
+                .enumerate()
+                .any(|(other, (source, _))| other != index && *source == copies[index].1)
+        });
+        if let Some(index) = safe {
+            let (source, destination) = copies.remove(index);
+            emit_phi_copy(asm, source, destination, ty);
+            continue;
+        }
+
+        let (source, _) = copies[0];
+        let scratch = match ty {
+            Ty::F64 => Gpr::new_d(31),
+            Ty::I64 | Ty::Bool => Gpr::new(28),
+        };
+        assert!(
+            copies
+                .iter()
+                .all(|(src, dst)| *src != scratch && *dst != scratch),
+            "AArch64 phi scratch register is unexpectedly allocated"
+        );
+        emit_phi_copy(asm, source, scratch, ty);
+        for (src, _) in copies.iter_mut() {
+            if *src == source {
+                *src = scratch;
+            }
+        }
+    }
+}
+
+fn emit_phi_copy(asm: &mut Assembler, source: Gpr, destination: Gpr, ty: Ty) {
+    match ty {
+        Ty::F64 => asm.fmov_d(destination, source),
+        Ty::I64 | Ty::Bool => asm.orr_reg(destination, XZR, source),
+    }
+}
+
+fn emit_branch_compare(
+    function: &Function,
+    value: Value,
+    registers: &HashMap<Value, Gpr>,
+    asm: &mut Assembler,
+) -> Result<Condition, String> {
+    let Inst::Cmp { op, lhs, rhs } = function
         .insts
         .get(value.0 as usize)
         .ok_or_else(|| format!("missing branch condition {value:?}"))?
     else {
         return Err("AArch64 branches require a direct scalar comparison".to_string());
     };
-    if function.types.get(lhs.0 as usize) == Some(&Ty::F64) {
-        return Ok(f64_condition_for_cmp(*op));
+    let register_of = |operand: Value| {
+        registers
+            .get(&operand)
+            .copied()
+            .ok_or_else(|| format!("missing AArch64 register for value {operand:?}"))
+    };
+    match function.types.get(lhs.0 as usize) {
+        Some(Ty::F64) => {
+            asm.fcmp_d(register_of(*lhs)?, register_of(*rhs)?);
+            Ok(f64_condition_for_cmp(*op))
+        }
+        Some(Ty::I64) | Some(Ty::Bool) => {
+            asm.cmp_reg(register_of(*lhs)?, register_of(*rhs)?);
+            Ok(integer_condition_for_cmp(*op))
+        }
+        _ => Err("AArch64 comparison has an invalid operand".to_string()),
     }
-    Ok(integer_condition_for_cmp(*op))
 }
 
 #[cfg(test)]
@@ -3443,7 +3596,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_allocator_keeps_phi_edge_homes_stable_in_a_cfg() {
+    fn linear_allocator_reuses_non_interfering_phi_homes_in_a_cfg() {
         let function = forge_runtime::lower_source("if x > 0.0 then x + 1.0 else x - 1.0").unwrap();
         let allocation = linear_allocate_scalar(&function)
             .unwrap()
@@ -3467,7 +3620,7 @@ mod tests {
         let mut unique_phi_registers = phi_registers.clone();
         unique_phi_registers.sort_by_key(|register| register.index());
         unique_phi_registers.dedup();
-        assert_eq!(phi_registers.len(), unique_phi_registers.len());
+        assert!(unique_phi_registers.len() < phi_registers.len());
     }
 
     #[test]
@@ -3605,7 +3758,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_mixed_cfg_integer_phi_stack_spills() {
+    fn emits_mixed_cfg_integer_phi_with_reused_homes() {
         let source = std::iter::repeat_n("x + (if (n & 1) > 0 then 1 else 2)", 14)
             .collect::<Vec<_>>()
             .join(" + ");
@@ -3615,13 +3768,10 @@ mod tests {
             .chunks(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
-        let integer_load = ldr(Gpr::new(28), SP, 0) & 0xffc0_03ff;
-        let integer_store = str_(Gpr::new(28), SP, 0) & 0xffc0_03ff;
+        assert!(words.iter().any(|word| *word & 0x7f00_0000 == 0x5400_0000));
         assert!(words
             .iter()
-            .any(|word| *word & 0xffc0_03ff == integer_store));
-        assert!(words.iter().any(|word| *word & 0xffc0_03ff == integer_load));
-        assert!(words.iter().any(|word| *word & 0x7f00_0000 == 0x5400_0000));
+            .any(|word| *word == and_reg(Gpr::new(8), Gpr::new(0), Gpr::new(9))));
     }
 
     #[test]
@@ -3814,20 +3964,46 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn executes_aarch64_mixed_cfg_integer_phi_stack_spills() {
-        let source = std::iter::repeat_n("x + (if (n & 1) > 0 then 1 else 2)", 14)
-            .collect::<Vec<_>>()
-            .join(" + ");
-        let function = forge_runtime::lower_source(&source).unwrap();
+        for count in 1..=14 {
+            let source = std::iter::repeat_n("x + (if (n & 1) > 0 then 1 else 2)", count)
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let function = forge_runtime::lower_source(&source).unwrap();
+            let bytes = emit_f64(&function).unwrap();
+            let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
+            buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
+            buffer.make_executable().unwrap();
+            // SAFETY: the emitted body follows the AAPCS64 fn(f64, i64) -> f64
+            // convention, and the executable buffer remains alive for both calls.
+            let function: unsafe extern "C" fn(f64, i64) -> f64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            assert_eq!(
+                unsafe { function(2.0, 3) },
+                3.0 * count as f64,
+                "count={count}"
+            );
+            assert_eq!(
+                unsafe { function(2.0, 4) },
+                4.0 * count as f64,
+                "count={count}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn executes_aarch64_downstream_phi_without_clobbering_an_edge_live_value() {
+        let source = "max(((3.0 * y) + if ((-0.0) < 0.0) then (1.0) else (x)), (fma((0.0 / (abs(0.5) + 1.0)), 2.0, max(2.0, x))))";
+        let function = forge_runtime::lower_source(source).unwrap();
         let bytes = emit_f64(&function).unwrap();
         let mut buffer = forge_mem::ExecutableBuffer::new(bytes.len()).unwrap();
         buffer.write(|slot| slot[..bytes.len()].copy_from_slice(&bytes));
         buffer.make_executable().unwrap();
-        // SAFETY: the emitted body follows the AAPCS64 fn(f64, i64) -> f64
-        // convention, and the executable buffer remains alive for both calls.
-        let function: unsafe extern "C" fn(f64, i64) -> f64 =
+        // SAFETY: the emitted body follows the AAPCS64 fn(f64, f64) -> f64
+        // convention, and the executable buffer remains alive for the call.
+        let function: unsafe extern "C" fn(f64, f64) -> f64 =
             unsafe { std::mem::transmute(buffer.as_ptr()) };
-        assert_eq!(unsafe { function(2.0, 3) }, 42.0);
-        assert_eq!(unsafe { function(2.0, 4) }, 56.0);
+        assert!(unsafe { function(f64::MAX, 9.97481149436648e283) }.is_infinite());
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3891,6 +4067,21 @@ mod tests {
         assert!(bytes.windows(4).any(|word| {
             u32::from_le_bytes(word.try_into().unwrap()) & 0x7f00_0000 == 0x5400_0000
         }));
+    }
+
+    #[test]
+    fn parallel_phi_copies_break_a_register_cycle_with_reserved_scratch() {
+        let mut asm = Assembler::new();
+        let mut copies = vec![(Gpr::new(8), Gpr::new(9)), (Gpr::new(9), Gpr::new(8))];
+        emit_parallel_phi_copies(&mut asm, &mut copies, Ty::I64);
+        assert_eq!(
+            asm.words(),
+            &[
+                orr_reg(Gpr::new(28), XZR, Gpr::new(8)),
+                orr_reg(Gpr::new(8), XZR, Gpr::new(9)),
+                orr_reg(Gpr::new(9), XZR, Gpr::new(28)),
+            ]
+        );
     }
 
     #[test]
