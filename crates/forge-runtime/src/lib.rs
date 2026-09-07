@@ -414,7 +414,7 @@ fn execute_native_typed_aarch64(
         {
             forge_aarch64::emit_i64(function)
         }
-        _ => return Ok(None),
+        forge_ir::Ty::I64 | forge_ir::Ty::Bool => forge_aarch64::emit_scalar(function),
     };
     let Ok(bytes) = bytes else {
         return Ok(None);
@@ -455,7 +455,20 @@ fn execute_native_typed_aarch64(
                 unsafe { std::mem::transmute(trampoline_buffer.as_ptr()) };
             Ok(Some(RtValue::I64(unsafe { call(packed.as_ptr()) })))
         }
-        forge_ir::Ty::Bool => Ok(None),
+        forge_ir::Ty::Bool => {
+            // Boolean values are represented as canonical 0/1 words by the
+            // AArch64 scalar emitter. Keep the runtime boundary defensive in
+            // case a future emitter path returns a malformed word.
+            let call: unsafe extern "C" fn(*const u64) -> i64 =
+                unsafe { std::mem::transmute(trampoline_buffer.as_ptr()) };
+            let raw = unsafe { call(packed.as_ptr()) };
+            if !matches!(raw, 0 | 1) {
+                return Err(CompileError::UnsupportedTarget(
+                    "native typed bool result was not canonical",
+                ));
+            }
+            Ok(Some(RtValue::Bool(raw == 1)))
+        }
     }
 }
 
@@ -811,6 +824,47 @@ mod tests {
             .join(" + ");
         let args = (1..=9).map(RtValue::I64).collect::<Vec<_>>();
         assert_eq!(evaluate_typed(&source, &args).unwrap(), RtValue::I64(45));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn typed_runtime_returns_canonical_aapcs64_bool_results() {
+        assert_eq!(
+            evaluate_typed("x > 0.0", &[RtValue::F64(3.0)]).unwrap(),
+            RtValue::Bool(true)
+        );
+        assert_eq!(
+            evaluate_typed("(n & 1) == 1", &[RtValue::I64(3)]).unwrap(),
+            RtValue::Bool(true)
+        );
+
+        let source = (0..9)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>()
+            .join(" + ")
+            + " > 0.0";
+        let args = (0..9).map(|_| RtValue::F64(1.0)).collect::<Vec<_>>();
+        assert_eq!(evaluate_typed(&source, &args).unwrap(), RtValue::Bool(true));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn typed_runtime_executes_aapcs64_rounding_intrinsics_natively() {
+        for (source, expected) in [
+            ("floor(x)", -3.0),
+            ("ceil(x)", -2.0),
+            ("round(x)", -3.0),
+            ("trunc(x)", -2.0),
+        ] {
+            assert_eq!(
+                evaluate_typed(source, &[RtValue::F64(-2.5)]).unwrap(),
+                RtValue::F64(expected)
+            );
+        }
+        assert_eq!(
+            evaluate_typed("floor(x) + (n & 1)", &[RtValue::F64(2.75), RtValue::I64(3)]).unwrap(),
+            RtValue::F64(3.0)
+        );
     }
 
     #[test]
