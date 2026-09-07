@@ -406,6 +406,14 @@ fn execute_native_typed_aarch64(
 
     let bytes = match result_ty {
         forge_ir::Ty::F64 => forge_aarch64::emit_f64(function),
+        forge_ir::Ty::I64
+            if function
+                .params
+                .iter()
+                .all(|(_, ty)| *ty == forge_ir::Ty::I64) =>
+        {
+            forge_aarch64::emit_i64(function)
+        }
         forge_ir::Ty::I64 | forge_ir::Ty::Bool => forge_aarch64::emit_scalar(function),
     };
     let Ok(bytes) = bytes else {
