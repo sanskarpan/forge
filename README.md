@@ -51,8 +51,8 @@ and [docs/PLATFORMS.md](docs/PLATFORMS.md) for the implementation details.
 
 ## Scope notes
 
-The full AArch64 expression backend and packed SIMD loop code generation are
-not claimed as complete yet. The tested wasm-bindgen artifact/benchmark API
+The full AArch64 expression backend and broader vector/array IR remain
+explicit scope boundaries. The tested wasm-bindgen artifact/benchmark API
 and React workbench are available; the browser executes real WASM artifacts
 and receives serialized x86-64/AArch64 inspection artifacts for supported
 expressions. Native bytes are never executed in the browser, and expressions
