@@ -71,7 +71,6 @@ pub fn emit_prologue(asm: &mut Assembler, callee_saved: &[PhysReg], spill_bytes:
                 .expect("Win64 nonvolatile XMM frame is too large");
             asm.movsd_mem_reg(PhysReg::Rbp, offset, *reg);
         }
-        return;
     }
 
     #[cfg(not(windows))]
@@ -120,7 +119,6 @@ pub fn emit_epilogue(asm: &mut Assembler, callee_saved: &[PhysReg], spill_bytes:
         }
         asm.pop_reg(PhysReg::Rbp);
         asm.ret();
-        return;
     }
 
     #[cfg(not(windows))]
