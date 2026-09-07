@@ -45,6 +45,7 @@ export interface CompileArtifact {
   target?: string;
   parameter_types: string[];
   result_type: string;
+  required_imports?: string[];
   wasm_bytes_hex?: string;
   wasm_bytes_len?: number;
   bytes_hex?: string;

@@ -1,8 +1,9 @@
 //! Portable WASM scalar backend and execution facade.
 //!
-//! `compile` emits a real, dependency-free WebAssembly module for the
-//! all-f64 scalar language subset. Host libm calls and integer/bool function
-//! signatures are rejected explicitly until their WASM ABI is specified.
+//! `compile` emits a real WebAssembly module for the scalar language subset.
+//! Most modules are dependency-free; modules using floating-point remainder
+//! declare one typed `forge.fmod` host import because WebAssembly MVP has no
+//! scalar `f64.rem` instruction.
 
 use forge_ir::interp::{interpret, RtValue};
 use forge_syntax::ast::{Ast, BinaryOp, Expr, ExprIdx, UnaryOp};
@@ -36,6 +37,10 @@ pub struct WasmArtifact {
     pub wasm_hex: String,
     pub parameter_types: Vec<String>,
     pub result_type: String,
+    /// Imports required by the artifact, expressed as `module.name` strings.
+    /// The only current import is `forge.fmod`, with signature
+    /// `(f64, f64) -> f64`.
+    pub required_imports: Vec<String>,
 }
 
 impl WasmArtifact {
@@ -69,7 +74,8 @@ fn type_name(ty: Ty) -> String {
 /// Compiles a typed scalar expression to a one-function WASM module exporting
 /// `eval`. Parameters and results use their real WASM value types (`f64`,
 /// `i64`, or `i32` for Forge booleans), and each `let` binding becomes a local.
-/// The resulting bytes can be passed directly to `WebAssembly.instantiate`.
+/// The resulting bytes can be passed to `WebAssembly.instantiate`; expressions
+/// containing f64 `%` require `{ forge: { fmod: (lhs, rhs) => lhs % rhs } }`.
 pub fn compile(source: &str) -> Result<Vec<u8>, String> {
     Ok(compile_artifact(source)?.wasm_bytes)
 }
@@ -97,6 +103,7 @@ pub fn compile_artifact(source: &str) -> Result<WasmArtifact, String> {
     let mut expr = Vec::new();
     emit_expr(&typed, typed.ast.root, &params, &lets, &mut expr)?;
     expr.push(0x0b); // end
+    let requires_fmod = contains_f64_remainder(&typed, typed.ast.root);
 
     let mut body = Vec::new();
     if lets.is_empty() {
@@ -115,14 +122,33 @@ pub fn compile_artifact(source: &str) -> Result<WasmArtifact, String> {
     code_body.extend(body);
 
     let mut module = b"\0asm\x01\0\0\0".to_vec();
-    let mut types = vec![1, 0x60];
-    push_uleb(params.len() as u32, &mut types);
-    types.extend(typed.params.iter().map(|(_, ty)| wasm_valtype(*ty)));
-    types.push(1);
-    types.push(wasm_valtype(typed.types[typed.ast.root.index()]));
+    let eval_type_index = u32::from(requires_fmod);
+    let type_count = 1 + u32::from(requires_fmod);
+    let mut types = Vec::new();
+    push_uleb(type_count, &mut types);
+    if requires_fmod {
+        push_function_type(&[Ty::F64, Ty::F64], Ty::F64, &mut types);
+    }
+    push_function_type(
+        &typed.params.iter().map(|(_, ty)| *ty).collect::<Vec<_>>(),
+        typed.types[typed.ast.root.index()],
+        &mut types,
+    );
     section(1, types, &mut module);
-    section(3, vec![1, 0], &mut module);
-    let export = vec![1, 4, b'e', b'v', b'a', b'l', 0, 0];
+    if requires_fmod {
+        let mut imports = vec![1];
+        push_name("forge", &mut imports);
+        push_name("fmod", &mut imports);
+        imports.push(0); // function import
+        push_uleb(0, &mut imports); // fmod type index
+        section(2, imports, &mut module);
+    }
+    let mut functions = vec![1];
+    push_uleb(eval_type_index, &mut functions);
+    section(3, functions, &mut module);
+    let mut export = vec![1];
+    push_name("eval", &mut export);
+    export.extend([0, u8::from(requires_fmod)]);
     section(7, export, &mut module);
     let mut code = vec![1];
     code.extend(code_body);
@@ -137,7 +163,49 @@ pub fn compile_artifact(source: &str) -> Result<WasmArtifact, String> {
         wasm_hex,
         parameter_types: typed.params.iter().map(|(_, ty)| type_name(*ty)).collect(),
         result_type: type_name(typed.types[typed.ast.root.index()]),
+        required_imports: if requires_fmod {
+            vec!["forge.fmod".to_string()]
+        } else {
+            Vec::new()
+        },
     })
+}
+
+fn push_function_type(params: &[Ty], result: Ty, out: &mut Vec<u8>) {
+    out.push(0x60);
+    push_uleb(params.len() as u32, out);
+    out.extend(params.iter().copied().map(wasm_valtype));
+    out.push(1);
+    out.push(wasm_valtype(result));
+}
+
+fn push_name(name: &str, out: &mut Vec<u8>) {
+    push_uleb(name.len() as u32, out);
+    out.extend(name.as_bytes());
+}
+
+fn contains_f64_remainder(typed: &TypedAst, idx: ExprIdx) -> bool {
+    match typed.ast.get(idx) {
+        Expr::Binary { op, lhs, rhs } => {
+            (*op == BinaryOp::Rem && typed.types[lhs.index()] == Ty::F64)
+                || contains_f64_remainder(typed, *lhs)
+                || contains_f64_remainder(typed, *rhs)
+        }
+        Expr::Unary { operand, .. } => contains_f64_remainder(typed, *operand),
+        Expr::Call { args, .. } => args
+            .iter()
+            .copied()
+            .any(|arg| contains_f64_remainder(typed, arg)),
+        Expr::If { cond, then_, else_ } => {
+            contains_f64_remainder(typed, *cond)
+                || contains_f64_remainder(typed, *then_)
+                || contains_f64_remainder(typed, *else_)
+        }
+        Expr::Let { value, body, .. } => {
+            contains_f64_remainder(typed, *value) || contains_f64_remainder(typed, *body)
+        }
+        Expr::Float(_) | Expr::Int(_) | Expr::Bool(_) | Expr::Ident(_) => false,
+    }
 }
 
 fn collect_lets(
@@ -244,7 +312,9 @@ fn emit_expr(
                     BinaryOp::Le => 0x65,
                     BinaryOp::Ge => 0x66,
                     BinaryOp::Rem => {
-                        return Err("WASM has no scalar f64 remainder opcode".to_string())
+                        out.push(0x10); // call imported forge.fmod
+                        push_uleb(0, out);
+                        return Ok(());
                     }
                     _ => return Err("invalid f64 binary operation".to_string()),
                 },
@@ -422,6 +492,7 @@ mod tests {
         assert_eq!(artifact.parameter_types, ["f64", "f64"]);
         assert_eq!(artifact.result_type, "f64");
         assert_eq!(artifact.parameter_count(), 2);
+        assert!(artifact.required_imports.is_empty());
         assert_eq!(
             artifact.wasm_hex.split_whitespace().count(),
             artifact.wasm_bytes.len()
@@ -433,5 +504,20 @@ mod tests {
     fn unsupported_libm_call_is_reported_before_emission() {
         let error = compile("sin(x)").unwrap_err();
         assert!(error.contains("inline implementation"));
+    }
+
+    #[test]
+    fn f64_remainder_artifact_declares_a_typed_host_import() {
+        let artifact = compile_artifact("x % y").unwrap();
+        assert_eq!(artifact.required_imports, ["forge.fmod"]);
+        assert!(artifact
+            .wasm_bytes
+            .windows(5)
+            .any(|window| window == b"forge"));
+        assert!(artifact
+            .wasm_bytes
+            .windows(4)
+            .any(|window| window == b"fmod"));
+        assert!(artifact.wasm_bytes.contains(&0x10)); // call
     }
 }
