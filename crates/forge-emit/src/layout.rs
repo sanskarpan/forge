@@ -26,8 +26,13 @@ pub fn emit_body(
         .into_iter()
         .map(|iv| (iv.value, (iv.start, iv.end)))
         .collect::<HashMap<_, _>>();
-    let framed = assignment.values().any(|l| matches!(l, Location::Spill(_)))
-        || (cfg!(windows) && func.params.len() > 4);
+    let framed =
+        assignment.values().any(|l| matches!(l, Location::Spill(_)))
+            || (cfg!(windows) && func.params.len() > 4)
+            || (!cfg!(windows)
+                && func.params.iter().enumerate().any(|(index, (_, ty))| {
+                    sysv_param_ordinals(&func.params, index, *ty).1.is_some()
+                }));
     let spill_bytes = assignment
         .values()
         .filter_map(|l| match l {
@@ -417,10 +422,21 @@ fn emit_param(func: &Function, index: u32, dst: PhysReg, asm: &mut Assembler, fr
         }
         return;
     }
-    let ordinal = func.params[..index as usize]
-        .iter()
-        .filter(|(_, prior_ty)| RegClass::of(*prior_ty) == RegClass::of(ty))
-        .count();
+    let (ordinal, stack_ordinal) = sysv_param_ordinals(&func.params, index as usize, ty);
+    if let Some(stack_ordinal) = stack_ordinal {
+        assert!(framed, "SysV stack parameters require a frame pointer");
+        let bytes = 16usize
+            .checked_add(stack_ordinal * 8)
+            .expect("SysV parameter area is too large for an x86 displacement");
+        let offset =
+            i32::try_from(bytes).expect("SysV parameter area is too large for an x86 displacement");
+        if ty == Ty::F64 {
+            asm.movsd_reg_mem(dst, PhysReg::Rbp, offset);
+        } else {
+            asm.mov_reg_mem(dst, PhysReg::Rbp, offset);
+        }
+        return;
+    }
     let src = match RegClass::of(ty) {
         RegClass::Gpr => forge_regalloc::SYSV_INT_ARGS[ordinal],
         RegClass::Xmm => forge_regalloc::SYSV_FLOAT_ARGS[ordinal],
@@ -432,6 +448,32 @@ fn emit_param(func: &Function, index: u32, dst: PhysReg, asm: &mut Assembler, fr
             asm.mov_reg_reg(dst, src);
         }
     }
+}
+
+/// Returns the SysV register-bank ordinal and, when that bank is exhausted,
+/// the ordinal of the parameter's eight-byte incoming stack slot. Stack slots
+/// are assigned in source parameter order, while register ordinals are counted
+/// independently for GPR and XMM classes.
+fn sysv_param_ordinals(params: &[(String, Ty)], index: usize, ty: Ty) -> (usize, Option<usize>) {
+    let mut gpr_seen = 0usize;
+    let mut xmm_seen = 0usize;
+    let mut stack_seen = 0usize;
+    for &(_, prior_ty) in params.iter().take(index) {
+        let (seen, capacity) = match RegClass::of(prior_ty) {
+            RegClass::Gpr => (&mut gpr_seen, forge_regalloc::SYSV_INT_ARGS.len()),
+            RegClass::Xmm => (&mut xmm_seen, forge_regalloc::SYSV_FLOAT_ARGS.len()),
+        };
+        if *seen >= capacity {
+            stack_seen += 1;
+        }
+        *seen += 1;
+    }
+    let (ordinal, capacity) = match RegClass::of(ty) {
+        RegClass::Gpr => (gpr_seen, forge_regalloc::SYSV_INT_ARGS.len()),
+        RegClass::Xmm => (xmm_seen, forge_regalloc::SYSV_FLOAT_ARGS.len()),
+    };
+    let stack_ordinal = (ordinal >= capacity).then_some(stack_seen);
+    (ordinal, stack_ordinal)
 }
 
 fn live_gpr_registers(
