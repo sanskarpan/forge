@@ -1,6 +1,6 @@
 //! Runtime SIMD capability selection shared by native front ends.
 
-use forge_ir::{Function, Inst, Terminator, Ty, Value};
+use forge_ir::{CmpOp, Function, Inst, Terminator, Ty, Value};
 
 /// The typed, lane-wise IR consumed by the packed evaluator. Values reuse the
 /// scalar IR's SSA indices so the vector program can be inspected alongside
@@ -41,6 +41,20 @@ pub enum VectorInst {
         op: ReduceOp,
         vec: Value,
     },
+    Cmp {
+        op: CmpOp,
+        lhs: Value,
+        rhs: Value,
+    },
+    Select {
+        cond: Value,
+        then_: Value,
+        else_: Value,
+    },
+    MaskAnd(Value, Value),
+    MaskOr(Value, Value),
+    MaskXor(Value, Value),
+    MaskNot(Value),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,64 +93,257 @@ pub struct VectorLoop {
     pub store: VectorStore,
 }
 
-/// Lowers the supported straight-line scalar subset into typed vector IR.
-/// Scalar f64 parameters become explicit `VecLoad` operations. Control flow,
-/// calls, integer/boolean values, and vector stores/reductions are rejected
-/// explicitly until their vector semantics exist.
+/// Lowers the supported scalar subset into typed vector IR.
+/// Scalar f64 parameters become explicit `VecLoad` operations. Pure structured
+/// control flow is converted to lane masks and predicated selects; calls,
+/// integer values, and unsupported operations still reject the packed path.
 pub fn lower_f64_vector(function: &Function, lanes: u8) -> Result<VectorFunction, String> {
     if !matches!(lanes, 2 | 4 | 8) {
         return Err(format!("unsupported f64 vector width: {lanes}"));
     }
-    let Some(block) = (function.blocks.len() == 1).then(|| &function.blocks[0]) else {
-        return Err("vector lowering requires one straight-line block".to_string());
-    };
-    let Some(Terminator::Return(result)) = block.term.as_ref() else {
-        return Err("vector lowering requires a return terminator".to_string());
-    };
-
-    let mut insts = Vec::with_capacity(block.insts.len());
-    for &value in &block.insts {
-        let scalar = function
-            .insts
-            .get(value.0 as usize)
-            .ok_or_else(|| format!("block references missing instruction {value:?}"))?;
-        let vector = match scalar {
-            Inst::ConstF64(bits) => VectorInst::SplatF64(*bits),
-            Inst::ConstI64(number) => VectorInst::SplatF64((*number as f64).to_bits()),
-            Inst::Param { ty: Ty::F64, .. } => VectorInst::VecLoad {
-                base: value,
-                offset: 0,
-                lanes,
-            },
-            Inst::Add(lhs, rhs) => VectorInst::Add(*lhs, *rhs),
-            Inst::Sub(lhs, rhs) => VectorInst::Sub(*lhs, *rhs),
-            Inst::Mul(lhs, rhs) => VectorInst::Mul(*lhs, *rhs),
-            Inst::Div(lhs, rhs) => VectorInst::Div(*lhs, *rhs),
-            Inst::Min(lhs, rhs) => VectorInst::Min(*lhs, *rhs),
-            Inst::Max(lhs, rhs) => VectorInst::Max(*lhs, *rhs),
-            Inst::Neg(operand) => VectorInst::Neg(*operand),
-            Inst::Sqrt(operand) => VectorInst::Sqrt(*operand),
-            Inst::Abs(operand) => VectorInst::Abs(*operand),
-            Inst::Fma { a, b, c } => VectorInst::Fma {
-                a: *a,
-                b: *b,
-                c: *c,
-            },
-            Inst::IToF(operand) => VectorInst::Move(*operand),
-            Inst::Param { .. } => return Err("vector lowering requires f64 parameters".to_string()),
-            _ => {
-                return Err(format!(
-                    "scalar instruction is not vectorizable: {scalar:?}"
-                ))
-            }
+    if function.blocks.len() == 1 {
+        let block = &function.blocks[0];
+        let Some(Terminator::Return(result)) = block.term.as_ref() else {
+            return Err("vector lowering requires a return terminator".to_string());
         };
-        insts.push((value, vector));
+        let mut insts = Vec::with_capacity(block.insts.len());
+        for &value in &block.insts {
+            let scalar = function
+                .insts
+                .get(value.0 as usize)
+                .ok_or_else(|| format!("block references missing instruction {value:?}"))?;
+            insts.push((value, lower_vector_inst(function, value, scalar, lanes)?));
+        }
+        return Ok(VectorFunction {
+            lanes,
+            insts,
+            result: *result,
+        });
     }
+
+    lower_structured_vector(function, lanes)
+}
+
+fn lower_vector_inst(
+    function: &Function,
+    value: Value,
+    scalar: &Inst,
+    lanes: u8,
+) -> Result<VectorInst, String> {
+    let result_ty = function
+        .types
+        .get(value.0 as usize)
+        .copied()
+        .ok_or_else(|| format!("missing type for vector value {value:?}"))?;
+    let vector = match scalar {
+        Inst::ConstF64(bits) => VectorInst::SplatF64(*bits),
+        Inst::ConstI64(number) => VectorInst::SplatF64((*number as f64).to_bits()),
+        Inst::ConstBool(value) => {
+            VectorInst::SplatF64((if *value { 1.0f64 } else { 0.0f64 }).to_bits())
+        }
+        Inst::Param { ty: Ty::F64, .. } => VectorInst::VecLoad {
+            base: value,
+            offset: 0,
+            lanes,
+        },
+        Inst::Add(lhs, rhs) => VectorInst::Add(*lhs, *rhs),
+        Inst::Sub(lhs, rhs) => VectorInst::Sub(*lhs, *rhs),
+        Inst::Mul(lhs, rhs) => VectorInst::Mul(*lhs, *rhs),
+        Inst::Div(lhs, rhs) => VectorInst::Div(*lhs, *rhs),
+        Inst::Min(lhs, rhs) => VectorInst::Min(*lhs, *rhs),
+        Inst::Max(lhs, rhs) => VectorInst::Max(*lhs, *rhs),
+        Inst::Neg(operand) => VectorInst::Neg(*operand),
+        Inst::Sqrt(operand) => VectorInst::Sqrt(*operand),
+        Inst::Abs(operand) => VectorInst::Abs(*operand),
+        Inst::Fma { a, b, c } => VectorInst::Fma {
+            a: *a,
+            b: *b,
+            c: *c,
+        },
+        Inst::IToF(operand) => VectorInst::Move(*operand),
+        Inst::Cmp { op, lhs, rhs }
+            if result_ty == Ty::Bool
+                && function.types.get(lhs.0 as usize) == Some(&Ty::F64)
+                && function.types.get(rhs.0 as usize) == Some(&Ty::F64) =>
+        {
+            VectorInst::Cmp {
+                op: *op,
+                lhs: *lhs,
+                rhs: *rhs,
+            }
+        }
+        Inst::And(lhs, rhs) if result_ty == Ty::Bool => VectorInst::MaskAnd(*lhs, *rhs),
+        Inst::Or(lhs, rhs) if result_ty == Ty::Bool => VectorInst::MaskOr(*lhs, *rhs),
+        Inst::Xor(lhs, rhs) if result_ty == Ty::Bool => VectorInst::MaskXor(*lhs, *rhs),
+        Inst::Not(operand) if result_ty == Ty::Bool => VectorInst::MaskNot(*operand),
+        Inst::Param { .. } => return Err("vector lowering requires f64 parameters".to_string()),
+        _ => {
+            return Err(format!(
+                "scalar instruction is not vectorizable: {scalar:?}"
+            ))
+        }
+    };
+    Ok(vector)
+}
+
+fn reachable_blocks(function: &Function) -> Result<Vec<usize>, String> {
+    fn visit(
+        function: &Function,
+        block: usize,
+        marks: &mut [u8],
+        postorder: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        match marks.get(block).copied() {
+            Some(1) => return Err("vector lowering does not support CFG loops".to_string()),
+            Some(2) => return Ok(()),
+            None => return Err(format!("CFG references missing block {block}")),
+            _ => {}
+        }
+        marks[block] = 1;
+        match function.blocks[block].term.as_ref() {
+            Some(Terminator::Branch { then_, else_, .. }) => {
+                visit(function, then_.0 as usize, marks, postorder)?;
+                visit(function, else_.0 as usize, marks, postorder)?;
+            }
+            Some(Terminator::Jump(target)) => {
+                visit(function, target.0 as usize, marks, postorder)?;
+            }
+            Some(Terminator::Return(_)) => {}
+            None => return Err(format!("CFG block {block} has no terminator")),
+        }
+        marks[block] = 2;
+        postorder.push(block);
+        Ok(())
+    }
+
+    let mut marks = vec![0; function.blocks.len()];
+    let mut postorder = Vec::new();
+    visit(
+        function,
+        function.entry.0 as usize,
+        &mut marks,
+        &mut postorder,
+    )?;
+    postorder.reverse();
+    Ok(postorder)
+}
+
+fn lower_structured_vector(function: &Function, lanes: u8) -> Result<VectorFunction, String> {
+    let order = reachable_blocks(function)?;
+    let mut insts = Vec::new();
+    let mut next_aux = function.insts.len() as u32;
+    let mut fresh = |inst: VectorInst, output: &mut Vec<(Value, VectorInst)>| {
+        let value = Value(next_aux);
+        next_aux += 1;
+        output.push((value, inst));
+        value
+    };
+    let true_mask = fresh(VectorInst::SplatF64(1.0f64.to_bits()), &mut insts);
+    let mut paths = vec![None; function.blocks.len()];
+    paths[function.entry.0 as usize] = Some(true_mask);
+    let mut result = None;
+
+    for block_index in order {
+        let path = paths[block_index]
+            .ok_or_else(|| format!("missing vector path mask for block {block_index}"))?;
+        let block = &function.blocks[block_index];
+        for &value in &block.insts {
+            let scalar = function
+                .insts
+                .get(value.0 as usize)
+                .ok_or_else(|| format!("block references missing instruction {value:?}"))?;
+            if let Inst::Phi { incoming } = scalar {
+                let Some(&(first_block, first_value)) = incoming.first() else {
+                    return Err("vector lowering rejects an empty phi".to_string());
+                };
+                paths
+                    .get(first_block.0 as usize)
+                    .and_then(|path| *path)
+                    .ok_or_else(|| "missing vector path for phi predecessor".to_string())?;
+                let mut selected = first_value;
+                for (position, &(incoming_block, incoming_value)) in
+                    incoming.iter().skip(1).enumerate()
+                {
+                    let incoming_path = paths
+                        .get(incoming_block.0 as usize)
+                        .and_then(|path| *path)
+                        .ok_or_else(|| "missing vector path for phi predecessor".to_string())?;
+                    let final_incoming = position + 2 == incoming.len();
+                    let output = if final_incoming {
+                        value
+                    } else {
+                        fresh(
+                            VectorInst::Select {
+                                cond: incoming_path,
+                                then_: incoming_value,
+                                else_: selected,
+                            },
+                            &mut insts,
+                        )
+                    };
+                    if final_incoming {
+                        insts.push((
+                            output,
+                            VectorInst::Select {
+                                cond: incoming_path,
+                                then_: incoming_value,
+                                else_: selected,
+                            },
+                        ));
+                    }
+                    selected = output;
+                }
+                if incoming.len() == 1 {
+                    insts.push((value, VectorInst::Move(first_value)));
+                }
+            } else {
+                insts.push((value, lower_vector_inst(function, value, scalar, lanes)?));
+            }
+        }
+
+        match block.term.as_ref() {
+            Some(Terminator::Return(value)) => result = Some(*value),
+            Some(Terminator::Jump(target)) => {
+                merge_path(&mut paths[target.0 as usize], path, &mut fresh, &mut insts)
+            }
+            Some(Terminator::Branch { cond, then_, else_ }) => {
+                let then_path = fresh(VectorInst::MaskAnd(path, *cond), &mut insts);
+                let not_cond = fresh(VectorInst::MaskNot(*cond), &mut insts);
+                let else_path = fresh(VectorInst::MaskAnd(path, not_cond), &mut insts);
+                merge_path(
+                    &mut paths[then_.0 as usize],
+                    then_path,
+                    &mut fresh,
+                    &mut insts,
+                );
+                merge_path(
+                    &mut paths[else_.0 as usize],
+                    else_path,
+                    &mut fresh,
+                    &mut insts,
+                );
+            }
+            None => return Err(format!("CFG block {block_index} has no terminator")),
+        }
+    }
+
     Ok(VectorFunction {
         lanes,
         insts,
-        result: *result,
+        result: result.ok_or_else(|| "vector lowering found no return".to_string())?,
     })
+}
+
+fn merge_path(
+    slot: &mut Option<Value>,
+    incoming: Value,
+    fresh: &mut impl FnMut(VectorInst, &mut Vec<(Value, VectorInst)>) -> Value,
+    insts: &mut Vec<(Value, VectorInst)>,
+) {
+    *slot = Some(match *slot {
+        Some(existing) => fresh(VectorInst::MaskOr(existing, incoming), insts),
+        None => incoming,
+    });
 }
 
 /// Lowers a scalar all-f64 function into an explicit packed loop. The loop
@@ -304,11 +511,11 @@ fn prepare_array(source: &str, columns: &[&[f64]]) -> Result<(Function, ArrayPla
 
 /// Evaluates a pure expression over one column per free f64 parameter. Full
 /// chunks use the widest safe packed backend for the host when the lowered
-/// function is a straight-line f64 expression. AVX-512 hosts also use a
-/// k-masked packed tail; other widths use the scalar interpreter for a tail.
-/// The scalar interpreter remains the correctness fallback for control flow,
-/// libm calls, and operations whose hardware NaN/rounding behavior does not
-/// exactly match the oracle.
+/// function is a straight-line or pure structured-control-flow f64 expression.
+/// AVX-512 hosts also use a k-masked packed tail; other widths use the scalar
+/// interpreter for a tail. The scalar interpreter remains the correctness
+/// fallback for loops, libm calls, and operations whose hardware
+/// NaN/rounding behavior does not exactly match the oracle.
 pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, String> {
     let (function, plan) = prepare_array(source, columns)?;
     let elements = plan.elements;
@@ -366,8 +573,8 @@ pub fn evaluate_array(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, S
 /// Reduces the per-row results of a pure all-f64 expression in source order.
 /// Packed chunks are used for the expression evaluation when available, then
 /// their lanes are accumulated left-to-right so the reduction order is
-/// deterministic. Control flow, libm calls, and unsupported operations use
-/// the scalar interpreter for the complete reduction.
+/// deterministic. Loops, libm calls, and unsupported operations use the
+/// scalar interpreter for the complete reduction.
 pub fn reduce_sum(source: &str, columns: &[&[f64]]) -> Result<ReductionResult, String> {
     let (function, plan) = prepare_array(source, columns)?;
     if plan.width != SimdWidth::Scalar {
@@ -452,6 +659,8 @@ trait PackedOps {
     unsafe fn max(lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
     unsafe fn sqrt(value: Self::Vector) -> Self::Vector;
     unsafe fn abs(value: Self::Vector) -> Self::Vector;
+    unsafe fn cmp(op: CmpOp, lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector;
+    unsafe fn select(mask: Self::Vector, then_: Self::Vector, else_: Self::Vector) -> Self::Vector;
     unsafe fn fma(lhs: Self::Vector, rhs: Self::Vector, addend: Self::Vector) -> Self::Vector {
         Self::add(Self::mul(lhs, rhs), addend)
     }
@@ -514,7 +723,13 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
     start: usize,
     active: usize,
 ) -> Result<Vec<f64>, ()> {
-    let mut values = vec![None; function.insts.len()];
+    let value_count = vector
+        .insts
+        .iter()
+        .map(|(value, _)| value.0 as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut values = vec![None; value_count.max(function.insts.len())];
     for &(value, inst) in &vector.insts {
         let result = match inst {
             VectorInst::SplatF64(bits) => V::splat(f64::from_bits(bits)),
@@ -588,6 +803,33 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
                     get_packed::<V>(&values, c)?,
                 )
             }
+            VectorInst::Cmp { op, lhs, rhs } => V::cmp(
+                op,
+                get_packed::<V>(&values, lhs)?,
+                get_packed::<V>(&values, rhs)?,
+            ),
+            VectorInst::Select { cond, then_, else_ } => V::select(
+                get_packed::<V>(&values, cond)?,
+                get_packed::<V>(&values, then_)?,
+                get_packed::<V>(&values, else_)?,
+            ),
+            VectorInst::MaskAnd(lhs, rhs) => V::mul(
+                get_packed::<V>(&values, lhs)?,
+                get_packed::<V>(&values, rhs)?,
+            ),
+            VectorInst::MaskOr(lhs, rhs) => {
+                let lhs = get_packed::<V>(&values, lhs)?;
+                let rhs = get_packed::<V>(&values, rhs)?;
+                let both = V::mul(lhs, rhs);
+                V::sub(V::add(lhs, rhs), both)
+            }
+            VectorInst::MaskXor(lhs, rhs) => {
+                let lhs = get_packed::<V>(&values, lhs)?;
+                let rhs = get_packed::<V>(&values, rhs)?;
+                let both = V::mul(lhs, rhs);
+                V::sub(V::sub(V::add(lhs, rhs), both), both)
+            }
+            VectorInst::MaskNot(value) => V::sub(V::splat(1.0), get_packed::<V>(&values, value)?),
             VectorInst::VecStore { .. } | VectorInst::VecReduce { .. } => return Err(()),
         };
         values[value.0 as usize] = Some(result);
@@ -668,7 +910,7 @@ fn function_uses_fma(function: &Function) -> bool {
 
 #[cfg(target_arch = "x86_64")]
 mod x86_packed {
-    use super::PackedOps;
+    use super::{CmpOp, PackedOps};
     use std::arch::asm;
     use std::arch::x86_64::*;
 
@@ -862,6 +1104,38 @@ mod x86_packed {
             output
         }
 
+        unsafe fn cmp(op: CmpOp, lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            std::array::from_fn(|lane| {
+                let result = match op {
+                    CmpOp::Eq => lhs[lane] == rhs[lane],
+                    CmpOp::Ne => lhs[lane] != rhs[lane],
+                    CmpOp::Lt => lhs[lane] < rhs[lane],
+                    CmpOp::Le => lhs[lane] <= rhs[lane],
+                    CmpOp::Gt => lhs[lane] > rhs[lane],
+                    CmpOp::Ge => lhs[lane] >= rhs[lane],
+                };
+                if result {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+        }
+
+        unsafe fn select(
+            mask: Self::Vector,
+            then_: Self::Vector,
+            else_: Self::Vector,
+        ) -> Self::Vector {
+            std::array::from_fn(|lane| {
+                if mask[lane] == 1.0 {
+                    then_[lane]
+                } else {
+                    else_[lane]
+                }
+            })
+        }
+
         unsafe fn fma(lhs: Self::Vector, rhs: Self::Vector, addend: Self::Vector) -> Self::Vector {
             let mut output = [0.0; 8];
             asm!(
@@ -1027,6 +1301,27 @@ mod x86_packed {
                     $and(value, $mask)
                 }
                 #[target_feature(enable = $feature)]
+                unsafe fn cmp(op: CmpOp, lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+                    let comparison = match op {
+                        CmpOp::Eq => $cmp(lhs, rhs, _CMP_EQ_OQ),
+                        CmpOp::Ne => $cmp(lhs, rhs, _CMP_NEQ_UQ),
+                        CmpOp::Lt => $cmp(lhs, rhs, _CMP_LT_OQ),
+                        CmpOp::Le => $cmp(lhs, rhs, _CMP_LE_OQ),
+                        CmpOp::Gt => $cmp(lhs, rhs, _CMP_GT_OQ),
+                        CmpOp::Ge => $cmp(lhs, rhs, _CMP_GE_OQ),
+                    };
+                    $and(comparison, $set1(1.0))
+                }
+                #[target_feature(enable = $feature)]
+                unsafe fn select(
+                    mask: Self::Vector,
+                    then_: Self::Vector,
+                    else_: Self::Vector,
+                ) -> Self::Vector {
+                    let mask = $cmp(mask, $set1(1.0), _CMP_EQ_OQ);
+                    $or($and(mask, then_), $andnot(mask, else_))
+                }
+                #[target_feature(enable = $feature)]
                 unsafe fn fma(
                     lhs: Self::Vector,
                     rhs: Self::Vector,
@@ -1173,6 +1468,27 @@ mod x86_packed {
         unsafe fn abs(value: Self::Vector) -> Self::Vector {
             _mm256_and_pd(value, _mm256_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)))
         }
+        #[target_feature(enable = "avx2")]
+        unsafe fn cmp(op: CmpOp, lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            let comparison = match op {
+                CmpOp::Eq => _mm256_cmp_pd(lhs, rhs, _CMP_EQ_OQ),
+                CmpOp::Ne => _mm256_cmp_pd(lhs, rhs, _CMP_NEQ_UQ),
+                CmpOp::Lt => _mm256_cmp_pd(lhs, rhs, _CMP_LT_OQ),
+                CmpOp::Le => _mm256_cmp_pd(lhs, rhs, _CMP_LE_OQ),
+                CmpOp::Gt => _mm256_cmp_pd(lhs, rhs, _CMP_GT_OQ),
+                CmpOp::Ge => _mm256_cmp_pd(lhs, rhs, _CMP_GE_OQ),
+            };
+            _mm256_and_pd(comparison, _mm256_set1_pd(1.0))
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn select(
+            mask: Self::Vector,
+            then_: Self::Vector,
+            else_: Self::Vector,
+        ) -> Self::Vector {
+            let mask = _mm256_cmp_pd(mask, _mm256_set1_pd(1.0), _CMP_EQ_OQ);
+            _mm256_or_pd(_mm256_and_pd(mask, then_), _mm256_andnot_pd(mask, else_))
+        }
         #[target_feature(enable = "avx2,fma")]
         unsafe fn fma(lhs: Self::Vector, rhs: Self::Vector, addend: Self::Vector) -> Self::Vector {
             _mm256_fmadd_pd(lhs, rhs, addend)
@@ -1182,7 +1498,7 @@ mod x86_packed {
 
 #[cfg(target_arch = "aarch64")]
 mod neon_packed {
-    use super::PackedOps;
+    use super::{CmpOp, PackedOps};
     use std::arch::aarch64::*;
 
     #[inline]
@@ -1267,6 +1583,24 @@ mod neon_packed {
         }
         unsafe fn abs(value: Self::Vector) -> Self::Vector {
             vabsq_f64(value)
+        }
+        unsafe fn cmp(op: CmpOp, lhs: Self::Vector, rhs: Self::Vector) -> Self::Vector {
+            let mask = match op {
+                CmpOp::Eq => vceqq_f64(lhs, rhs),
+                CmpOp::Ne => veorq_u64(vceqq_f64(lhs, rhs), vdupq_n_u64(u64::MAX)),
+                CmpOp::Lt => vcltq_f64(lhs, rhs),
+                CmpOp::Le => vcleq_f64(lhs, rhs),
+                CmpOp::Gt => vcgtq_f64(lhs, rhs),
+                CmpOp::Ge => vcgeq_f64(lhs, rhs),
+            };
+            vreinterpretq_f64_u64(vandq_u64(mask, vreinterpretq_u64_f64(vdupq_n_f64(1.0))))
+        }
+        unsafe fn select(
+            mask: Self::Vector,
+            then_: Self::Vector,
+            else_: Self::Vector,
+        ) -> Self::Vector {
+            vbslq_f64(vceqq_f64(mask, vdupq_n_f64(1.0)), then_, else_)
         }
     }
 }
@@ -1403,11 +1737,57 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_control_flow_keeps_the_scalar_fallback() {
+    fn structured_control_flow_uses_predicated_packed_execution() {
         let input = [0.0, 1.0, 2.0, 3.0];
         let result = evaluate_array("if x < 2.0 then x + 1.0 else x - 1.0", &[&input]).unwrap();
         assert_eq!(result.values, vec![1.0, 2.0, 1.0, 2.0]);
-        assert!(!result.used_packed_backend);
+        assert_eq!(
+            result.used_packed_backend,
+            result.plan.width != SimdWidth::Scalar
+        );
+    }
+
+    #[test]
+    fn nested_control_flow_and_nan_conditions_match_the_scalar_oracle() {
+        let input = [
+            -3.0,
+            -1.0,
+            0.0,
+            2.0,
+            f64::NAN,
+            f64::from_bits(0x8000_0000_0000_0000),
+        ];
+        let result = evaluate_array(
+            "if x < 0.0 then (if x < -2.0 then x * x else x + 1.0) else x - 1.0",
+            &[&input],
+        )
+        .unwrap();
+        let expected = input
+            .iter()
+            .map(|&x| {
+                if x < 0.0 {
+                    if x < -2.0 {
+                        x * x
+                    } else {
+                        x + 1.0
+                    }
+                } else {
+                    x - 1.0
+                }
+            })
+            .collect::<Vec<_>>();
+        for (actual, expected) in result.values.iter().zip(expected) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert_eq!(
+            result.used_packed_backend,
+            result.plan.width != SimdWidth::Scalar
+        );
+
+        let inactive_nan =
+            evaluate_array("if x < 0.0 then sqrt(-1.0) else 2.0", &[&[1.0, -1.0]]).unwrap();
+        assert_eq!(inactive_nan.values[0].to_bits(), 2.0f64.to_bits());
+        assert!(inactive_nan.values[1].is_nan());
     }
 
     #[test]
@@ -1423,11 +1803,14 @@ mod tests {
     }
 
     #[test]
-    fn sum_reduction_uses_scalar_oracle_for_control_flow() {
+    fn sum_reduction_uses_predicated_packed_control_flow() {
         let input = [0.0, 1.0, 2.0, 3.0];
         let result = reduce_sum("if x < 2.0 then x + 1.0 else x - 1.0", &[&input]).unwrap();
         assert_eq!(result.value, 6.0);
-        assert!(!result.used_packed_backend);
+        assert_eq!(
+            result.used_packed_backend,
+            result.plan.width != SimdWidth::Scalar
+        );
     }
 
     #[test]
@@ -1578,12 +1961,19 @@ mod tests {
     }
 
     #[test]
-    fn vector_lowering_rejects_unsupported_widths_and_control_flow() {
+    fn vector_lowering_rejects_unsupported_widths_but_accepts_pure_control_flow() {
         let straight_line = forge_runtime::lower_source("x + 1.0").unwrap();
         assert!(lower_f64_vector(&straight_line, 3).is_err());
 
         let control_flow = forge_runtime::lower_source("if x < 0.0 then x else -x").unwrap();
-        let error = lower_f64_vector(&control_flow, 2).unwrap_err();
-        assert!(error.contains("straight-line"));
+        let vector = lower_f64_vector(&control_flow, 2).unwrap();
+        assert!(vector
+            .insts
+            .iter()
+            .any(|(_, inst)| matches!(inst, VectorInst::Select { .. })));
+        assert!(vector.insts.iter().any(|(_, inst)| matches!(
+            inst,
+            VectorInst::MaskAnd(_, _) | VectorInst::MaskNot(_) | VectorInst::MaskOr(_, _)
+        )));
     }
 }
