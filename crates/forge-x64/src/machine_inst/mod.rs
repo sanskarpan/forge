@@ -380,25 +380,53 @@ impl<'a> Selector<'a> {
             Inst::Param { index, .. } => self.insts.push(MachineInst::Param { dst, index: *index }),
 
             Inst::Add(a, b) => match self.ty_of(*a) {
-                Ty::F64 => self.insts.push(MachineInst::FloatAdd { dst, lhs: *a, rhs: *b }),
+                Ty::F64 => self.insts.push(MachineInst::FloatAdd {
+                    dst,
+                    lhs: *a,
+                    rhs: *b,
+                }),
                 Ty::I64 => match find_fusable_add(self.func, *a, *b) {
-                    Some((base, index, scale)) => {
-                        self.insts.push(MachineInst::Lea { dst, base, index, scale, disp: 0 })
-                    }
-                    None => self.insts.push(MachineInst::IntAdd { dst, lhs: *a, rhs: *b }),
+                    Some((base, index, scale)) => self.insts.push(MachineInst::Lea {
+                        dst,
+                        base,
+                        index,
+                        scale,
+                        disp: 0,
+                    }),
+                    None => self.insts.push(MachineInst::IntAdd {
+                        dst,
+                        lhs: *a,
+                        rhs: *b,
+                    }),
                 },
                 Ty::Bool => unreachable!("Add never applies to Bool"),
             },
             Inst::Sub(a, b) => match self.ty_of(*a) {
-                Ty::F64 => self.insts.push(MachineInst::FloatSub { dst, lhs: *a, rhs: *b }),
-                Ty::I64 => self.insts.push(MachineInst::IntSub { dst, lhs: *a, rhs: *b }),
+                Ty::F64 => self.insts.push(MachineInst::FloatSub {
+                    dst,
+                    lhs: *a,
+                    rhs: *b,
+                }),
+                Ty::I64 => self.insts.push(MachineInst::IntSub {
+                    dst,
+                    lhs: *a,
+                    rhs: *b,
+                }),
                 Ty::Bool => unreachable!("Sub never applies to Bool"),
             },
             Inst::Mul(a, b) => match self.ty_of(*a) {
-                Ty::F64 => self.insts.push(MachineInst::FloatMul { dst, lhs: *a, rhs: *b }),
+                Ty::F64 => self.insts.push(MachineInst::FloatMul {
+                    dst,
+                    lhs: *a,
+                    rhs: *b,
+                }),
                 Ty::I64 => {
                     if !self.fully_fusable_scaled_indices.contains(&dst) {
-                        self.insts.push(MachineInst::IntMul { dst, lhs: *a, rhs: *b });
+                        self.insts.push(MachineInst::IntMul {
+                            dst,
+                            lhs: *a,
+                            rhs: *b,
+                        });
                     }
                     // else: fully subsumed by lea fusion, nothing to emit --
                     // same suppression discipline as Inst::Phi.
@@ -406,12 +434,24 @@ impl<'a> Selector<'a> {
                 Ty::Bool => unreachable!("Mul never applies to Bool"),
             },
             Inst::Div(a, b) => match self.ty_of(*a) {
-                Ty::F64 => self.insts.push(MachineInst::FloatDiv { dst, lhs: *a, rhs: *b }),
-                Ty::I64 => self.insts.push(MachineInst::IntDiv { dst, lhs: *a, rhs: *b }),
+                Ty::F64 => self.insts.push(MachineInst::FloatDiv {
+                    dst,
+                    lhs: *a,
+                    rhs: *b,
+                }),
+                Ty::I64 => self.insts.push(MachineInst::IntDiv {
+                    dst,
+                    lhs: *a,
+                    rhs: *b,
+                }),
                 Ty::Bool => unreachable!("Div never applies to Bool"),
             },
             Inst::Rem(a, b) => match self.ty_of(*a) {
-                Ty::I64 => self.insts.push(MachineInst::IntRem { dst, lhs: *a, rhs: *b }),
+                Ty::I64 => self.insts.push(MachineInst::IntRem {
+                    dst,
+                    lhs: *a,
+                    rhs: *b,
+                }),
                 Ty::F64 => self.insts.push(MachineInst::CallLibm {
                     dst,
                     func: forge_ir::LibFunc::Fmod,
@@ -426,26 +466,62 @@ impl<'a> Selector<'a> {
                     // (negation) -- contrast Abs's mask below, which CLEARS
                     // it via AND instead.
                     let mask_pool = self.pool.intern(i64::MIN as u64);
-                    self.insts.push(MachineInst::FloatNeg { dst, src: *a, mask_pool });
+                    self.insts.push(MachineInst::FloatNeg {
+                        dst,
+                        src: *a,
+                        mask_pool,
+                    });
                 }
                 Ty::I64 => self.insts.push(MachineInst::IntNeg { dst, src: *a }),
                 Ty::Bool => unreachable!("Neg never applies to Bool"),
             },
-            Inst::And(a, b) => self.insts.push(MachineInst::And { dst, lhs: *a, rhs: *b }),
-            Inst::Or(a, b) => self.insts.push(MachineInst::Or { dst, lhs: *a, rhs: *b }),
-            Inst::Xor(a, b) => self.insts.push(MachineInst::Xor { dst, lhs: *a, rhs: *b }),
+            Inst::And(a, b) => self.insts.push(MachineInst::And {
+                dst,
+                lhs: *a,
+                rhs: *b,
+            }),
+            Inst::Or(a, b) => self.insts.push(MachineInst::Or {
+                dst,
+                lhs: *a,
+                rhs: *b,
+            }),
+            Inst::Xor(a, b) => self.insts.push(MachineInst::Xor {
+                dst,
+                lhs: *a,
+                rhs: *b,
+            }),
             Inst::Not(a) => self.insts.push(MachineInst::Not { dst, src: *a }),
             Inst::Shl(a, b) => {
                 if !self.fully_fusable_scaled_indices.contains(&dst) {
-                    self.insts.push(MachineInst::Shl { dst, lhs: *a, rhs: *b });
+                    self.insts.push(MachineInst::Shl {
+                        dst,
+                        lhs: *a,
+                        rhs: *b,
+                    });
                 }
                 // else: fully subsumed by lea fusion, nothing to emit.
             }
-            Inst::Shr(a, b) => self.insts.push(MachineInst::Shr { dst, lhs: *a, rhs: *b }),
-            Inst::Sar(a, b) => self.insts.push(MachineInst::Sar { dst, lhs: *a, rhs: *b }),
+            Inst::Shr(a, b) => self.insts.push(MachineInst::Shr {
+                dst,
+                lhs: *a,
+                rhs: *b,
+            }),
+            Inst::Sar(a, b) => self.insts.push(MachineInst::Sar {
+                dst,
+                lhs: *a,
+                rhs: *b,
+            }),
 
-            Inst::Min(a, b) => self.insts.push(MachineInst::FloatMin { dst, lhs: *a, rhs: *b }),
-            Inst::Max(a, b) => self.insts.push(MachineInst::FloatMax { dst, lhs: *a, rhs: *b }),
+            Inst::Min(a, b) => self.insts.push(MachineInst::FloatMin {
+                dst,
+                lhs: *a,
+                rhs: *b,
+            }),
+            Inst::Max(a, b) => self.insts.push(MachineInst::FloatMax {
+                dst,
+                lhs: *a,
+                rhs: *b,
+            }),
             Inst::Sqrt(a) => self.insts.push(MachineInst::FloatSqrt { dst, src: *a }),
             Inst::Floor(a) => self.insts.push(MachineInst::FloatRound {
                 dst,
@@ -498,7 +574,11 @@ impl<'a> Selector<'a> {
                 // (absolute value) -- contrast Neg's mask above, which
                 // FLIPS it via XOR instead.
                 let mask_pool = self.pool.intern(0x7FFF_FFFF_FFFF_FFFFu64);
-                self.insts.push(MachineInst::FloatAbs { dst, src: *a, mask_pool });
+                self.insts.push(MachineInst::FloatAbs {
+                    dst,
+                    src: *a,
+                    mask_pool,
+                });
             }
             Inst::Fma { a, b, c } => {
                 self.insts.push(MachineInst::FloatFma {
