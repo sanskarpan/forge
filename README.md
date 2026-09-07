@@ -54,7 +54,9 @@ and [docs/PLATFORMS.md](docs/PLATFORMS.md) for the implementation details.
 The full AArch64 expression backend and general array-mode memory/loop IR
 remain explicit scope boundaries; pure acyclic structured conditionals are
 already handled by the packed evaluator with lane masks and predicated
-selects. The tested wasm-bindgen artifact/benchmark API
+selects. Array callers can use `evaluate_array_with_features` or
+`reduce_sum_with_features` to apply a host-safe SIMD feature mask; the scalar
+mask forces the exact interpreter fallback. The tested wasm-bindgen artifact/benchmark API
 and React workbench are available; the browser executes real WASM artifacts
 and receives serialized x86-64/AArch64 inspection artifacts for supported
 expressions. Native bytes are never executed in the browser, and expressions
