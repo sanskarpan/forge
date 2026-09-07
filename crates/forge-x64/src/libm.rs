@@ -7,6 +7,7 @@ extern "C" {
     fn exp(x: f64) -> f64;
     fn log(x: f64) -> f64;
     fn pow(x: f64, y: f64) -> f64;
+    fn fmod(x: f64, y: f64) -> f64;
 }
 
 /// Resolves `func`'s real, process-wide libm symbol to an absolute
@@ -36,6 +37,7 @@ pub fn libm_address(func: LibFunc) -> i64 {
         LibFunc::Exp => exp as Unary as usize as i64,
         LibFunc::Log => log as Unary as usize as i64,
         LibFunc::Pow => pow as Binary as usize as i64,
+        LibFunc::Fmod => fmod as Binary as usize as i64,
     }
 }
 
@@ -68,7 +70,7 @@ mod tests {
     }
 
     #[test]
-    fn all_six_addresses_are_real_and_pairwise_distinct() {
+    fn all_seven_addresses_are_real_and_pairwise_distinct() {
         let addrs = [
             libm_address(LibFunc::Sin),
             libm_address(LibFunc::Cos),
@@ -76,6 +78,7 @@ mod tests {
             libm_address(LibFunc::Exp),
             libm_address(LibFunc::Log),
             libm_address(LibFunc::Pow),
+            libm_address(LibFunc::Fmod),
         ];
         for &a in &addrs {
             assert_ne!(a, 0, "resolved address must not be null");
@@ -141,6 +144,10 @@ mod tests {
             assert_eq!(
                 call_binary(libm_address(LibFunc::Pow), 2.0, 10.0),
                 black_box(2.0f64).powf(black_box(10.0))
+            );
+            assert_eq!(
+                call_binary(libm_address(LibFunc::Fmod), -7.5, 2.0),
+                black_box(-7.5f64) % black_box(2.0)
             );
         }
     }

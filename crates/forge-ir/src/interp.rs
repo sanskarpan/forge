@@ -215,6 +215,7 @@ pub fn interpret(f: &Function, args: &[RtValue]) -> RtValue {
                         LibFunc::Exp => a.exp(),
                         LibFunc::Log => a.ln(),
                         LibFunc::Pow => a.powf(get(&vals, call_args[1]).as_f64()),
+                        LibFunc::Fmod => unreachable!("fmod is lowered from the % operator"),
                     })
                 }
 
@@ -426,6 +427,14 @@ mod tests {
             let result = run(source, &[RtValue::F64(-0.0), RtValue::F64(0.0)]);
             assert_eq!(result, RtValue::F64(expected));
             assert_eq!(result.as_f64().to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn floating_remainder_matches_rust_remainder_semantics() {
+        for (x, y) in [(7.5, 2.0), (-7.5, 2.0), (7.5, -2.0), (-0.0, 2.0)] {
+            let result = run("x % y", &[RtValue::F64(x), RtValue::F64(y)]).as_f64();
+            assert_eq!(result.to_bits(), (x % y).to_bits(), "x={x}, y={y}");
         }
     }
 

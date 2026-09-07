@@ -441,21 +441,17 @@ fn select_lowers_int_rem() {
     );
 }
 
-/// Float remainder (`x % y` on f64) is a real, exercised language
-/// feature (see interp.rs's oracle) but has no native x86 instruction
-/// and no libm route yet (LibFunc has no Fmod variant) -- deferred
-/// with a clear panic, exactly like Call. This is NOT the same kind
-/// of "acceptable interim approximation" as Fma's Mul+Add decomposition:
-/// a naive `x - trunc(x/y)*y` software sequence can diverge
-/// arbitrarily (catastrophic cancellation) from Rust's `%` for large
-/// x/y ratios, which would be a real, unbounded correctness bug, not
-/// a bounded/documented precision difference -- so it's deferred
-/// entirely rather than approximated.
 #[test]
-#[should_panic(expected = "float remainder")]
-fn select_panics_on_float_rem_with_a_clear_deferral_message() {
-    let (selected, ..) = select_f64_binop(Inst::Rem);
-    let _ = selected; // unreachable if select_f64_binop itself panics, which it must
+fn select_lowers_float_rem_to_fmod() {
+    let (selected, x, y, r) = select_f64_binop(Inst::Rem);
+    assert_eq!(
+        selected.insts[2],
+        MachineInst::CallLibm {
+            dst: r,
+            func: forge_ir::LibFunc::Fmod,
+            args: smallvec::smallvec![x, y],
+        }
+    );
 }
 
 #[test]
