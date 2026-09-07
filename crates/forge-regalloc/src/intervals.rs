@@ -376,8 +376,11 @@ fn populate_two_address_hints(
     }
 }
 
-/// Validates `func.params` fits within SysV's ABI argument-register counts.
-/// Does NOT populate `Interval::fixed` for Param/IntDiv/IntRem's dst --
+/// Records no ABI register capacity restriction at allocation time. Parameters
+/// beyond the SysV register banks are loaded from the incoming stack by the
+/// layout emitter. This helper remains as the named boundary for the ABI
+/// policy, and deliberately does NOT populate `Interval::fixed` for
+/// Param/IntDiv/IntRem's dst --
 /// see the design doc's corrected "Fixed registers" section: none of
 /// these are genuinely whole-lifetime register requirements (the ABI/
 /// hardware register only matters for a single instant -- the Param's
@@ -393,32 +396,7 @@ fn populate_two_address_hints(
 /// needed) and inserts a copy into the value's real assigned location if
 /// they don't already coincide.
 fn validate_param_abi_capacity(func: &Function) {
-    let mut gpr_seen = 0usize;
-    let mut xmm_seen = 0usize;
-    for &(_, ty) in &func.params {
-        match RegClass::of(ty) {
-            RegClass::Gpr => {
-                assert!(
-                    gpr_seen < crate::interval::SYSV_INT_ARGS.len(),
-                    "function has more than {} integer/bool parameters -- exceeds SysV's \
-                     integer argument register count; this needs to become a real Diagnostic \
-                     before any user-facing CLI surface ships (tracked in the Phase 8a design doc)",
-                    crate::interval::SYSV_INT_ARGS.len()
-                );
-                gpr_seen += 1;
-            }
-            RegClass::Xmm => {
-                assert!(
-                    xmm_seen < crate::interval::SYSV_FLOAT_ARGS.len(),
-                    "function has more than {} float parameters -- exceeds SysV's float \
-                     argument register count; this needs to become a real Diagnostic before \
-                     any user-facing CLI surface ships (tracked in the Phase 8a design doc)",
-                    crate::interval::SYSV_FLOAT_ARGS.len()
-                );
-                xmm_seen += 1;
-            }
-        }
-    }
+    let _ = func;
     // IntDiv/IntRem's dst deliberately gets NO fixed marking either -- see
     // this function's own doc comment above.
 }
@@ -1121,8 +1099,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "more than 6 integer/bool parameters")]
-    fn seventh_int_param_panics() {
+    fn seventh_int_param_builds_intervals() {
         let mut b = Builder::new();
         let entry = b.create_block();
         b.seal_block(entry);
@@ -1145,7 +1122,8 @@ mod tests {
         b.f.blocks[entry.0 as usize].term = Some(Terminator::Return(last.unwrap()));
 
         let selected = select(&b.f);
-        let _ = build_intervals(&b.f, &selected); // must panic
+        let intervals = build_intervals(&b.f, &selected);
+        assert_eq!(intervals.len(), 7);
     }
 
     #[test]

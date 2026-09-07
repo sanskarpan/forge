@@ -26,8 +26,13 @@ pub fn emit_body(
         .into_iter()
         .map(|iv| (iv.value, (iv.start, iv.end)))
         .collect::<HashMap<_, _>>();
-    let framed = assignment.values().any(|l| matches!(l, Location::Spill(_)))
-        || (cfg!(windows) && func.params.len() > 4);
+    let framed =
+        assignment.values().any(|l| matches!(l, Location::Spill(_)))
+            || (cfg!(windows) && func.params.len() > 4)
+            || (!cfg!(windows)
+                && func.params.iter().enumerate().any(|(index, (_, ty))| {
+                    sysv_param_ordinals(&func.params, index, *ty).1.is_some()
+                }));
     let spill_bytes = assignment
         .values()
         .filter_map(|l| match l {
@@ -60,6 +65,9 @@ pub fn emit_body(
             .map(|&(_, s)| s)
             .unwrap_or(selected.insts.len());
         asm.bind(block_labels[&block]);
+        if block == func.entry {
+            emit_params(func, selected, assignment, &mut asm, framed);
+        }
 
         for (offset, inst) in selected.insts[start..end].iter().enumerate() {
             let position = start + offset;
@@ -84,9 +92,7 @@ pub fn emit_body(
             }
 
             match inst {
-                MachineInst::Param { dst, index } => {
-                    emit_param(func, *index, loc(*dst), &mut asm, framed);
-                }
+                MachineInst::Param { .. } => {}
                 MachineInst::CallLibm {
                     dst,
                     func: libm,
@@ -160,13 +166,15 @@ pub fn emit_body(
                 other => translate_inst(&mut asm, other, &loc, &pool_labels),
             }
 
-            if let Some(dst) = def_of(inst) {
-                if let Location::Spill(slot) = assignment[&dst] {
-                    let reg = scratch[&dst];
-                    if value_ty(func, selected, dst) == Ty::F64 {
-                        asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(slot), reg);
-                    } else {
-                        asm.mov_mem_reg(PhysReg::Rbp, spill_offset(slot), reg);
+            if !matches!(inst, MachineInst::Param { .. }) {
+                if let Some(dst) = def_of(inst) {
+                    if let Location::Spill(slot) = assignment[&dst] {
+                        let reg = scratch[&dst];
+                        if value_ty(func, selected, dst) == Ty::F64 {
+                            asm.movsd_mem_reg(PhysReg::Rbp, spill_offset(slot), reg);
+                        } else {
+                            asm.mov_mem_reg(PhysReg::Rbp, spill_offset(slot), reg);
+                        }
                     }
                 }
             }
@@ -301,6 +309,110 @@ fn phi_scratch(ty: Ty) -> PhysReg {
     }
 }
 
+/// Materializes all entry parameters as one parallel-copy operation. A
+/// register-backed parameter cannot be copied independently: its destination
+/// may be another parameter's incoming ABI register. Scheduling the complete
+/// set together preserves those incoming values and handles register cycles.
+fn emit_params(
+    func: &Function,
+    selected: &SelectedFunction,
+    assignment: &HashMap<Value, Location>,
+    asm: &mut Assembler,
+    framed: bool,
+) {
+    let mut register_copies = Vec::new();
+    let mut stack_params = Vec::new();
+    for inst in &selected.insts {
+        let MachineInst::Param { dst, index } = inst else {
+            continue;
+        };
+        let index = *index as usize;
+        let ty = func.params[index].1;
+        let destination = assignment[dst];
+        if let Some(source) = param_register(&func.params, index, ty) {
+            if destination != Location::Reg(source) {
+                register_copies.push(PhiCopy {
+                    src: Location::Reg(source),
+                    dst: destination,
+                    ty,
+                });
+            }
+        } else {
+            stack_params.push((index, destination, ty));
+        }
+    }
+
+    emit_parallel_copies(&mut register_copies, asm);
+    for (index, destination, ty) in stack_params {
+        let destination_register = match destination {
+            Location::Reg(reg) => reg,
+            Location::Spill(slot) => {
+                let scratch = phi_scratch(ty);
+                emit_stack_param_load(&func.params, index, ty, scratch, asm, framed);
+                emit_copy(asm, Location::Reg(scratch), Location::Spill(slot), ty);
+                continue;
+            }
+        };
+        emit_stack_param_load(&func.params, index, ty, destination_register, asm, framed);
+    }
+}
+
+fn param_register(params: &[(String, Ty)], index: usize, ty: Ty) -> Option<PhysReg> {
+    if cfg!(windows) {
+        if index >= 4 {
+            return None;
+        }
+        return Some(match RegClass::of(ty) {
+            RegClass::Gpr => [PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8, PhysReg::R9][index],
+            RegClass::Xmm => [PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3][index],
+        });
+    }
+
+    let (ordinal, stack_ordinal) = sysv_param_ordinals(params, index, ty);
+    if stack_ordinal.is_some() {
+        None
+    } else {
+        Some(match RegClass::of(ty) {
+            RegClass::Gpr => forge_regalloc::SYSV_INT_ARGS[ordinal],
+            RegClass::Xmm => forge_regalloc::SYSV_FLOAT_ARGS[ordinal],
+        })
+    }
+}
+
+fn emit_stack_param_load(
+    params: &[(String, Ty)],
+    index: usize,
+    ty: Ty,
+    destination: PhysReg,
+    asm: &mut Assembler,
+    framed: bool,
+) {
+    assert!(framed, "stack parameters require a frame pointer");
+    let offset = if cfg!(windows) {
+        let slot_offset = (index - 4)
+            .checked_mul(8)
+            .expect("Win64 parameter area is too large for an x86 displacement");
+        48i32
+            .checked_add(
+                i32::try_from(slot_offset)
+                    .expect("Win64 parameter area is too large for an x86 displacement"),
+            )
+            .expect("Win64 parameter area is too large for an x86 displacement")
+    } else {
+        let (_, stack_ordinal) = sysv_param_ordinals(params, index, ty);
+        let stack_ordinal = stack_ordinal.expect("stack parameter must have a stack ordinal");
+        let bytes = 16usize
+            .checked_add(stack_ordinal * 8)
+            .expect("SysV parameter area is too large for an x86 displacement");
+        i32::try_from(bytes).expect("SysV parameter area is too large for an x86 displacement")
+    };
+    if ty == Ty::F64 {
+        asm.movsd_reg_mem(destination, PhysReg::Rbp, offset);
+    } else {
+        asm.mov_reg_mem(destination, PhysReg::Rbp, offset);
+    }
+}
+
 fn spill_offset(slot: u32) -> i32 {
     let bytes = slot
         .checked_add(1)
@@ -381,57 +493,30 @@ fn assign_spill_scratch(
     out
 }
 
-fn emit_param(func: &Function, index: u32, dst: PhysReg, asm: &mut Assembler, framed: bool) {
-    let ty = func.params[index as usize].1;
-    if cfg!(windows) {
-        if index >= 4 {
-            assert!(framed, "Win64 stack parameters require a frame pointer");
-            let slot_offset = (index - 4)
-                .checked_mul(8)
-                .expect("Win64 parameter area is too large for an x86 displacement");
-            let offset = 48i32
-                .checked_add(
-                    i32::try_from(slot_offset)
-                        .expect("Win64 parameter area is too large for an x86 displacement"),
-                )
-                .expect("Win64 parameter area is too large for an x86 displacement");
-            if ty == Ty::F64 {
-                asm.movsd_reg_mem(dst, PhysReg::Rbp, offset);
-            } else {
-                asm.mov_reg_mem(dst, PhysReg::Rbp, offset);
-            }
-            return;
-        }
-        let src = match RegClass::of(ty) {
-            RegClass::Gpr => [PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8, PhysReg::R9][index as usize],
-            RegClass::Xmm => {
-                [PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3][index as usize]
-            }
+/// Returns the SysV register-bank ordinal and, when that bank is exhausted,
+/// the ordinal of the parameter's eight-byte incoming stack slot. Stack slots
+/// are assigned in source parameter order, while register ordinals are counted
+/// independently for GPR and XMM classes.
+fn sysv_param_ordinals(params: &[(String, Ty)], index: usize, ty: Ty) -> (usize, Option<usize>) {
+    let mut gpr_seen = 0usize;
+    let mut xmm_seen = 0usize;
+    let mut stack_seen = 0usize;
+    for &(_, prior_ty) in params.iter().take(index) {
+        let (seen, capacity) = match RegClass::of(prior_ty) {
+            RegClass::Gpr => (&mut gpr_seen, forge_regalloc::SYSV_INT_ARGS.len()),
+            RegClass::Xmm => (&mut xmm_seen, forge_regalloc::SYSV_FLOAT_ARGS.len()),
         };
-        if dst != src {
-            if ty == Ty::F64 {
-                asm.movsd_reg_reg(dst, src);
-            } else {
-                asm.mov_reg_reg(dst, src);
-            }
+        if *seen >= capacity {
+            stack_seen += 1;
         }
-        return;
+        *seen += 1;
     }
-    let ordinal = func.params[..index as usize]
-        .iter()
-        .filter(|(_, prior_ty)| RegClass::of(*prior_ty) == RegClass::of(ty))
-        .count();
-    let src = match RegClass::of(ty) {
-        RegClass::Gpr => forge_regalloc::SYSV_INT_ARGS[ordinal],
-        RegClass::Xmm => forge_regalloc::SYSV_FLOAT_ARGS[ordinal],
+    let (ordinal, capacity) = match RegClass::of(ty) {
+        RegClass::Gpr => (gpr_seen, forge_regalloc::SYSV_INT_ARGS.len()),
+        RegClass::Xmm => (xmm_seen, forge_regalloc::SYSV_FLOAT_ARGS.len()),
     };
-    if dst != src {
-        if ty == Ty::F64 {
-            asm.movsd_reg_reg(dst, src);
-        } else {
-            asm.mov_reg_reg(dst, src);
-        }
-    }
+    let stack_ordinal = (ordinal >= capacity).then_some(stack_seen);
+    (ordinal, stack_ordinal)
 }
 
 fn live_gpr_registers(
