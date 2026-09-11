@@ -53,8 +53,13 @@ and [docs/PLATFORMS.md](docs/PLATFORMS.md) for the implementation details.
 
 The documented source-level array form is now available end to end:
 `@vectorize result[i] = a[i] * b[i] + c[i]` parses indexed f64 columns,
-lowers to verified array loop/memory IR, and executes through the packed
-evaluator with scalar epilogues and exact fallback. The full AArch64
+while unindexed f64 names are scalar broadcasts, e.g.
+`@vectorize result[i] = a[i] + scale`. Both forms lower to verified array
+loop/memory IR and execute through the packed evaluator with scalar epilogues
+and exact fallback. Supply broadcast values with
+`forge_simd::evaluate_vectorized_with_broadcasts` (or its feature-masked
+variant) separately from the input columns; packed backends splat them without
+materializing repeated arrays. The full AArch64
 expression backend remains an explicit scope boundary; pure acyclic
 structured conditionals are already handled by the packed evaluator with lane
 masks and predicated selects. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
@@ -63,9 +68,11 @@ AVX2, and AVX-512F implement ties-away-from-zero `round` with exact packed
 sequences, while SSE2-only and unsupported x86 widths use the scalar
 interpreter fallback. Array
 callers can use `evaluate_array_with_features`,
-`evaluate_vectorized_with_features`, or `reduce_sum_with_features` to apply a
-host-safe SIMD feature mask; `evaluate_vectorized` is the convenience entry
-point without an explicit mask. The scalar
+`evaluate_vectorized_with_features`,
+`evaluate_vectorized_with_broadcasts_and_features`, or
+`reduce_sum_with_features` to apply a host-safe SIMD feature mask;
+`evaluate_vectorized` and `evaluate_vectorized_with_broadcasts` are the
+convenience entries without an explicit mask. The scalar
 mask forces the exact interpreter fallback. The tested wasm-bindgen artifact/benchmark API
 and React workbench are available; the browser executes real WASM artifacts
 and receives serialized x86-64/AArch64 inspection artifacts for supported

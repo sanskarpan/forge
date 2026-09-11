@@ -84,11 +84,15 @@ pub fn typecheck_array(program: crate::array::ArrayProgram) -> Result<TypedArray
             "invalid vectorized result type",
         ));
     }
-    if ctx.param_ty.values().any(|ty| *ty != Ty::ArrayF64) {
+    if ctx
+        .param_ty
+        .values()
+        .any(|ty| !matches!(ty, Ty::ArrayF64 | Ty::F64))
+    {
         ctx.diags.push(Diagnostic::error(
-            "vectorized bodies currently accept indexed f64 columns only",
+            "vectorized bodies accept indexed f64 columns and unindexed f64 broadcasts",
             ast.span(ast.root),
-            "expected every parameter to be an array column",
+            "expected every parameter to be an f64 column or broadcast",
         ));
     }
     let diags = std::mem::take(&mut ctx.diags);
@@ -440,6 +444,34 @@ mod tests {
         let err = typed("sqrt(1.0, 2.0)").unwrap_err();
         assert_eq!(err.len(), 1);
         assert!(err[0].message.contains("takes"));
+    }
+
+    #[test]
+    fn vectorized_body_accepts_an_unindexed_f64_broadcast() {
+        let (tokens, lex_diags) = lex("@vectorize result[i] = a[i] + scale");
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (program, parse_diags) = crate::array::parse(&tokens);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let typed = typecheck_array(program.expect("vector program")).unwrap();
+        assert_eq!(
+            typed.params,
+            vec![
+                ("a".to_string(), Ty::ArrayF64),
+                ("scale".to_string(), Ty::F64)
+            ]
+        );
+    }
+
+    #[test]
+    fn vectorized_body_rejects_an_integer_broadcast() {
+        let (tokens, lex_diags) = lex("@vectorize result[i] = a[i] + (n & 1)");
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (program, parse_diags) = crate::array::parse(&tokens);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let err = typecheck_array(program.expect("vector program")).unwrap_err();
+        assert!(err
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unindexed f64 broadcasts")));
     }
 
     #[test]

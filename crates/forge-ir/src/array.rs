@@ -13,6 +13,15 @@ use forge_syntax::typeck::{Ty as AstTy, TypedArray, TypedAst};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ArrayValue(pub u32);
 
+/// Describes how a source-level array parameter is supplied to each row of
+/// the vectorized loop. Columns are loaded at the induction index; scalar
+/// broadcasts are splatted by the packed evaluator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrayParamKind {
+    Column,
+    ScalarBroadcast,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ArrayInst {
     Induction {
@@ -59,6 +68,7 @@ pub struct ArrayBlock {
 pub struct ArrayFunction {
     pub element: Function,
     pub params: Vec<(String, Ty)>,
+    pub param_kinds: Vec<ArrayParamKind>,
     pub output: String,
     pub index: String,
     pub blocks: Vec<ArrayBlock>,
@@ -73,6 +83,11 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
     crate::verify::verify(&function.element)?;
     if function.blocks.len() != 3 || function.entry != Block(0) {
         return Err("array loop must contain entry, body, and exit blocks".to_string());
+    }
+    if function.params.len() != function.element.params.len()
+        || function.param_kinds.len() != function.params.len()
+    {
+        return Err("array parameter metadata does not match the element function".to_string());
     }
     let induction = match function.blocks[0].insts.as_slice() {
         [ArrayInst::Induction {
@@ -101,6 +116,11 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
     }
     let mut loads = 0usize;
     let mut stores = 0usize;
+    let column_count = function
+        .param_kinds
+        .iter()
+        .filter(|kind| **kind == ArrayParamKind::Column)
+        .count();
     for inst in &function.blocks[1].insts {
         match inst {
             ArrayInst::Load {
@@ -108,11 +128,21 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
                 column,
                 index,
             } => {
+                let Some(element_param) = function
+                    .param_kinds
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, kind)| **kind == ArrayParamKind::Column)
+                    .nth(*column as usize)
+                    .map(|(param, _)| param as u32)
+                else {
+                    return Err("array load references an unknown column".to_string());
+                };
                 if *index != induction
-                    || *column as usize >= function.params.len()
                     || !matches!(
                         function.element.insts.get(result.0 as usize),
-                        Some(crate::Inst::Param { .. })
+                        Some(crate::Inst::Param { index, ty: Ty::F64 })
+                            if *index == element_param
                     )
                 {
                     return Err("array load does not match an element parameter".to_string());
@@ -137,7 +167,7 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
             }
         }
     }
-    if loads != function.params.len() || stores != 1 {
+    if loads != column_count || stores != 1 {
         return Err("array body must load every column and store exactly once".to_string());
     }
     Ok(())
@@ -146,7 +176,9 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
 /// Lowers a type-checked vectorized body into the memory/loop envelope and a
 /// scalar element function. The current language contract intentionally
 /// accepts the canonical `column[index]` addressing form; arbitrary offsets
-/// can be added later without weakening this representation.
+/// can be added later without weakening this representation. Unindexed f64
+/// parameters remain scalar broadcasts in the element function and are not
+/// represented by memory loads.
 pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
     let mut ast = typed.ast.clone();
     let root = ast.root;
@@ -174,13 +206,15 @@ pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
         .params
         .iter()
         .enumerate()
-        .map(|(column, _)| {
+        .filter(|(_, (_, ty))| *ty == AstTy::ArrayF64)
+        .enumerate()
+        .map(|(column, (param, _))| {
             let result = element
                 .insts
                 .iter()
                 .enumerate()
                 .find_map(|(value, inst)| match inst {
-                    crate::Inst::Param { index, .. } if *index == column as u32 => {
+                    crate::Inst::Param { index, .. } if *index == param as u32 => {
                         Some(Value(value as u32))
                     }
                     _ => None,
@@ -215,6 +249,15 @@ pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
             .params
             .iter()
             .map(|(name, _)| (name.clone(), Ty::F64))
+            .collect(),
+        param_kinds: typed
+            .params
+            .iter()
+            .map(|(_, ty)| match ty {
+                AstTy::ArrayF64 => ArrayParamKind::Column,
+                AstTy::F64 => ArrayParamKind::ScalarBroadcast,
+                other => panic!("unexpected array parameter type {other:?}"),
+            })
             .collect(),
         output: typed.output.clone(),
         index: typed.index.clone(),
@@ -325,5 +368,28 @@ mod tests {
             Some(ArrayInst::Store { output, .. }) if output == "result"
         ));
         assert_eq!(function.element.params.len(), 3);
+    }
+
+    #[test]
+    fn lowers_scalar_broadcast_without_an_array_load() {
+        let (tokens, lex_diags) = lex("@vectorize result[i] = a[i] + scale");
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (program, parse_diags) = parse(&tokens);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let typed = typecheck_array(program.expect("vector program")).unwrap();
+        let function = lower_array(&typed).unwrap();
+
+        assert_eq!(
+            function.param_kinds,
+            vec![ArrayParamKind::Column, ArrayParamKind::ScalarBroadcast]
+        );
+        assert_eq!(
+            function.blocks[1]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst, ArrayInst::Load { .. }))
+                .count(),
+            1
+        );
     }
 }
