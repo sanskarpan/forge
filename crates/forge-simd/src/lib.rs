@@ -963,8 +963,16 @@ fn try_evaluate_packed_loop(
     }
     #[cfg(target_arch = "x86_64")]
     if plan.width == SimdWidth::F64x2 && features.sse2 && std::is_x86_feature_detected!("sse2") {
+        if features.sse41 && std::is_x86_feature_detected!("sse4.1") {
+            // SAFETY: SSE4.1 is guaranteed by the runtime check and lane
+            // ranges were checked inside evaluate_packed.
+            return unsafe { evaluate_packed_loop::<x86_packed::Sse41>(function, columns, plan) }
+                .ok();
+        }
         // SAFETY: SSE2 is guaranteed by the runtime check and lane ranges
-        // were checked inside evaluate_packed.
+        // were checked inside evaluate_packed. SSE2 remains the scalar
+        // fallback for operations, such as ties-away-from-zero round, that
+        // do not have the required packed primitive.
         return unsafe { evaluate_packed_loop::<x86_packed::Sse2>(function, columns, plan) }.ok();
     }
     #[cfg(target_arch = "aarch64")]
@@ -1013,6 +1021,7 @@ mod x86_packed {
     use std::arch::x86_64::*;
 
     pub struct Sse2;
+    pub struct Sse41;
     pub struct Avx2;
 
     /// AVX-512 implementation using stable inline assembly rather than the
@@ -1400,6 +1409,42 @@ mod x86_packed {
         ))
     }
 
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn sse41_floor(value: __m128d) -> Result<__m128d, ()> {
+        Ok(_mm_round_pd(
+            value,
+            _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC,
+        ))
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn sse41_ceil(value: __m128d) -> Result<__m128d, ()> {
+        Ok(_mm_round_pd(
+            value,
+            _MM_FROUND_TO_POS_INF | _MM_FROUND_NO_EXC,
+        ))
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn sse41_trunc(value: __m128d) -> Result<__m128d, ()> {
+        Ok(_mm_round_pd(value, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC))
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn sse41_round(value: __m128d) -> Result<__m128d, ()> {
+        let abs_mask = _mm_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff));
+        let sign_mask = _mm_set1_pd(f64::from_bits(0x8000_0000_0000_0000));
+        let nan = _mm_cmp_pd(value, value, _CMP_UNORD_Q);
+        let magnitude = _mm_and_pd(value, abs_mask);
+        let shifted = _mm_add_pd(magnitude, _mm_set1_pd(0.5));
+        let rounded = _mm_round_pd(shifted, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+        let signed = _mm_or_pd(_mm_and_pd(value, sign_mask), rounded);
+        Ok(_mm_or_pd(
+            _mm_and_pd(nan, value),
+            _mm_andnot_pd(nan, signed),
+        ))
+    }
+
     #[target_feature(enable = "avx2")]
     unsafe fn avx2_round(value: __m256d) -> Result<__m256d, ()> {
         let abs_mask = _mm256_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff));
@@ -1579,6 +1624,37 @@ mod x86_packed {
         unavailable_128,
         unavailable_128,
         unavailable_128
+    );
+
+    impl_x86_ops!(
+        Sse41,
+        __m128d,
+        2,
+        _mm_set1_pd,
+        _mm_loadu_pd,
+        _mm_storeu_pd,
+        _mm_add_pd,
+        _mm_sub_pd,
+        _mm_mul_pd,
+        _mm_div_pd,
+        _mm_sqrt_pd,
+        _mm_and_pd,
+        _mm_cmp_pd,
+        _mm_andnot_pd,
+        _mm_or_pd,
+        _mm_setzero_pd,
+        _mm_castpd_si128,
+        _mm_castsi128_pd,
+        _mm_and_si128,
+        _mm_andnot_si128,
+        _mm_or_si128,
+        _mm_set1_epi64x,
+        _mm_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff)),
+        "sse4.1",
+        sse41_floor,
+        sse41_ceil,
+        sse41_round,
+        sse41_trunc
     );
 
     impl_x86_ops!(
@@ -2241,9 +2317,47 @@ mod tests {
                 result.plan.width != SimdWidth::Scalar && result.plan.full_chunks > 0;
             let expected_packed = has_full_chunk
                 && (cfg!(target_arch = "aarch64")
-                    || (cfg!(target_arch = "x86_64") && result.plan.width != SimdWidth::F64x2));
+                    || (cfg!(target_arch = "x86_64")
+                        && (result.plan.width != SimdWidth::F64x2 || CpuFeatures::detect().sse41)));
             assert_eq!(result.used_packed_backend, expected_packed, "{source}");
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sse41_round_preserves_nan_payloads_and_matches_scalar_bits() {
+        let mut features = CpuFeatures::detect();
+        if !features.sse41 {
+            return;
+        }
+        features.avx = false;
+        features.avx2 = false;
+        features.fma = false;
+        features.avx512f = false;
+        features.avx512dq = false;
+        let input = [
+            -2.5,
+            2.5,
+            f64::from_bits(0xfff8_0000_0000_0042),
+            f64::from_bits(0x7ff8_0000_0000_0043),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let result = evaluate_array_with_features("round(x)", &[&input], features).unwrap();
+        let expected = input.map(f64::round);
+        assert_eq!(result.plan.width, SimdWidth::F64x2);
+        assert!(result.used_packed_backend);
+        assert_eq!(
+            result
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
