@@ -75,7 +75,25 @@ impl<'a> Parser<'a> {
 
     fn parse_expr(&mut self, min_bp: u8) -> ExprIdx {
         let mut lhs = self.parse_prefix();
-        while let Some((op, l_bp, r_bp)) = self.infix_binding_power() {
+        loop {
+            if self.peek().kind == TokenKind::LBracket {
+                // Indexing binds tighter than every binary operator. Keeping
+                // it in this loop also makes chained indexing reject cleanly
+                // in type checking rather than changing scalar precedence.
+                if Self::POSTFIX_BP < min_bp {
+                    break;
+                }
+                self.advance();
+                let index = self.parse_expr(0);
+                let end = self.peek().span;
+                self.expect(TokenKind::RBracket);
+                let span = self.spans[lhs.index()].join(end);
+                lhs = self.push(Expr::Index { base: lhs, index }, span);
+                continue;
+            }
+            let Some((op, l_bp, r_bp)) = self.infix_binding_power() else {
+                break;
+            };
             if l_bp < min_bp {
                 break;
             }
@@ -86,6 +104,8 @@ impl<'a> Parser<'a> {
         }
         lhs
     }
+
+    const POSTFIX_BP: u8 = 22;
 
     /// Precedence per SPEC §3, lowest to highest; each level is left-assoc
     /// via `(bp, bp + 1)`.
