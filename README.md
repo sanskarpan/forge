@@ -66,7 +66,10 @@ positive offsets trim trailing rows, and a window too short for the requested
 offsets returns an empty result. The same column may be used at multiple
 constant offsets, including stencil-style expressions such as
 `a[i - 1] + a[i] + a[i + 1]`. Dynamic offsets remain rejected explicitly
-because they require a gather operation. The full AArch64
+because they require a gather operation. Array expressions containing
+`sin`, `cos`, `tan`, `exp`, `log`, or `pow` retain packed execution through a
+lane-preserving libm adapter that applies the interpreter's scalar operation to
+each active lane and repacks the exact results. The full AArch64
 expression backend remains an explicit scope boundary; pure acyclic
 structured conditionals are already handled by the packed evaluator with lane
 masks and predicated selects. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
