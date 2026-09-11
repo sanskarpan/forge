@@ -64,6 +64,10 @@ pub enum Expr {
         callee: String,
         args: Vec<ExprIdx>,
     },
+    Index {
+        base: ExprIdx,
+        index: ExprIdx,
+    },
     If {
         cond: ExprIdx,
         then_: ExprIdx,

@@ -534,6 +534,12 @@ fn ast_json(ast: &forge_syntax::ast::Ast, idx: forge_syntax::ast::ExprIdx) -> St
                 .join(","),
             span_json
         ),
+        Expr::Index { base, index } => format!(
+            r#"{{"kind":"index","base":{},"index":{},{} }}"#,
+            ast_json(ast, *base),
+            ast_json(ast, *index),
+            span_json
+        ),
         Expr::If { cond, then_, else_ } => format!(
             r#"{{"kind":"if","cond":{},"then":{},"else":{},{} }}"#,
             ast_json(ast, *cond),

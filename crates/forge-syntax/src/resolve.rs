@@ -43,6 +43,10 @@ fn rename(ast: &mut Ast, idx: ExprIdx, scope: &mut Vec<(String, String)>, counte
                 rename(ast, a, scope, counter);
             }
         }
+        Expr::Index { base, index } => {
+            rename(ast, base, scope, counter);
+            rename(ast, index, scope, counter);
+        }
         Expr::If { cond, then_, else_ } => {
             rename(ast, cond, scope, counter);
             rename(ast, then_, scope, counter);

@@ -11,6 +11,9 @@ pub enum Ty {
     F64,
     I64,
     Bool,
+    /// A source-level f64 column. It is consumed by `Index` and is lowered
+    /// to one scalar f64 parameter per array element by the array pipeline.
+    ArrayF64,
 }
 
 #[derive(Debug)]
@@ -18,6 +21,15 @@ pub struct TypedAst {
     pub ast: Ast,
     pub types: Vec<Ty>,
     pub params: Vec<(String, Ty)>,
+}
+
+#[derive(Debug)]
+pub struct TypedArray {
+    pub ast: Ast,
+    pub types: Vec<Ty>,
+    pub params: Vec<(String, Ty)>,
+    pub output: String,
+    pub index: String,
 }
 
 pub fn typecheck(ast: Ast) -> Result<TypedAst, Vec<Diagnostic>> {
@@ -28,6 +40,7 @@ pub fn typecheck(ast: Ast) -> Result<TypedAst, Vec<Diagnostic>> {
         local_ty: FxHashMap::default(),
         types: vec![Ty::F64; ast.exprs.len()],
         diags: Vec::new(),
+        allow_arrays: false,
     };
     ctx.infer_expect(ast.root, None);
     ctx.check(ast.root);
@@ -46,6 +59,59 @@ pub fn typecheck(ast: Ast) -> Result<TypedAst, Vec<Diagnostic>> {
     }
 }
 
+/// Type-checks the body of a parsed `@vectorize` declaration. Array columns
+/// are represented as `ArrayF64` until array lowering turns each indexed load
+/// into the current element's scalar f64 parameter. The induction variable is
+/// a local i64 and is intentionally not exposed as a runtime parameter.
+pub fn typecheck_array(program: crate::array::ArrayProgram) -> Result<TypedArray, Vec<Diagnostic>> {
+    let ast = crate::resolve::resolve(program.body);
+    let mut ctx = Ctx {
+        ast: &ast,
+        param_ty: FxHashMap::default(),
+        param_order: Vec::new(),
+        local_ty: FxHashMap::default(),
+        types: vec![Ty::F64; ast.exprs.len()],
+        diags: Vec::new(),
+        allow_arrays: true,
+    };
+    ctx.local_ty.insert(program.index.clone(), Ty::I64);
+    ctx.infer_expect(ast.root, Some(Ty::F64));
+    let result_ty = ctx.check(ast.root);
+    if result_ty != Ty::F64 {
+        ctx.diags.push(Diagnostic::error(
+            format!("vectorized body must return F64, found {result_ty:?}"),
+            ast.span(ast.root),
+            "invalid vectorized result type",
+        ));
+    }
+    if ctx.param_ty.values().any(|ty| *ty != Ty::ArrayF64) {
+        ctx.diags.push(Diagnostic::error(
+            "vectorized bodies currently accept indexed f64 columns only",
+            ast.span(ast.root),
+            "expected every parameter to be an array column",
+        ));
+    }
+    let diags = std::mem::take(&mut ctx.diags);
+    let types = std::mem::take(&mut ctx.types);
+    let params = ctx
+        .param_order
+        .iter()
+        .map(|name| (name.clone(), ctx.param_ty[name]))
+        .collect();
+    drop(ctx);
+    if diags.is_empty() {
+        Ok(TypedArray {
+            ast,
+            types,
+            params,
+            output: program.output,
+            index: program.index,
+        })
+    } else {
+        Err(diags)
+    }
+}
+
 struct Ctx<'a> {
     ast: &'a Ast,
     param_ty: FxHashMap<String, Ty>,
@@ -53,6 +119,7 @@ struct Ctx<'a> {
     local_ty: FxHashMap<String, Ty>,
     types: Vec<Ty>,
     diags: Vec<Diagnostic>,
+    allow_arrays: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -95,6 +162,9 @@ impl<'a> Ctx<'a> {
     fn infer_expect(&mut self, idx: ExprIdx, expected: Option<Ty>) {
         match self.ast.get(idx).clone() {
             Expr::Ident(name) => {
+                if self.local_ty.contains_key(&name) {
+                    return;
+                }
                 if name.contains('%') {
                     return;
                 }
@@ -126,6 +196,10 @@ impl<'a> Ctx<'a> {
                 for a in args {
                     self.infer_expect(a, Some(Ty::F64));
                 }
+            }
+            Expr::Index { base, index } => {
+                self.infer_expect(base, Some(Ty::ArrayF64));
+                self.infer_expect(index, Some(Ty::I64));
             }
             Expr::If { cond, then_, else_ } => {
                 self.infer_expect(cond, Some(Ty::Bool));
@@ -174,6 +248,20 @@ impl<'a> Ctx<'a> {
             }
             Expr::Binary { op, lhs, rhs } => self.check_binary(op, lhs, rhs),
             Expr::Call { callee, args } => self.check_call(&callee, &args, span),
+            Expr::Index { base, index } => {
+                if !self.allow_arrays {
+                    self.diags.push(Diagnostic::error(
+                        "array indexing is only valid inside @vectorize",
+                        span,
+                        "array expression outside vectorize declaration",
+                    ));
+                }
+                let base_ty = self.check(base);
+                let index_ty = self.check(index);
+                self.expect(base_ty, Ty::ArrayF64, self.ast.span(base));
+                self.expect(index_ty, Ty::I64, self.ast.span(index));
+                Ty::F64
+            }
             Expr::If { cond, then_, else_ } => {
                 let c = self.check(cond);
                 self.expect(c, Ty::Bool, self.ast.span(cond));

@@ -119,6 +119,7 @@ pub struct BlockData {
     pub preds: SmallVec<[Block; 2]>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Function {
     pub insts: Vec<Inst>,
     pub types: Vec<Ty>,
