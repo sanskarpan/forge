@@ -1,7 +1,7 @@
 //! Runtime SIMD capability selection shared by native front ends.
 
 use forge_ir::array::ArrayParamKind;
-use forge_ir::{CmpOp, Function, Inst, Terminator, Ty, Value};
+use forge_ir::{CmpOp, Function, Inst, LibFunc, Terminator, Ty, Value};
 
 /// The typed, lane-wise IR consumed by the packed evaluator. Values reuse the
 /// scalar IR's SSA indices so the vector program can be inspected alongside
@@ -30,6 +30,15 @@ pub enum VectorInst {
         a: Value,
         b: Value,
         c: Value,
+    },
+    LibmUnary {
+        func: LibFunc,
+        arg: Value,
+    },
+    LibmBinary {
+        func: LibFunc,
+        lhs: Value,
+        rhs: Value,
     },
     VecLoad {
         base: Value,
@@ -184,6 +193,18 @@ fn lower_vector_inst(
             a: *a,
             b: *b,
             c: *c,
+        },
+        Inst::Call { func, args } => match args.as_slice() {
+            [arg] => VectorInst::LibmUnary {
+                func: *func,
+                arg: *arg,
+            },
+            [lhs, rhs] => VectorInst::LibmBinary {
+                func: *func,
+                lhs: *lhs,
+                rhs: *rhs,
+            },
+            _ => return Err("vector lowering found an invalid libm arity".to_string()),
         },
         Inst::IToF(operand) => VectorInst::Move(*operand),
         Inst::Cmp { op, lhs, rhs }
@@ -987,6 +1008,57 @@ trait PackedOps {
     }
 }
 
+fn eval_libm_unary(func: LibFunc, value: f64) -> f64 {
+    match func {
+        LibFunc::Sin => value.sin(),
+        LibFunc::Cos => value.cos(),
+        LibFunc::Tan => value.tan(),
+        LibFunc::Exp => value.exp(),
+        LibFunc::Log => value.ln(),
+        LibFunc::Pow | LibFunc::Fmod => unreachable!("binary libm function used as unary"),
+    }
+}
+
+fn eval_libm_binary(func: LibFunc, lhs: f64, rhs: f64) -> f64 {
+    match func {
+        LibFunc::Pow => lhs.powf(rhs),
+        LibFunc::Fmod => lhs % rhs,
+        LibFunc::Sin | LibFunc::Cos | LibFunc::Tan | LibFunc::Exp | LibFunc::Log => {
+            unreachable!("unary libm function used as binary")
+        }
+    }
+}
+
+/// Applies a libm call to each lane while keeping the surrounding expression
+/// in the packed evaluator. Rust does not expose portable packed libm
+/// intrinsics, so this adapter deliberately uses the scalar operations that
+/// define Forge's interpreter oracle and repacks their exact results. This
+/// preserves NaN, infinity, signed-zero, and platform-libm behavior without
+/// silently switching the whole array expression to the scalar loop.
+unsafe fn packed_libm_unary<V: PackedOps>(func: LibFunc, value: V::Vector) -> V::Vector {
+    let mut lanes = vec![0.0; V::LANES];
+    V::store(value, lanes.as_mut_ptr());
+    for lane in &mut lanes {
+        *lane = eval_libm_unary(func, *lane);
+    }
+    V::load(lanes.as_ptr())
+}
+
+unsafe fn packed_libm_binary<V: PackedOps>(
+    func: LibFunc,
+    lhs: V::Vector,
+    rhs: V::Vector,
+) -> V::Vector {
+    let mut lhs_lanes = vec![0.0; V::LANES];
+    let mut rhs_lanes = vec![0.0; V::LANES];
+    V::store(lhs, lhs_lanes.as_mut_ptr());
+    V::store(rhs, rhs_lanes.as_mut_ptr());
+    for (lhs, rhs) in lhs_lanes.iter_mut().zip(rhs_lanes) {
+        *lhs = eval_libm_binary(func, *lhs, rhs);
+    }
+    V::load(lhs_lanes.as_ptr())
+}
+
 fn get_packed<V: PackedOps>(values: &[Option<V::Vector>], value: Value) -> Result<V::Vector, ()> {
     values
         .get(value.0 as usize)
@@ -1145,6 +1217,14 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
                     get_packed::<V>(&values, c)?,
                 )
             }
+            VectorInst::LibmUnary { func, arg } => {
+                packed_libm_unary::<V>(func, get_packed::<V>(&values, arg)?)
+            }
+            VectorInst::LibmBinary { func, lhs, rhs } => packed_libm_binary::<V>(
+                func,
+                get_packed::<V>(&values, lhs)?,
+                get_packed::<V>(&values, rhs)?,
+            ),
             VectorInst::Cmp { op, lhs, rhs } => V::cmp(
                 op,
                 get_packed::<V>(&values, lhs)?,
@@ -2541,6 +2621,77 @@ mod tests {
                 && CpuFeatures::detect().avx2
                 && CpuFeatures::detect().fma)
                 || avx512_fma
+        );
+    }
+
+    #[test]
+    fn packed_libm_calls_match_scalar_bits_and_keep_the_packed_body() {
+        let input = (0..17)
+            .map(|index| (index as f64 - 8.0) * 0.375)
+            .collect::<Vec<_>>();
+        for (source, expected) in [
+            ("sin(x)", input.iter().map(|x| x.sin()).collect::<Vec<_>>()),
+            ("cos(x)", input.iter().map(|x| x.cos()).collect::<Vec<_>>()),
+            ("tan(x)", input.iter().map(|x| x.tan()).collect::<Vec<_>>()),
+            ("exp(x)", input.iter().map(|x| x.exp()).collect::<Vec<_>>()),
+            ("log(x)", input.iter().map(|x| x.ln()).collect::<Vec<_>>()),
+        ] {
+            let packed = evaluate_array(source, &[&input]).unwrap();
+            let scalar =
+                evaluate_array_with_features(source, &[&input], CpuFeatures::scalar()).unwrap();
+            assert_eq!(
+                packed
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "packed result mismatch for {source}"
+            );
+            assert_eq!(
+                packed
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                scalar
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "scalar result mismatch for {source}"
+            );
+            assert_eq!(
+                packed.used_packed_backend,
+                packed.plan.width != SimdWidth::Scalar
+            );
+        }
+
+        let exponent = (0..17)
+            .map(|index| (index % 5) as f64 - 2.0)
+            .collect::<Vec<_>>();
+        let packed = evaluate_array("pow(x, y)", &[&input, &exponent]).unwrap();
+        let scalar =
+            evaluate_array_with_features("pow(x, y)", &[&input, &exponent], CpuFeatures::scalar())
+                .unwrap();
+        assert_eq!(
+            packed
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            scalar
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            packed.used_packed_backend,
+            packed.plan.width != SimdWidth::Scalar
         );
     }
 
