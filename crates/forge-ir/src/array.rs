@@ -33,6 +33,9 @@ pub enum ArrayInst {
         result: Value,
         column: u32,
         index: ArrayValue,
+        /// Element displacement from the logical loop index. The evaluator
+        /// validates the resulting window before executing the loop.
+        offset: i32,
     },
     Store {
         output: String,
@@ -127,6 +130,7 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
                 result,
                 column,
                 index,
+                ..
             } => {
                 let Some(element_param) = function
                     .param_kinds
@@ -175,14 +179,14 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
 
 /// Lowers a type-checked vectorized body into the memory/loop envelope and a
 /// scalar element function. The current language contract intentionally
-/// accepts the canonical `column[index]` addressing form; arbitrary offsets
-/// can be added later without weakening this representation. Unindexed f64
-/// parameters remain scalar broadcasts in the element function and are not
-/// represented by memory loads.
+/// accepts indexed column addressing with a constant element displacement.
+/// Unindexed f64 parameters remain scalar broadcasts in the element function
+/// and are not represented by memory loads.
 pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
     let mut ast = typed.ast.clone();
     let root = ast.root;
-    rewrite_indexed_loads(&mut ast, root, &typed.index)?;
+    let mut column_offsets = Vec::new();
+    rewrite_indexed_loads(&mut ast, root, &typed.index, &mut column_offsets)?;
     let element_typed = TypedAst {
         ast,
         types: typed.types.clone(),
@@ -209,6 +213,12 @@ pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
         .filter(|(_, (_, ty))| *ty == AstTy::ArrayF64)
         .enumerate()
         .map(|(column, (param, _))| {
+            let name = &typed.params[param].0;
+            let offset = column_offsets
+                .iter()
+                .find(|(column_name, _)| column_name == name)
+                .map(|(_, offset)| *offset)
+                .ok_or_else(|| format!("missing indexed load for column `{name}`"))?;
             let result = element
                 .insts
                 .iter()
@@ -224,6 +234,7 @@ pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
                 result,
                 column: column as u32,
                 index: induction,
+                offset,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -290,42 +301,98 @@ pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
     Ok(function)
 }
 
-fn rewrite_indexed_loads(ast: &mut Ast, idx: ExprIdx, induction_name: &str) -> Result<(), String> {
+fn rewrite_indexed_loads(
+    ast: &mut Ast,
+    idx: ExprIdx,
+    induction_name: &str,
+    column_offsets: &mut Vec<(String, i32)>,
+) -> Result<(), String> {
     match ast.get(idx).clone() {
         Expr::Index { base, index } => {
             if !matches!(ast.get(base), Expr::Ident(_)) {
                 return Err("vectorized loads must use a column identifier".to_string());
             }
-            if !matches!(ast.get(index), Expr::Ident(name) if name == induction_name) {
-                return Err("vectorized loads must use the declared induction variable".to_string());
-            }
+            let offset = parse_index_offset(ast, index, induction_name)?;
             let Expr::Ident(name) = ast.get(base).clone() else {
                 unreachable!()
             };
+            if let Some((_, existing)) = column_offsets
+                .iter()
+                .find(|(column_name, _)| *column_name == name)
+            {
+                if *existing != offset {
+                    return Err(format!(
+                        "column `{name}` is indexed with multiple offsets ({existing} and {offset})"
+                    ));
+                }
+            } else {
+                column_offsets.push((name.clone(), offset));
+            }
             ast.exprs[idx.index()] = Expr::Ident(name);
         }
-        Expr::Unary { operand, .. } => rewrite_indexed_loads(ast, operand, induction_name)?,
+        Expr::Unary { operand, .. } => {
+            rewrite_indexed_loads(ast, operand, induction_name, column_offsets)?
+        }
         Expr::Binary { lhs, rhs, .. } => {
-            rewrite_indexed_loads(ast, lhs, induction_name)?;
-            rewrite_indexed_loads(ast, rhs, induction_name)?;
+            rewrite_indexed_loads(ast, lhs, induction_name, column_offsets)?;
+            rewrite_indexed_loads(ast, rhs, induction_name, column_offsets)?;
         }
         Expr::Call { args, .. } => {
             for arg in args {
-                rewrite_indexed_loads(ast, arg, induction_name)?;
+                rewrite_indexed_loads(ast, arg, induction_name, column_offsets)?;
             }
         }
         Expr::If { cond, then_, else_ } => {
-            rewrite_indexed_loads(ast, cond, induction_name)?;
-            rewrite_indexed_loads(ast, then_, induction_name)?;
-            rewrite_indexed_loads(ast, else_, induction_name)?;
+            rewrite_indexed_loads(ast, cond, induction_name, column_offsets)?;
+            rewrite_indexed_loads(ast, then_, induction_name, column_offsets)?;
+            rewrite_indexed_loads(ast, else_, induction_name, column_offsets)?;
         }
         Expr::Let { value, body, .. } => {
-            rewrite_indexed_loads(ast, value, induction_name)?;
-            rewrite_indexed_loads(ast, body, induction_name)?;
+            rewrite_indexed_loads(ast, value, induction_name, column_offsets)?;
+            rewrite_indexed_loads(ast, body, induction_name, column_offsets)?;
         }
         Expr::Float(_) | Expr::Int(_) | Expr::Bool(_) | Expr::Ident(_) => {}
     }
     Ok(())
+}
+
+fn parse_index_offset(ast: &Ast, index: ExprIdx, induction_name: &str) -> Result<i32, String> {
+    let offset = match ast.get(index) {
+        Expr::Ident(name) if name == induction_name => Some(0),
+        Expr::Binary {
+            op: forge_syntax::ast::BinaryOp::Add,
+            lhs,
+            rhs,
+        } => match (ast.get(*lhs), ast.get(*rhs)) {
+            (Expr::Ident(name), _constant) if name == induction_name => constant_i64(ast, *rhs),
+            (_constant, Expr::Ident(name)) if name == induction_name => constant_i64(ast, *lhs),
+            _ => None,
+        },
+        Expr::Binary {
+            op: forge_syntax::ast::BinaryOp::Sub,
+            lhs,
+            rhs,
+        } if matches!(ast.get(*lhs), Expr::Ident(name) if name == induction_name) => {
+            constant_i64(ast, *rhs).and_then(|value| value.checked_neg())
+        }
+        _ => None,
+    }
+    .ok_or_else(|| {
+        "vectorized loads must use the induction variable plus a constant integer offset"
+            .to_string()
+    })?;
+    i32::try_from(offset).map_err(|_| "vectorized load offset must fit in i32".to_string())
+}
+
+fn constant_i64(ast: &Ast, idx: ExprIdx) -> Option<i64> {
+    match ast.get(idx) {
+        Expr::Int(value) => Some(*value),
+        Expr::Unary {
+            op: forge_syntax::ast::UnaryOp::Neg,
+            operand,
+        } => constant_i64(ast, *operand).and_then(|value| value.checked_neg()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -391,5 +458,47 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn lowers_constant_index_offsets_into_verified_loads() {
+        let (tokens, lex_diags) =
+            lex("@vectorize result[i] = left[i + 2] + right[i - 1] + left[i + 2]");
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (program, parse_diags) = parse(&tokens);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let typed = typecheck_array(program.expect("vector program")).unwrap();
+        let function = lower_array(&typed).unwrap();
+        let offsets = function.blocks[1]
+            .insts
+            .iter()
+            .filter_map(|inst| match inst {
+                ArrayInst::Load { column, offset, .. } => Some((*column, *offset)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![(0, 2), (1, -1)]);
+    }
+
+    #[test]
+    fn rejects_dynamic_or_conflicting_index_offsets() {
+        for source in [
+            "@vectorize result[i] = a[i + shift]",
+            "@vectorize result[i] = a[i] + a[i + 1]",
+        ] {
+            let (tokens, lex_diags) = lex(source);
+            assert!(lex_diags.is_empty(), "{lex_diags:?}");
+            let (program, parse_diags) = parse(&tokens);
+            assert!(parse_diags.is_empty(), "{parse_diags:?}");
+            let Some(program) = program else {
+                panic!("array parser rejected {source}");
+            };
+            if let Ok(typed) = typecheck_array(program) {
+                assert!(
+                    lower_array(&typed).is_err(),
+                    "expected rejection for {source}"
+                );
+            }
+        }
     }
 }
