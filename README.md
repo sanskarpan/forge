@@ -59,7 +59,12 @@ loop/memory IR and execute through the packed evaluator with scalar epilogues
 and exact fallback. Supply broadcast values with
 `forge_simd::evaluate_vectorized_with_broadcasts` (or its feature-masked
 variant) separately from the input columns; packed backends splat them without
-materializing repeated arrays. The full AArch64
+materializing repeated arrays. Indexed columns also support constant offsets,
+for example `@vectorize result[i] = a[i + 1] - b[i - 2]`. The evaluator uses
+the largest shared in-bounds window: negative offsets skip leading rows,
+positive offsets trim trailing rows, and a window too short for the requested
+offsets returns an empty result. Dynamic offsets and using different offsets
+for the same column remain rejected explicitly. The full AArch64
 expression backend remains an explicit scope boundary; pure acyclic
 structured conditionals are already handled by the packed evaluator with lane
 masks and predicated selects. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
