@@ -103,8 +103,20 @@ pub struct VectorLoop {
 /// control flow is converted to lane masks and predicated selects; calls,
 /// integer values, and unsupported operations still reject the packed path.
 pub fn lower_f64_vector(function: &Function, lanes: u8) -> Result<VectorFunction, String> {
+    let offsets = vec![0; function.params.len()];
+    lower_f64_vector_with_param_offsets(function, lanes, &offsets)
+}
+
+fn lower_f64_vector_with_param_offsets(
+    function: &Function,
+    lanes: u8,
+    param_offsets: &[i32],
+) -> Result<VectorFunction, String> {
     if !matches!(lanes, 2 | 4 | 8) {
         return Err(format!("unsupported f64 vector width: {lanes}"));
+    }
+    if param_offsets.len() != function.params.len() {
+        return Err("vector parameter offsets do not match the function signature".to_string());
     }
     if function.blocks.len() == 1 {
         let block = &function.blocks[0];
@@ -117,7 +129,10 @@ pub fn lower_f64_vector(function: &Function, lanes: u8) -> Result<VectorFunction
                 .insts
                 .get(value.0 as usize)
                 .ok_or_else(|| format!("block references missing instruction {value:?}"))?;
-            insts.push((value, lower_vector_inst(function, value, scalar, lanes)?));
+            insts.push((
+                value,
+                lower_vector_inst(function, value, scalar, lanes, param_offsets)?,
+            ));
         }
         return Ok(VectorFunction {
             lanes,
@@ -126,7 +141,7 @@ pub fn lower_f64_vector(function: &Function, lanes: u8) -> Result<VectorFunction
         });
     }
 
-    lower_structured_vector(function, lanes)
+    lower_structured_vector(function, lanes, param_offsets)
 }
 
 fn lower_vector_inst(
@@ -134,6 +149,7 @@ fn lower_vector_inst(
     value: Value,
     scalar: &Inst,
     lanes: u8,
+    param_offsets: &[i32],
 ) -> Result<VectorInst, String> {
     let result_ty = function
         .types
@@ -146,9 +162,9 @@ fn lower_vector_inst(
         Inst::ConstBool(value) => {
             VectorInst::SplatF64((if *value { 1.0f64 } else { 0.0f64 }).to_bits())
         }
-        Inst::Param { ty: Ty::F64, .. } => VectorInst::VecLoad {
+        Inst::Param { index, ty: Ty::F64 } => VectorInst::VecLoad {
             base: value,
-            offset: 0,
+            offset: param_offsets[*index as usize],
             lanes,
         },
         Inst::Add(lhs, rhs) => VectorInst::Add(*lhs, *rhs),
@@ -237,7 +253,11 @@ fn reachable_blocks(function: &Function) -> Result<Vec<usize>, String> {
     Ok(postorder)
 }
 
-fn lower_structured_vector(function: &Function, lanes: u8) -> Result<VectorFunction, String> {
+fn lower_structured_vector(
+    function: &Function,
+    lanes: u8,
+    param_offsets: &[i32],
+) -> Result<VectorFunction, String> {
     let order = reachable_blocks(function)?;
     let mut insts = Vec::new();
     let mut next_aux = function.insts.len() as u32;
@@ -306,7 +326,10 @@ fn lower_structured_vector(function: &Function, lanes: u8) -> Result<VectorFunct
                     insts.push((value, VectorInst::Move(first_value)));
                 }
             } else {
-                insts.push((value, lower_vector_inst(function, value, scalar, lanes)?));
+                insts.push((
+                    value,
+                    lower_vector_inst(function, value, scalar, lanes, param_offsets)?,
+                ));
             }
         }
 
@@ -486,6 +509,9 @@ impl SimdWidth {
 pub struct ArrayPlan {
     pub width: SimdWidth,
     pub elements: usize,
+    /// Source-column index corresponding to logical output index zero.
+    /// Constant negative load offsets use this origin to stay in bounds.
+    pub input_offset: usize,
     pub full_chunks: usize,
     pub tail: usize,
 }
@@ -496,6 +522,14 @@ impl ArrayPlan {
     }
 
     pub fn for_len_with_features(elements: usize, features: CpuFeatures) -> Self {
+        Self::for_len_with_features_and_input_offset(elements, features, 0)
+    }
+
+    pub fn for_len_with_features_and_input_offset(
+        elements: usize,
+        features: CpuFeatures,
+        input_offset: usize,
+    ) -> Self {
         let width = match features.best_width(Ty::F64) {
             8 => SimdWidth::F64x8,
             4 => SimdWidth::F64x4,
@@ -506,6 +540,7 @@ impl ArrayPlan {
         Self {
             width,
             elements,
+            input_offset,
             full_chunks: elements / lanes,
             tail: elements % lanes,
         }
@@ -536,9 +571,16 @@ enum ArrayInput<'a> {
 }
 
 impl ArrayInput<'_> {
-    fn value_at(self, index: usize) -> f64 {
+    fn value_at(self, index: usize, input_offset: usize, load_offset: i32) -> f64 {
         match self {
-            Self::Column(column) => column[index],
+            Self::Column(column) => {
+                let index = if load_offset >= 0 {
+                    index + input_offset + load_offset as usize
+                } else {
+                    index + input_offset - load_offset.unsigned_abs() as usize
+                };
+                column[index]
+            }
             Self::Scalar(value) => value,
         }
     }
@@ -559,13 +601,13 @@ fn prepare_array(
                 .to_string(),
         );
     }
-    let elements = columns.first().map_or(0, |column| column.len());
-    if columns.iter().any(|column| column.len() != elements) {
+    let input_elements = columns.first().map_or(0, |column| column.len());
+    if columns.iter().any(|column| column.len() != input_elements) {
         return Err("array columns must have equal lengths".to_string());
     }
     Ok((
         function,
-        ArrayPlan::for_len_with_features(elements, features),
+        ArrayPlan::for_len_with_features(input_elements, features),
     ))
 }
 
@@ -598,7 +640,8 @@ pub fn evaluate_array_with_features(
         .copied()
         .map(ArrayInput::Column)
         .collect::<Vec<_>>();
-    evaluate_lowered_array_with_features(&function, &inputs, plan, features)
+    let param_offsets = vec![0; function.params.len()];
+    evaluate_lowered_array_with_features(&function, &inputs, plan, features, &param_offsets)
 }
 
 fn evaluate_lowered_array_with_features(
@@ -606,12 +649,18 @@ fn evaluate_lowered_array_with_features(
     inputs: &[ArrayInput<'_>],
     plan: ArrayPlan,
     features: CpuFeatures,
+    param_offsets: &[i32],
 ) -> Result<ArrayResult, String> {
+    if param_offsets.len() != inputs.len() {
+        return Err("array load offsets do not match the element inputs".to_string());
+    }
     let elements = plan.elements;
     if plan.width != SimdWidth::Scalar {
         let mut values = Vec::with_capacity(elements);
         let lanes = plan.width.lanes();
-        if let Some(chunks) = try_evaluate_packed_loop(function, inputs, plan, features) {
+        if let Some(chunks) =
+            try_evaluate_packed_loop(function, inputs, plan, features, param_offsets)
+        {
             let mut used_packed = plan.full_chunks > 0;
             values.extend(chunks);
             if plan.tail > 0 {
@@ -622,6 +671,8 @@ fn evaluate_lowered_array_with_features(
                     plan.width,
                     plan.tail,
                     features,
+                    plan.input_offset,
+                    param_offsets,
                 ) {
                     values.extend(tail);
                     used_packed = true;
@@ -629,7 +680,8 @@ fn evaluate_lowered_array_with_features(
                     for index in plan.full_chunks * lanes..elements {
                         let args = inputs
                             .iter()
-                            .map(|input| input.value_at(index))
+                            .zip(param_offsets.iter().copied())
+                            .map(|(input, offset)| input.value_at(index, plan.input_offset, offset))
                             .collect::<Vec<_>>();
                         values.push(evaluate_scalar_function(function, &args)?);
                     }
@@ -649,7 +701,8 @@ fn evaluate_lowered_array_with_features(
     for index in 0..elements {
         let args = inputs
             .iter()
-            .map(|input| input.value_at(index))
+            .zip(param_offsets.iter().copied())
+            .map(|(input, offset)| input.value_at(index, plan.input_offset, offset))
             .collect::<Vec<_>>();
         values.push(evaluate_scalar_function(function, &args)?);
     }
@@ -734,8 +787,8 @@ pub fn evaluate_vectorized_with_broadcasts_and_features(
     if column_count != columns.len() || broadcast_count != broadcasts.len() {
         return Err("vectorized columns and broadcasts must match the input signature".to_string());
     }
-    let elements = columns.first().map_or(0, |column| column.len());
-    if columns.iter().any(|column| column.len() != elements) {
+    let input_elements = columns.first().map_or(0, |column| column.len());
+    if columns.iter().any(|column| column.len() != input_elements) {
         return Err("vectorized columns must have equal lengths".to_string());
     }
     let mut column = 0usize;
@@ -757,8 +810,57 @@ pub fn evaluate_vectorized_with_broadcasts_and_features(
         })
         .collect::<Vec<_>>();
     let features = requested.supported_by_host();
-    let plan = ArrayPlan::for_len_with_features(elements, features);
-    evaluate_lowered_array_with_features(&array_function.element, &inputs, plan, features)
+    let loads = array_function.blocks[1]
+        .insts
+        .iter()
+        .filter_map(|inst| match inst {
+            forge_ir::array::ArrayInst::Load { offset, .. } => Some(*offset),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut param_offsets = vec![0; array_function.params.len()];
+    let mut load = 0usize;
+    for (param, kind) in array_function.param_kinds.iter().enumerate() {
+        if *kind == ArrayParamKind::Column {
+            param_offsets[param] = loads
+                .get(load)
+                .copied()
+                .ok_or_else(|| "array IR is missing a column load offset".to_string())?;
+            load += 1;
+        }
+    }
+    let (min_offset, max_offset) = array_load_offset_bounds(&array_function)?;
+    let input_offset = min_offset.unsigned_abs() as usize;
+    let trim = input_offset
+        .checked_add(max_offset.max(0) as usize)
+        .ok_or_else(|| "vectorized load window is too large".to_string())?;
+    let elements = input_elements.saturating_sub(trim);
+    let plan = ArrayPlan::for_len_with_features_and_input_offset(elements, features, input_offset);
+    evaluate_lowered_array_with_features(
+        &array_function.element,
+        &inputs,
+        plan,
+        features,
+        &param_offsets,
+    )
+}
+
+fn array_load_offset_bounds(
+    function: &forge_ir::array::ArrayFunction,
+) -> Result<(i32, i32), String> {
+    let offsets = function.blocks.get(1).into_iter().flat_map(|block| {
+        block.insts.iter().filter_map(|inst| match inst {
+            forge_ir::array::ArrayInst::Load { offset, .. } => Some(*offset),
+            _ => None,
+        })
+    });
+    let mut offsets = offsets.peekable();
+    let Some(first) = offsets.peek().copied() else {
+        return Ok((0, 0));
+    };
+    Ok(offsets.fold((first, first), |(min, max), offset| {
+        (min.min(offset), max.max(offset))
+    }))
 }
 
 /// Reduces the per-row results of a pure all-f64 expression in source order.
@@ -784,9 +886,12 @@ pub fn reduce_sum_with_features(
         .copied()
         .map(ArrayInput::Column)
         .collect::<Vec<_>>();
+    let param_offsets = vec![0; function.params.len()];
     if plan.width != SimdWidth::Scalar {
         let lanes = plan.width.lanes();
-        if let Some(chunks) = try_evaluate_packed_loop(&function, &inputs, plan, features) {
+        if let Some(chunks) =
+            try_evaluate_packed_loop(&function, &inputs, plan, features, &param_offsets)
+        {
             let mut used_packed = plan.full_chunks > 0;
             let mut values = chunks;
             if plan.tail > 0 {
@@ -797,6 +902,8 @@ pub fn reduce_sum_with_features(
                     plan.width,
                     plan.tail,
                     features,
+                    plan.input_offset,
+                    &param_offsets,
                 ) {
                     values.extend(tail);
                     used_packed = true;
@@ -804,7 +911,7 @@ pub fn reduce_sum_with_features(
                     for index in plan.full_chunks * lanes..plan.elements {
                         let args = columns
                             .iter()
-                            .map(|column| column[index])
+                            .map(|column| column[index + plan.input_offset])
                             .collect::<Vec<_>>();
                         values.push(evaluate_scalar(source, &args)?);
                     }
@@ -825,7 +932,7 @@ pub fn reduce_sum_with_features(
     for index in 0..plan.elements {
         let args = columns
             .iter()
-            .map(|column| column[index])
+            .map(|column| column[index + plan.input_offset])
             .collect::<Vec<_>>();
         value += evaluate_scalar(source, &args)?;
     }
@@ -901,9 +1008,12 @@ unsafe fn evaluate_packed_loop<V: PackedOps>(
     function: &Function,
     inputs: &[ArrayInput<'_>],
     plan: ArrayPlan,
+    param_offsets: &[i32],
 ) -> Result<Vec<f64>, ()> {
     let vector_loop =
         lower_f64_vector_loop(function, V::LANES as u8, plan.elements).map_err(|_| ())?;
+    let vector = lower_f64_vector_with_param_offsets(function, V::LANES as u8, param_offsets)
+        .map_err(|_| ())?;
     if vector_loop.store.value != vector_loop.body.result
         || vector_loop.store.lanes as usize != V::LANES
     {
@@ -917,10 +1027,11 @@ unsafe fn evaluate_packed_loop<V: PackedOps>(
             .ok_or(())?;
         values.extend(evaluate_vector_function::<V>(
             function,
-            &vector_loop.body,
+            &vector,
             inputs,
             start,
             vector_loop.lanes as usize,
+            plan.input_offset,
         )?);
     }
     Ok(values)
@@ -932,12 +1043,15 @@ unsafe fn evaluate_packed_with_active<V: PackedOps>(
     inputs: &[ArrayInput<'_>],
     start: usize,
     active: usize,
+    input_offset: usize,
+    param_offsets: &[i32],
 ) -> Result<Vec<f64>, ()> {
     if active == 0 || active > V::LANES {
         return Err(());
     }
-    let vector = lower_f64_vector(function, V::LANES as u8).map_err(|_| ())?;
-    evaluate_vector_function::<V>(function, &vector, inputs, start, active)
+    let vector = lower_f64_vector_with_param_offsets(function, V::LANES as u8, param_offsets)
+        .map_err(|_| ())?;
+    evaluate_vector_function::<V>(function, &vector, inputs, start, active, input_offset)
 }
 
 unsafe fn evaluate_vector_function<V: PackedOps>(
@@ -946,6 +1060,7 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
     inputs: &[ArrayInput<'_>],
     start: usize,
     active: usize,
+    input_offset: usize,
 ) -> Result<Vec<f64>, ()> {
     let value_count = vector
         .insts
@@ -959,10 +1074,11 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
             VectorInst::SplatF64(bits) => V::splat(f64::from_bits(bits)),
             VectorInst::Param { index } => match inputs.get(index as usize).ok_or(())? {
                 ArrayInput::Column(column) => {
-                    if start.checked_add(active).ok_or(())? > column.len() {
+                    let begin = start.checked_add(input_offset).ok_or(())?;
+                    if begin.checked_add(active).ok_or(())? > column.len() {
                         return Err(());
                     }
-                    V::load_masked(column[start..].as_ptr(), active)?
+                    V::load_masked(column[begin..].as_ptr(), active)?
                 }
                 ArrayInput::Scalar(value) => V::splat(*value),
             },
@@ -979,10 +1095,14 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
                     return Err(());
                 };
                 let begin = if offset >= 0 {
-                    start.checked_add(offset as usize).ok_or(())?
+                    start
+                        .checked_add(input_offset)
+                        .and_then(|start| start.checked_add(offset as usize))
+                        .ok_or(())?
                 } else {
                     start
-                        .checked_sub(offset.unsigned_abs() as usize)
+                        .checked_add(input_offset)
+                        .and_then(|start| start.checked_sub(offset.unsigned_abs() as usize))
                         .ok_or(())?
                 };
                 let ArrayInput::Column(column) = inputs.get(*index as usize).ok_or(())? else {
@@ -1078,6 +1198,7 @@ fn try_evaluate_packed_loop(
     inputs: &[ArrayInput<'_>],
     plan: ArrayPlan,
     features: CpuFeatures,
+    param_offsets: &[i32],
 ) -> Option<Vec<f64>> {
     #[cfg(target_arch = "x86_64")]
     if plan.width == SimdWidth::F64x8
@@ -1086,7 +1207,10 @@ fn try_evaluate_packed_loop(
         && std::is_x86_feature_detected!("avx512f")
     {
         // SAFETY: runtime feature detection proves AVX-512F is available.
-        return unsafe { evaluate_packed_loop::<x86_packed::Avx512>(function, inputs, plan) }.ok();
+        return unsafe {
+            evaluate_packed_loop::<x86_packed::Avx512>(function, inputs, plan, param_offsets)
+        }
+        .ok();
     }
     #[cfg(target_arch = "x86_64")]
     if plan.width == SimdWidth::F64x4 && features.avx2 && std::is_x86_feature_detected!("avx2") {
@@ -1096,29 +1220,42 @@ fn try_evaluate_packed_loop(
             if !features.fma || !std::is_x86_feature_detected!("fma") {
                 return None;
             }
-            return unsafe { evaluate_packed_loop::<x86_packed::Avx2Fma>(function, inputs, plan) }
-                .ok();
+            return unsafe {
+                evaluate_packed_loop::<x86_packed::Avx2Fma>(function, inputs, plan, param_offsets)
+            }
+            .ok();
         }
-        return unsafe { evaluate_packed_loop::<x86_packed::Avx2>(function, inputs, plan) }.ok();
+        return unsafe {
+            evaluate_packed_loop::<x86_packed::Avx2>(function, inputs, plan, param_offsets)
+        }
+        .ok();
     }
     #[cfg(target_arch = "x86_64")]
     if plan.width == SimdWidth::F64x2 && features.sse2 && std::is_x86_feature_detected!("sse2") {
         if features.sse41 && std::is_x86_feature_detected!("sse4.1") {
             // SAFETY: SSE4.1 is guaranteed by the runtime check and lane
             // ranges were checked inside evaluate_packed.
-            return unsafe { evaluate_packed_loop::<x86_packed::Sse41>(function, inputs, plan) }
-                .ok();
+            return unsafe {
+                evaluate_packed_loop::<x86_packed::Sse41>(function, inputs, plan, param_offsets)
+            }
+            .ok();
         }
         // SAFETY: SSE2 is guaranteed by the runtime check and lane ranges
         // were checked inside evaluate_packed. SSE2 remains the scalar
         // fallback for operations, such as ties-away-from-zero round, that
         // do not have the required packed primitive.
-        return unsafe { evaluate_packed_loop::<x86_packed::Sse2>(function, inputs, plan) }.ok();
+        return unsafe {
+            evaluate_packed_loop::<x86_packed::Sse2>(function, inputs, plan, param_offsets)
+        }
+        .ok();
     }
     #[cfg(target_arch = "aarch64")]
     if plan.width == SimdWidth::F64x2 && features.neon {
         // AArch64 always provides the NEON register set used here.
-        return unsafe { evaluate_packed_loop::<neon_packed::Neon>(function, inputs, plan) }.ok();
+        return unsafe {
+            evaluate_packed_loop::<neon_packed::Neon>(function, inputs, plan, param_offsets)
+        }
+        .ok();
     }
     None
 }
@@ -1130,16 +1267,34 @@ fn try_evaluate_packed_tail(
     width: SimdWidth,
     active: usize,
     features: CpuFeatures,
+    input_offset: usize,
+    param_offsets: &[i32],
 ) -> Option<Vec<f64>> {
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (function, inputs, start, width, active, features);
+    let _ = (
+        function,
+        inputs,
+        start,
+        width,
+        active,
+        features,
+        input_offset,
+        param_offsets,
+    );
 
     #[cfg(target_arch = "x86_64")]
     if width == SimdWidth::F64x8 && features.avx512f && std::is_x86_feature_detected!("avx512f") {
         // SAFETY: AVX-512F is runtime-gated and the masked load/store only
         // accesses the `active` elements that remain in each input column.
         return unsafe {
-            evaluate_packed_with_active::<x86_packed::Avx512>(function, inputs, start, active)
+            evaluate_packed_with_active::<x86_packed::Avx512>(
+                function,
+                inputs,
+                start,
+                active,
+                input_offset,
+                param_offsets,
+            )
         }
         .ok();
     }
@@ -2640,10 +2795,63 @@ mod tests {
     }
 
     #[test]
-    fn source_vectorize_rejects_noncanonical_indexing() {
+    fn source_vectorize_supports_constant_offsets_and_valid_windows() {
+        let left = (0..40).map(|index| index as f64 - 10.0).collect::<Vec<_>>();
+        let right = (0..40)
+            .map(|index| (index as f64 * 0.5) + 2.0)
+            .collect::<Vec<_>>();
+        let source = "@vectorize result[i] = left[i + 2] + right[i - 1]";
+        let packed = evaluate_vectorized(source, &[&left, &right]).unwrap();
+        let scalar = evaluate_vectorized_with_broadcasts_and_features(
+            source,
+            &[&left, &right],
+            &[],
+            CpuFeatures::scalar(),
+        )
+        .unwrap();
+        let expected = (0..37)
+            .map(|index| left[index + 3] + right[index])
+            .collect::<Vec<_>>();
+        assert_eq!(packed.values.len(), 37);
+        assert_eq!(packed.plan.input_offset, 1);
+        assert_eq!(
+            packed
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scalar
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            packed
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let empty =
+            evaluate_vectorized("@vectorize result[i] = a[i + 3]", &[&[1.0, 2.0, 3.0]]).unwrap();
+        assert!(empty.values.is_empty());
+        assert_eq!(empty.plan.elements, 0);
+    }
+
+    #[test]
+    fn source_vectorize_rejects_dynamic_index_offsets() {
         let error =
-            evaluate_vectorized("@vectorize result[i] = a[i + 1]", &[&[1.0, 2.0]]).unwrap_err();
-        assert!(error.contains("declared induction variable"), "{error}");
+            evaluate_vectorized("@vectorize result[i] = a[i + shift]", &[&[1.0, 2.0]]).unwrap_err();
+        assert!(
+            error.contains("constant integer offset") || error.contains("f64 column or broadcast"),
+            "{error}"
+        );
     }
 
     #[test]
