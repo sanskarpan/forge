@@ -667,11 +667,10 @@ fn evaluate_lowered_array_with_features(
                 if let Some(tail) = try_evaluate_packed_tail(
                     function,
                     inputs,
+                    plan,
                     plan.full_chunks * lanes,
-                    plan.width,
                     plan.tail,
                     features,
-                    plan.input_offset,
                     param_offsets,
                 ) {
                     values.extend(tail);
@@ -898,11 +897,10 @@ pub fn reduce_sum_with_features(
                 if let Some(tail) = try_evaluate_packed_tail(
                     &function,
                     &inputs,
+                    plan,
                     plan.full_chunks * lanes,
-                    plan.width,
                     plan.tail,
                     features,
-                    plan.input_offset,
                     &param_offsets,
                 ) {
                     values.extend(tail);
@@ -1263,27 +1261,28 @@ fn try_evaluate_packed_loop(
 fn try_evaluate_packed_tail(
     function: &Function,
     inputs: &[ArrayInput<'_>],
+    plan: ArrayPlan,
     start: usize,
-    width: SimdWidth,
     active: usize,
     features: CpuFeatures,
-    input_offset: usize,
     param_offsets: &[i32],
 ) -> Option<Vec<f64>> {
     #[cfg(not(target_arch = "x86_64"))]
     let _ = (
         function,
         inputs,
+        plan,
         start,
-        width,
         active,
         features,
-        input_offset,
         param_offsets,
     );
 
     #[cfg(target_arch = "x86_64")]
-    if width == SimdWidth::F64x8 && features.avx512f && std::is_x86_feature_detected!("avx512f") {
+    if plan.width == SimdWidth::F64x8
+        && features.avx512f
+        && std::is_x86_feature_detected!("avx512f")
+    {
         // SAFETY: AVX-512F is runtime-gated and the masked load/store only
         // accesses the `active` elements that remain in each input column.
         return unsafe {
@@ -1292,7 +1291,7 @@ fn try_evaluate_packed_tail(
                 inputs,
                 start,
                 active,
-                input_offset,
+                plan.input_offset,
                 param_offsets,
             )
         }
