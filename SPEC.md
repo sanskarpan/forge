@@ -1384,10 +1384,20 @@ metadata, and `forge-simd::evaluate_vectorized_with_broadcasts_and_features`
 executes its explicit induction/header/body/exit loop using the same packed
 width selection, scalar-epilogue, AVX-512 masked-tail, and exact scalar
 fallback machinery as the lower-level array API. The implemented addressing
-contract is the canonical `column[index]` form; arbitrary pointer offsets,
-nested source loops, and packed libm calls remain outside this language
-boundary. Broadcast values are supplied separately from columns and are
-splat directly into packed lanes without constructing repeated input arrays.
+contract accepts `column[index]` and constant element offsets such as
+`column[index + 2]`, `column[index - 1]`, or `column[2 + index]`. The same
+source column must use one offset throughout a program, and dynamic offsets
+remain rejected because they would require a gather operation outside the
+current packed memory contract. The evaluator chooses the maximal shared
+valid window: `input_offset = max(0, -min_offset)` and
+`elements = max(0, input_length - input_offset - max(0, max_offset))`.
+Negative offsets therefore skip the necessary leading input rows and positive
+offsets trim the trailing rows; short windows return an empty result. The
+verified array `Load` records the offset, and packed/scalar execution applies
+it with checked address arithmetic. Nested source loops and packed libm calls
+remain outside this language boundary. Broadcast values are supplied
+separately from columns and are splat directly into packed lanes without
+constructing repeated input arrays.
 
 ### Vectorizer
 
@@ -1395,9 +1405,10 @@ The current packed implementation supports SSE2, SSE4.1, AVX2, AVX-512F, and NEO
 widths. `forge-simd` lowers each supported straight-line or pure acyclic
 structured-control-flow function into a typed vector body and an explicit
 `VectorLoop` plan: the plan records the induction start, lane-sized step,
-full-chunk count, tail count, and output store. Each f64 parameter is
-represented as a `VecLoad`, and the same body is reused at each induction
-offset. Structured `if` expressions use canonical lane masks, mask algebra
+full-chunk count, tail count, and output store. Each indexed f64 column is
+represented as an offset-bearing `VecLoad`, while an unindexed f64 parameter
+is a packed splat; the same body is reused at each induction offset.
+Structured `if` expressions use canonical lane masks, mask algebra
 for nested paths, and bit-preserving predicated selects for φ values. SSE2,
 AVX2, and NEON use scalar epilogues for incomplete chunks; AVX-512F uses
 stable inline assembly with k-masked zeroing loads/stores for the tail. Packed
