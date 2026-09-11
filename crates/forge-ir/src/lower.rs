@@ -53,6 +53,7 @@ fn lower_ty(t: AstTy) -> Ty {
         AstTy::F64 => Ty::F64,
         AstTy::I64 => Ty::I64,
         AstTy::Bool => Ty::Bool,
+        AstTy::ArrayF64 => Ty::F64,
     }
 }
 
@@ -149,6 +150,10 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
             }
             let inst = lower_call(&callee, &vals);
             (b.emit(block, inst, ty, span), block)
+        }
+
+        Expr::Index { .. } => {
+            unreachable!("array indexing must be rewritten by forge_ir::array::lower_array")
         }
 
         Expr::If { cond, then_, else_ } => {
