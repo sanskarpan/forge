@@ -55,9 +55,10 @@ The full AArch64 expression backend and general array-mode memory/loop IR
 remain explicit scope boundaries; pure acyclic structured conditionals are
 already handled by the packed evaluator with lane masks and predicated
 selects. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
-AVX-512F, and NEON where their rounding semantics are exact; AVX2 and
-AVX-512F implement ties-away-from-zero `round` with an exact packed sequence,
-while SSE2 and unsupported x86 widths use the scalar interpreter fallback. Array
+AVX-512F, and NEON where their rounding semantics are exact; SSE4.1 width-2,
+AVX2, and AVX-512F implement ties-away-from-zero `round` with exact packed
+sequences, while SSE2-only and unsupported x86 widths use the scalar
+interpreter fallback. Array
 callers can use `evaluate_array_with_features` or
 `reduce_sum_with_features` to apply a host-safe SIMD feature mask; the scalar
 mask forces the exact interpreter fallback. The tested wasm-bindgen artifact/benchmark API
