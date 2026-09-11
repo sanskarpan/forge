@@ -1385,16 +1385,17 @@ executes its explicit induction/header/body/exit loop using the same packed
 width selection, scalar-epilogue, AVX-512 masked-tail, and exact scalar
 fallback machinery as the lower-level array API. The implemented addressing
 contract accepts `column[index]` and constant element offsets such as
-`column[index + 2]`, `column[index - 1]`, or `column[2 + index]`. The same
-source column must use one offset throughout a program, and dynamic offsets
+`column[index + 2]`, `column[index - 1]`, or `column[2 + index]`. A source
+column may appear at multiple constant offsets; each occurrence is a distinct
+verified element load/parameter mapped to that source column. Dynamic offsets
 remain rejected because they would require a gather operation outside the
 current packed memory contract. The evaluator chooses the maximal shared
 valid window: `input_offset = max(0, -min_offset)` and
 `elements = max(0, input_length - input_offset - max(0, max_offset))`.
 Negative offsets therefore skip the necessary leading input rows and positive
 offsets trim the trailing rows; short windows return an empty result. The
-verified array `Load` records the offset, and packed/scalar execution applies
-it with checked address arithmetic. Nested source loops and packed libm calls
+verified array `Load` records the source column and offset, and packed/scalar
+execution applies it with checked address arithmetic. Nested source loops and packed libm calls
 remain outside this language boundary. Broadcast values are supplied
 separately from columns and are splat directly into packed lanes without
 constructing repeated input arrays.
