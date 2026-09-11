@@ -72,6 +72,10 @@ pub struct ArrayFunction {
     pub element: Function,
     pub params: Vec<(String, Ty)>,
     pub param_kinds: Vec<ArrayParamKind>,
+    /// For a column parameter, identifies the source column ordinal. A
+    /// source column may have several element parameters when it is loaded at
+    /// several constant offsets.
+    pub param_sources: Vec<Option<u32>>,
     pub output: String,
     pub index: String,
     pub blocks: Vec<ArrayBlock>,
@@ -89,6 +93,7 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
     }
     if function.params.len() != function.element.params.len()
         || function.param_kinds.len() != function.params.len()
+        || function.param_sources.len() != function.params.len()
     {
         return Err("array parameter metadata does not match the element function".to_string());
     }
@@ -120,10 +125,12 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
     let mut loads = 0usize;
     let mut stores = 0usize;
     let column_count = function
-        .param_kinds
+        .param_sources
         .iter()
-        .filter(|kind| **kind == ArrayParamKind::Column)
-        .count();
+        .flatten()
+        .max()
+        .map_or(0, |column| *column as usize + 1);
+    let mut loaded_params = vec![false; function.params.len()];
     for inst in &function.blocks[1].insts {
         match inst {
             ArrayInst::Load {
@@ -132,25 +139,25 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
                 index,
                 ..
             } => {
-                let Some(element_param) = function
-                    .param_kinds
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, kind)| **kind == ArrayParamKind::Column)
-                    .nth(*column as usize)
-                    .map(|(param, _)| param as u32)
-                else {
+                if *column as usize >= column_count {
                     return Err("array load references an unknown column".to_string());
+                }
+                let Some(crate::Inst::Param {
+                    index: element_param,
+                    ty: Ty::F64,
+                }) = function.element.insts.get(result.0 as usize)
+                else {
+                    return Err("array load does not match an element parameter".to_string());
                 };
                 if *index != induction
-                    || !matches!(
-                        function.element.insts.get(result.0 as usize),
-                        Some(crate::Inst::Param { index, ty: Ty::F64 })
-                            if *index == element_param
-                    )
+                    || function.param_kinds.get(*element_param as usize)
+                        != Some(&ArrayParamKind::Column)
+                    || function.param_sources.get(*element_param as usize) != Some(&Some(*column))
+                    || loaded_params.get_mut(*element_param as usize).is_none()
                 {
                     return Err("array load does not match an element parameter".to_string());
                 }
+                loaded_params[*element_param as usize] = true;
                 loads += 1;
             }
             ArrayInst::Store {
@@ -171,8 +178,16 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
             }
         }
     }
-    if loads != column_count || stores != 1 {
-        return Err("array body must load every column and store exactly once".to_string());
+    if loads != loaded_params.iter().filter(|loaded| **loaded).count()
+        || loaded_params
+            .iter()
+            .enumerate()
+            .any(|(param, loaded)| function.param_kinds[param] == ArrayParamKind::Column && !loaded)
+        || stores != 1
+    {
+        return Err(
+            "array body must load every column parameter and store exactly once".to_string(),
+        );
     }
     Ok(())
 }
@@ -187,38 +202,42 @@ pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
     let root = ast.root;
     let mut column_offsets = Vec::new();
     rewrite_indexed_loads(&mut ast, root, &typed.index, &mut column_offsets)?;
+    let mut element_params = Vec::new();
+    let mut element_sources = Vec::new();
+    for (source_column, (name, ty)) in typed.params.iter().enumerate() {
+        if *ty == AstTy::ArrayF64 {
+            for (_, _offset, synthetic) in column_offsets
+                .iter()
+                .filter(|(column_name, _, _)| column_name == name)
+            {
+                element_params.push((synthetic.clone(), AstTy::F64));
+                element_sources.push(Some(source_column as u32));
+            }
+        } else {
+            element_params.push((name.clone(), *ty));
+            element_sources.push(None);
+        }
+    }
     let element_typed = TypedAst {
         ast,
         types: typed.types.clone(),
-        params: typed
-            .params
-            .iter()
-            .map(|(name, ty)| {
-                (
-                    name.clone(),
-                    match ty {
-                        AstTy::ArrayF64 => AstTy::F64,
-                        other => *other,
-                    },
-                )
-            })
-            .collect(),
+        params: element_params.clone(),
     };
     let element = crate::lower::lower(&element_typed);
     let induction = ArrayValue(0);
-    let loads = typed
-        .params
+    let loads = column_offsets
         .iter()
         .enumerate()
-        .filter(|(_, (_, ty))| *ty == AstTy::ArrayF64)
-        .enumerate()
-        .map(|(column, (param, _))| {
-            let name = &typed.params[param].0;
-            let offset = column_offsets
+        .map(|(load, (name, offset, synthetic))| {
+            let source_column = typed
+                .params
                 .iter()
-                .find(|(column_name, _)| column_name == name)
-                .map(|(_, offset)| *offset)
-                .ok_or_else(|| format!("missing indexed load for column `{name}`"))?;
+                .position(|(param, ty)| param == name && *ty == AstTy::ArrayF64)
+                .ok_or_else(|| format!("missing indexed column parameter `{name}`"))?;
+            let param = element_params
+                .iter()
+                .position(|(param, _)| param == synthetic)
+                .ok_or_else(|| format!("missing element parameter for load {load}"))?;
             let result = element
                 .insts
                 .iter()
@@ -229,12 +248,12 @@ pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
                     }
                     _ => None,
                 })
-                .ok_or_else(|| format!("missing element parameter for column {column}"))?;
+                .ok_or_else(|| format!("missing element parameter for load {load}"))?;
             Ok(ArrayInst::Load {
                 result,
-                column: column as u32,
+                column: source_column as u32,
                 index: induction,
-                offset,
+                offset: *offset,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -256,20 +275,20 @@ pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
     });
     let function = ArrayFunction {
         element,
-        params: typed
-            .params
+        params: element_params
             .iter()
             .map(|(name, _)| (name.clone(), Ty::F64))
             .collect(),
-        param_kinds: typed
-            .params
+        param_kinds: element_params
             .iter()
-            .map(|(_, ty)| match ty {
-                AstTy::ArrayF64 => ArrayParamKind::Column,
-                AstTy::F64 => ArrayParamKind::ScalarBroadcast,
-                other => panic!("unexpected array parameter type {other:?}"),
+            .zip(element_sources.iter())
+            .map(|((_, ty), source)| match (ty, source) {
+                (AstTy::F64, Some(_)) => ArrayParamKind::Column,
+                (AstTy::F64, None) => ArrayParamKind::ScalarBroadcast,
+                (other, _) => panic!("unexpected array parameter type {other:?}"),
             })
             .collect(),
+        param_sources: element_sources,
         output: typed.output.clone(),
         index: typed.index.clone(),
         blocks: vec![
@@ -305,7 +324,7 @@ fn rewrite_indexed_loads(
     ast: &mut Ast,
     idx: ExprIdx,
     induction_name: &str,
-    column_offsets: &mut Vec<(String, i32)>,
+    column_offsets: &mut Vec<(String, i32, String)>,
 ) -> Result<(), String> {
     match ast.get(idx).clone() {
         Expr::Index { base, index } => {
@@ -316,19 +335,9 @@ fn rewrite_indexed_loads(
             let Expr::Ident(name) = ast.get(base).clone() else {
                 unreachable!()
             };
-            if let Some((_, existing)) = column_offsets
-                .iter()
-                .find(|(column_name, _)| *column_name == name)
-            {
-                if *existing != offset {
-                    return Err(format!(
-                        "column `{name}` is indexed with multiple offsets ({existing} and {offset})"
-                    ));
-                }
-            } else {
-                column_offsets.push((name.clone(), offset));
-            }
-            ast.exprs[idx.index()] = Expr::Ident(name);
+            let synthetic = format!("{name}%array_load_{}", column_offsets.len());
+            column_offsets.push((name, offset, synthetic.clone()));
+            ast.exprs[idx.index()] = Expr::Ident(synthetic);
         }
         Expr::Unary { operand, .. } => {
             rewrite_indexed_loads(ast, operand, induction_name, column_offsets)?
@@ -477,15 +486,12 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(offsets, vec![(0, 2), (1, -1)]);
+        assert_eq!(offsets, vec![(0, 2), (1, -1), (0, 2)]);
     }
 
     #[test]
     fn rejects_dynamic_or_conflicting_index_offsets() {
-        for source in [
-            "@vectorize result[i] = a[i + shift]",
-            "@vectorize result[i] = a[i] + a[i + 1]",
-        ] {
+        for source in ["@vectorize result[i] = a[i + shift]"] {
             let (tokens, lex_diags) = lex(source);
             assert!(lex_diags.is_empty(), "{lex_diags:?}");
             let (program, parse_diags) = parse(&tokens);
