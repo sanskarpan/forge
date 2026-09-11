@@ -1387,16 +1387,21 @@ fallback machinery as the lower-level array API. The implemented addressing
 contract accepts `column[index]` and constant element offsets such as
 `column[index + 2]`, `column[index - 1]`, or `column[2 + index]`. A source
 column may appear at multiple constant offsets; each occurrence is a distinct
-verified element load/parameter mapped to that source column. Dynamic offsets
-remain rejected because they would require a gather operation outside the
-current packed memory contract. The evaluator chooses the maximal shared
+verified element load/parameter mapped to that source column. The evaluator chooses the maximal shared
 valid window: `input_offset = max(0, -min_offset)` and
 `elements = max(0, input_length - input_offset - max(0, max_offset))`.
 Negative offsets therefore skip the necessary leading input rows and positive
 offsets trim the trailing rows; short windows return an empty result. The
 verified array `Load` records the source column and offset, and packed/scalar
-execution applies it with checked address arithmetic. Nested source loops and packed libm calls
-remain outside this language boundary. Broadcast values are supplied
+execution applies it with checked address arithmetic. Dynamic offsets remain
+outside the current language boundary because they require a gather operation
+and a separately defined bounds contract. Unary `sin`, `cos`, `tan`, `exp`, and
+`log`, together with binary `pow`, are supported in packed array expressions by
+a lane-preserving adapter: each active lane uses the same scalar Rust/libm
+operation as the interpreter oracle and the results are repacked into the
+selected vector width. This keeps the surrounding expression packed without
+claiming a non-portable native vector-libm ABI. Nested source loops remain
+outside this language boundary. Broadcast values are supplied
 separately from columns and are splat directly into packed lanes without
 constructing repeated input arrays.
 
