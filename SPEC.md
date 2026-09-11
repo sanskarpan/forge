@@ -1376,6 +1376,18 @@ host where another packed width is available. The public entry points are
 `evaluate_array_with_features` and `reduce_sum_with_features` in
 `forge-simd`.
 
+The source-level array entry point is `@vectorize output[index] = expression`.
+`forge-syntax` parses indexed f64 column references,
+`forge-runtime::lower_array_source` produces a verified
+`forge_ir::array::ArrayFunction`, and
+`forge-simd::evaluate_vectorized_with_features` executes its explicit
+induction/header/body/exit loop using the same packed width selection,
+scalar-epilogue, AVX-512 masked-tail, and exact scalar fallback machinery as
+the lower-level array API. The implemented addressing contract is the
+canonical `column[index]` form; arbitrary pointer offsets, nested source loops,
+packed libm calls, and scalar broadcast parameters remain outside this
+language boundary.
+
 ### Vectorizer
 
 The current packed implementation supports SSE2, SSE4.1, AVX2, AVX-512F, and NEON
@@ -1400,8 +1412,10 @@ instruction; NEON uses its native FRINT operations. SSE4.1, AVX2, and AVX-512F
 implement ties-away-from-zero `round` exactly with packed absolute-value,
 offset, floor, and sign-restoration operations, preserving original NaN
 payloads. SSE2-only and unsupported x86 widths use the scalar interpreter's
-exact result. Loops, libm calls, and
-general array-mode memory IR remain scalar fallback scope.
+exact result. The canonical source-level array form is backed by explicit
+array memory IR; unsupported packed operations, including libm calls, use the
+scalar element fallback. Nested source loops and arbitrary memory addressing
+remain future language extensions.
 
 ```rust
 /// A pure expression over element i becomes a lane-wise dataflow graph:
