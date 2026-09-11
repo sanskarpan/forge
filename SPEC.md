@@ -129,7 +129,7 @@ Deliberately minimal: `f64`, `i64`, `bool`, plus `vec<f64, N>` / `vec<i64, N>` i
 
 `sqrt` `abs` `min` `max` `floor` `ceil` `round` `trunc` `sin` `cos` `tan` `exp` `log` `pow` `fma`
 
-- `sqrt`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `trunc` → **single instructions** (`vsqrtsd`, `vandpd`, `vminsd`, `vroundsd`)
+- `sqrt`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `trunc` → **single instructions** (`vsqrtsd`, `vandpd`, `vminsd`, `vroundsd`). In array mode, AVX2 and AVX-512F use packed floor/ceil/trunc instructions and AArch64 uses FRINTM/FRINTP/FRINTZ/FRINTA; x86 ties-away-from-zero `round` remains an exact scalar fallback because packed nearest-even is not Forge-equivalent.
 - `sin`, `cos`, `exp`, `log`, `pow` → **calls into libm**, which forces the project to handle a real call sequence: caller-saved spilling, stack alignment, and the difference between the System V and Win64 ABIs
 - floating-point `%` → an exact process-local `fmod` call on native x86-64 and AArch64; WASM artifact emission rejects it because the WASM scalar instruction set has no `f64.rem` opcode
 - `fma` → scalar `vfmadd231sd` when x86 FMA3 is available; on x86 without FMA3 the runtime uses the interpreter fallback so the result remains exact relative to Forge's defined semantics. Packed AVX2+FMA and AVX-512F+FMA use the corresponding vector instructions; AVX-512F array tails use k-masked zeroing loads/stores; AArch64 has native `fmadd` and scalar FRINTM/FRINTP/FRINTA/FRINTZ paths for `floor`, `ceil`, Rust-compatible ties-away-from-zero `round`, and `trunc`. Stable EVEX byte forms are encoded separately and round-trip tested.
@@ -1394,8 +1394,12 @@ AVX-512F uses an exact lane helper because its native minimum/maximum
 instructions have different NaN behavior. The separate EVEX byte encoders
 remain round-trip tested; the runtime AVX-512F path is implemented in
 `forge-simd` because the packed evaluator operates on runtime-detected CPU
-features rather than compile-time target-feature specialization. Loops,
-libm calls, and general array-mode memory IR remain scalar fallback scope.
+features rather than compile-time target-feature specialization. Packed
+floor/ceil/trunc use the corresponding AVX2 or AVX-512F rounding instruction;
+NEON uses its native FRINT operations. Since x86 packed nearest rounding is
+ties-to-even, `round` is rejected by the packed evaluator on x86 and uses the
+scalar interpreter's ties-away-from-zero result. Loops, libm calls, and
+general array-mode memory IR remain scalar fallback scope.
 
 ```rust
 /// A pure expression over element i becomes a lane-wise dataflow graph:
