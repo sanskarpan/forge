@@ -490,21 +490,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dynamic_or_conflicting_index_offsets() {
-        for source in ["@vectorize result[i] = a[i + shift]"] {
-            let (tokens, lex_diags) = lex(source);
-            assert!(lex_diags.is_empty(), "{lex_diags:?}");
-            let (program, parse_diags) = parse(&tokens);
-            assert!(parse_diags.is_empty(), "{parse_diags:?}");
-            let Some(program) = program else {
-                panic!("array parser rejected {source}");
-            };
-            if let Ok(typed) = typecheck_array(program) {
-                assert!(
-                    lower_array(&typed).is_err(),
-                    "expected rejection for {source}"
-                );
-            }
+    fn rejects_dynamic_index_offsets() {
+        let source = "@vectorize result[i] = a[i + shift]";
+        let (tokens, lex_diags) = lex(source);
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (program, parse_diags) = parse(&tokens);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let Some(program) = program else {
+            panic!("array parser rejected {source}");
+        };
+        if let Ok(typed) = typecheck_array(program) {
+            assert!(
+                lower_array(&typed).is_err(),
+                "expected rejection for {source}"
+            );
         }
     }
 }
