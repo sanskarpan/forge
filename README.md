@@ -51,16 +51,21 @@ and [docs/PLATFORMS.md](docs/PLATFORMS.md) for the implementation details.
 
 ## Scope notes
 
-The full AArch64 expression backend and general array-mode memory/loop IR
-remain explicit scope boundaries; pure acyclic structured conditionals are
-already handled by the packed evaluator with lane masks and predicated
-selects. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
+The documented source-level array form is now available end to end:
+`@vectorize result[i] = a[i] * b[i] + c[i]` parses indexed f64 columns,
+lowers to verified array loop/memory IR, and executes through the packed
+evaluator with scalar epilogues and exact fallback. The full AArch64
+expression backend remains an explicit scope boundary; pure acyclic
+structured conditionals are already handled by the packed evaluator with lane
+masks and predicated selects. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
 AVX-512F, and NEON where their rounding semantics are exact; SSE4.1 width-2,
 AVX2, and AVX-512F implement ties-away-from-zero `round` with exact packed
 sequences, while SSE2-only and unsupported x86 widths use the scalar
 interpreter fallback. Array
-callers can use `evaluate_array_with_features` or
-`reduce_sum_with_features` to apply a host-safe SIMD feature mask; the scalar
+callers can use `evaluate_array_with_features`,
+`evaluate_vectorized_with_features`, or `reduce_sum_with_features` to apply a
+host-safe SIMD feature mask; `evaluate_vectorized` is the convenience entry
+point without an explicit mask. The scalar
 mask forces the exact interpreter fallback. The tested wasm-bindgen artifact/benchmark API
 and React workbench are available; the browser executes real WASM artifacts
 and receives serialized x86-64/AArch64 inspection artifacts for supported
