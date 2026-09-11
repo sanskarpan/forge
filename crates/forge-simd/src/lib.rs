@@ -1,5 +1,6 @@
 //! Runtime SIMD capability selection shared by native front ends.
 
+use forge_ir::array::ArrayParamKind;
 use forge_ir::{CmpOp, Function, Inst, Terminator, Ty, Value};
 
 /// The typed, lane-wise IR consumed by the packed evaluator. Values reuse the
@@ -528,6 +529,21 @@ pub struct ReductionResult {
     pub used_packed_backend: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ArrayInput<'a> {
+    Column(&'a [f64]),
+    Scalar(f64),
+}
+
+impl ArrayInput<'_> {
+    fn value_at(self, index: usize) -> f64 {
+        match self {
+            Self::Column(column) => column[index],
+            Self::Scalar(value) => value,
+        }
+    }
+}
+
 fn prepare_array(
     source: &str,
     columns: &[&[f64]],
@@ -577,12 +593,17 @@ pub fn evaluate_array_with_features(
 ) -> Result<ArrayResult, String> {
     let features = requested.supported_by_host();
     let (function, plan) = prepare_array(source, columns, features)?;
-    evaluate_lowered_array_with_features(&function, columns, plan, features)
+    let inputs = columns
+        .iter()
+        .copied()
+        .map(ArrayInput::Column)
+        .collect::<Vec<_>>();
+    evaluate_lowered_array_with_features(&function, &inputs, plan, features)
 }
 
 fn evaluate_lowered_array_with_features(
     function: &Function,
-    columns: &[&[f64]],
+    inputs: &[ArrayInput<'_>],
     plan: ArrayPlan,
     features: CpuFeatures,
 ) -> Result<ArrayResult, String> {
@@ -590,13 +611,13 @@ fn evaluate_lowered_array_with_features(
     if plan.width != SimdWidth::Scalar {
         let mut values = Vec::with_capacity(elements);
         let lanes = plan.width.lanes();
-        if let Some(chunks) = try_evaluate_packed_loop(function, columns, plan, features) {
+        if let Some(chunks) = try_evaluate_packed_loop(function, inputs, plan, features) {
             let mut used_packed = plan.full_chunks > 0;
             values.extend(chunks);
             if plan.tail > 0 {
                 if let Some(tail) = try_evaluate_packed_tail(
                     function,
-                    columns,
+                    inputs,
                     plan.full_chunks * lanes,
                     plan.width,
                     plan.tail,
@@ -606,9 +627,9 @@ fn evaluate_lowered_array_with_features(
                     used_packed = true;
                 } else {
                     for index in plan.full_chunks * lanes..elements {
-                        let args = columns
+                        let args = inputs
                             .iter()
-                            .map(|column| column[index])
+                            .map(|input| input.value_at(index))
                             .collect::<Vec<_>>();
                         values.push(evaluate_scalar_function(function, &args)?);
                     }
@@ -626,9 +647,9 @@ fn evaluate_lowered_array_with_features(
 
     let mut values = Vec::with_capacity(elements);
     for index in 0..elements {
-        let args = columns
+        let args = inputs
             .iter()
-            .map(|column| column[index])
+            .map(|input| input.value_at(index))
             .collect::<Vec<_>>();
         values.push(evaluate_scalar_function(function, &args)?);
     }
@@ -671,25 +692,73 @@ pub fn evaluate_vectorized_with_features(
     columns: &[&[f64]],
     requested: CpuFeatures,
 ) -> Result<ArrayResult, String> {
+    evaluate_vectorized_with_broadcasts_and_features(source, columns, &[], requested)
+}
+
+/// Evaluates a source-level vectorized expression with scalar f64 broadcasts.
+/// `columns` and `broadcasts` follow the declaration order of indexed and
+/// unindexed parameters respectively. Broadcasts are splatted directly into
+/// packed registers; no repeated input column is materialized.
+pub fn evaluate_vectorized_with_broadcasts(
+    source: &str,
+    columns: &[&[f64]],
+    broadcasts: &[f64],
+) -> Result<ArrayResult, String> {
+    evaluate_vectorized_with_broadcasts_and_features(
+        source,
+        columns,
+        broadcasts,
+        CpuFeatures::detect(),
+    )
+}
+
+/// Feature-masked form of [`evaluate_vectorized_with_broadcasts`].
+pub fn evaluate_vectorized_with_broadcasts_and_features(
+    source: &str,
+    columns: &[&[f64]],
+    broadcasts: &[f64],
+    requested: CpuFeatures,
+) -> Result<ArrayResult, String> {
     let array_function =
         forge_runtime::lower_array_source(source).map_err(|error| error.to_string())?;
-    if array_function.params.len() != columns.len()
-        || columns.iter().any(|column| {
-            columns
-                .first()
-                .is_some_and(|first| first.len() != column.len())
-        })
-    {
-        return Err(
-            "vectorized columns must match the indexed input signature and length".to_string(),
-        );
+    let column_count = array_function
+        .param_kinds
+        .iter()
+        .filter(|kind| **kind == ArrayParamKind::Column)
+        .count();
+    let broadcast_count = array_function
+        .param_kinds
+        .iter()
+        .filter(|kind| **kind == ArrayParamKind::ScalarBroadcast)
+        .count();
+    if column_count != columns.len() || broadcast_count != broadcasts.len() {
+        return Err("vectorized columns and broadcasts must match the input signature".to_string());
     }
+    let elements = columns.first().map_or(0, |column| column.len());
+    if columns.iter().any(|column| column.len() != elements) {
+        return Err("vectorized columns must have equal lengths".to_string());
+    }
+    let mut column = 0usize;
+    let mut broadcast = 0usize;
+    let inputs = array_function
+        .param_kinds
+        .iter()
+        .map(|kind| match kind {
+            ArrayParamKind::Column => {
+                let input = ArrayInput::Column(columns[column]);
+                column += 1;
+                input
+            }
+            ArrayParamKind::ScalarBroadcast => {
+                let input = ArrayInput::Scalar(broadcasts[broadcast]);
+                broadcast += 1;
+                input
+            }
+        })
+        .collect::<Vec<_>>();
     let features = requested.supported_by_host();
-    let plan = ArrayPlan::for_len_with_features(
-        columns.first().map_or(0, |column| column.len()),
-        features,
-    );
-    evaluate_lowered_array_with_features(&array_function.element, columns, plan, features)
+    let plan = ArrayPlan::for_len_with_features(elements, features);
+    evaluate_lowered_array_with_features(&array_function.element, &inputs, plan, features)
 }
 
 /// Reduces the per-row results of a pure all-f64 expression in source order.
@@ -710,15 +779,20 @@ pub fn reduce_sum_with_features(
 ) -> Result<ReductionResult, String> {
     let features = requested.supported_by_host();
     let (function, plan) = prepare_array(source, columns, features)?;
+    let inputs = columns
+        .iter()
+        .copied()
+        .map(ArrayInput::Column)
+        .collect::<Vec<_>>();
     if plan.width != SimdWidth::Scalar {
         let lanes = plan.width.lanes();
-        if let Some(chunks) = try_evaluate_packed_loop(&function, columns, plan, features) {
+        if let Some(chunks) = try_evaluate_packed_loop(&function, &inputs, plan, features) {
             let mut used_packed = plan.full_chunks > 0;
             let mut values = chunks;
             if plan.tail > 0 {
                 if let Some(tail) = try_evaluate_packed_tail(
                     &function,
-                    columns,
+                    &inputs,
                     plan.full_chunks * lanes,
                     plan.width,
                     plan.tail,
@@ -825,7 +899,7 @@ fn get_packed<V: PackedOps>(values: &[Option<V::Vector>], value: Value) -> Resul
 
 unsafe fn evaluate_packed_loop<V: PackedOps>(
     function: &Function,
-    columns: &[&[f64]],
+    inputs: &[ArrayInput<'_>],
     plan: ArrayPlan,
 ) -> Result<Vec<f64>, ()> {
     let vector_loop =
@@ -844,7 +918,7 @@ unsafe fn evaluate_packed_loop<V: PackedOps>(
         values.extend(evaluate_vector_function::<V>(
             function,
             &vector_loop.body,
-            columns,
+            inputs,
             start,
             vector_loop.lanes as usize,
         )?);
@@ -855,7 +929,7 @@ unsafe fn evaluate_packed_loop<V: PackedOps>(
 #[cfg(target_arch = "x86_64")]
 unsafe fn evaluate_packed_with_active<V: PackedOps>(
     function: &Function,
-    columns: &[&[f64]],
+    inputs: &[ArrayInput<'_>],
     start: usize,
     active: usize,
 ) -> Result<Vec<f64>, ()> {
@@ -863,13 +937,13 @@ unsafe fn evaluate_packed_with_active<V: PackedOps>(
         return Err(());
     }
     let vector = lower_f64_vector(function, V::LANES as u8).map_err(|_| ())?;
-    evaluate_vector_function::<V>(function, &vector, columns, start, active)
+    evaluate_vector_function::<V>(function, &vector, inputs, start, active)
 }
 
 unsafe fn evaluate_vector_function<V: PackedOps>(
     function: &Function,
     vector: &VectorFunction,
-    columns: &[&[f64]],
+    inputs: &[ArrayInput<'_>],
     start: usize,
     active: usize,
 ) -> Result<Vec<f64>, ()> {
@@ -883,13 +957,15 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
     for &(value, inst) in &vector.insts {
         let result = match inst {
             VectorInst::SplatF64(bits) => V::splat(f64::from_bits(bits)),
-            VectorInst::Param { index } => {
-                let column = columns.get(index as usize).ok_or(())?;
-                if start.checked_add(active).ok_or(())? > column.len() {
-                    return Err(());
+            VectorInst::Param { index } => match inputs.get(index as usize).ok_or(())? {
+                ArrayInput::Column(column) => {
+                    if start.checked_add(active).ok_or(())? > column.len() {
+                        return Err(());
+                    }
+                    V::load_masked(column[start..].as_ptr(), active)?
                 }
-                V::load_masked(column[start..].as_ptr(), active)?
-            }
+                ArrayInput::Scalar(value) => V::splat(*value),
+            },
             VectorInst::VecLoad {
                 base,
                 offset,
@@ -909,7 +985,9 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
                         .checked_sub(offset.unsigned_abs() as usize)
                         .ok_or(())?
                 };
-                let column = columns.get(*index as usize).ok_or(())?;
+                let ArrayInput::Column(column) = inputs.get(*index as usize).ok_or(())? else {
+                    return Err(());
+                };
                 if begin.checked_add(active).ok_or(())? > column.len() {
                     return Err(());
                 }
@@ -997,7 +1075,7 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
 
 fn try_evaluate_packed_loop(
     function: &Function,
-    columns: &[&[f64]],
+    inputs: &[ArrayInput<'_>],
     plan: ArrayPlan,
     features: CpuFeatures,
 ) -> Option<Vec<f64>> {
@@ -1008,7 +1086,7 @@ fn try_evaluate_packed_loop(
         && std::is_x86_feature_detected!("avx512f")
     {
         // SAFETY: runtime feature detection proves AVX-512F is available.
-        return unsafe { evaluate_packed_loop::<x86_packed::Avx512>(function, columns, plan) }.ok();
+        return unsafe { evaluate_packed_loop::<x86_packed::Avx512>(function, inputs, plan) }.ok();
     }
     #[cfg(target_arch = "x86_64")]
     if plan.width == SimdWidth::F64x4 && features.avx2 && std::is_x86_feature_detected!("avx2") {
@@ -1018,50 +1096,50 @@ fn try_evaluate_packed_loop(
             if !features.fma || !std::is_x86_feature_detected!("fma") {
                 return None;
             }
-            return unsafe { evaluate_packed_loop::<x86_packed::Avx2Fma>(function, columns, plan) }
+            return unsafe { evaluate_packed_loop::<x86_packed::Avx2Fma>(function, inputs, plan) }
                 .ok();
         }
-        return unsafe { evaluate_packed_loop::<x86_packed::Avx2>(function, columns, plan) }.ok();
+        return unsafe { evaluate_packed_loop::<x86_packed::Avx2>(function, inputs, plan) }.ok();
     }
     #[cfg(target_arch = "x86_64")]
     if plan.width == SimdWidth::F64x2 && features.sse2 && std::is_x86_feature_detected!("sse2") {
         if features.sse41 && std::is_x86_feature_detected!("sse4.1") {
             // SAFETY: SSE4.1 is guaranteed by the runtime check and lane
             // ranges were checked inside evaluate_packed.
-            return unsafe { evaluate_packed_loop::<x86_packed::Sse41>(function, columns, plan) }
+            return unsafe { evaluate_packed_loop::<x86_packed::Sse41>(function, inputs, plan) }
                 .ok();
         }
         // SAFETY: SSE2 is guaranteed by the runtime check and lane ranges
         // were checked inside evaluate_packed. SSE2 remains the scalar
         // fallback for operations, such as ties-away-from-zero round, that
         // do not have the required packed primitive.
-        return unsafe { evaluate_packed_loop::<x86_packed::Sse2>(function, columns, plan) }.ok();
+        return unsafe { evaluate_packed_loop::<x86_packed::Sse2>(function, inputs, plan) }.ok();
     }
     #[cfg(target_arch = "aarch64")]
     if plan.width == SimdWidth::F64x2 && features.neon {
         // AArch64 always provides the NEON register set used here.
-        return unsafe { evaluate_packed_loop::<neon_packed::Neon>(function, columns, plan) }.ok();
+        return unsafe { evaluate_packed_loop::<neon_packed::Neon>(function, inputs, plan) }.ok();
     }
     None
 }
 
 fn try_evaluate_packed_tail(
     function: &Function,
-    columns: &[&[f64]],
+    inputs: &[ArrayInput<'_>],
     start: usize,
     width: SimdWidth,
     active: usize,
     features: CpuFeatures,
 ) -> Option<Vec<f64>> {
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (function, columns, start, width, active, features);
+    let _ = (function, inputs, start, width, active, features);
 
     #[cfg(target_arch = "x86_64")]
     if width == SimdWidth::F64x8 && features.avx512f && std::is_x86_feature_detected!("avx512f") {
         // SAFETY: AVX-512F is runtime-gated and the masked load/store only
         // accesses the `active` elements that remain in each input column.
         return unsafe {
-            evaluate_packed_with_active::<x86_packed::Avx512>(function, columns, start, active)
+            evaluate_packed_with_active::<x86_packed::Avx512>(function, inputs, start, active)
         }
         .ok();
     }
@@ -2516,6 +2594,49 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn source_vectorize_broadcasts_scalars_without_repeated_columns() {
+        let values = (0..100)
+            .map(|index| index as f64 - 37.5)
+            .collect::<Vec<_>>();
+        for length in 1..=100 {
+            let vectorized = evaluate_vectorized_with_broadcasts(
+                "@vectorize result[i] = a[i] * scale + bias",
+                &[&values[..length]],
+                &[1.25, -0.5],
+            )
+            .unwrap();
+            let scalar = evaluate_vectorized_with_broadcasts_and_features(
+                "@vectorize result[i] = a[i] * scale + bias",
+                &[&values[..length]],
+                &[1.25, -0.5],
+                CpuFeatures::scalar(),
+            )
+            .unwrap();
+            assert_eq!(
+                vectorized
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                scalar
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "broadcast mismatch for length {length}"
+            );
+            assert_eq!(vectorized.plan.elements, length);
+        }
+    }
+
+    #[test]
+    fn source_vectorize_requires_the_declared_broadcast_values() {
+        let error =
+            evaluate_vectorized("@vectorize result[i] = a[i] + scale", &[&[1.0, 2.0]]).unwrap_err();
+        assert!(error.contains("columns and broadcasts"), "{error}");
     }
 
     #[test]

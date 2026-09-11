@@ -1377,16 +1377,17 @@ host where another packed width is available. The public entry points are
 `forge-simd`.
 
 The source-level array entry point is `@vectorize output[index] = expression`.
-`forge-syntax` parses indexed f64 column references,
-`forge-runtime::lower_array_source` produces a verified
-`forge_ir::array::ArrayFunction`, and
-`forge-simd::evaluate_vectorized_with_features` executes its explicit
-induction/header/body/exit loop using the same packed width selection,
-scalar-epilogue, AVX-512 masked-tail, and exact scalar fallback machinery as
-the lower-level array API. The implemented addressing contract is the
-canonical `column[index]` form; arbitrary pointer offsets, nested source loops,
-packed libm calls, and scalar broadcast parameters remain outside this
-language boundary.
+`forge-syntax` parses indexed f64 column references and unindexed f64 scalar
+broadcasts, `forge-runtime::lower_array_source` produces a verified
+`forge_ir::array::ArrayFunction` with explicit column/broadcast parameter
+metadata, and `forge-simd::evaluate_vectorized_with_broadcasts_and_features`
+executes its explicit induction/header/body/exit loop using the same packed
+width selection, scalar-epilogue, AVX-512 masked-tail, and exact scalar
+fallback machinery as the lower-level array API. The implemented addressing
+contract is the canonical `column[index]` form; arbitrary pointer offsets,
+nested source loops, and packed libm calls remain outside this language
+boundary. Broadcast values are supplied separately from columns and are
+splat directly into packed lanes without constructing repeated input arrays.
 
 ### Vectorizer
 
