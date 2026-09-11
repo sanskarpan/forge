@@ -62,7 +62,9 @@ pub fn typecheck(ast: Ast) -> Result<TypedAst, Vec<Diagnostic>> {
 /// Type-checks the body of a parsed `@vectorize` declaration. Array columns
 /// are represented as `ArrayF64` until array lowering turns each indexed load
 /// into the current element's scalar f64 parameter. The induction variable is
-/// a local i64 and is intentionally not exposed as a runtime parameter.
+/// a local i64 and is intentionally not exposed as a runtime parameter. An
+/// i64 free parameter is allowed only when it contributes to an indexed-load
+/// offset; the array runtime supplies that value as a loop-invariant scalar.
 pub fn typecheck_array(program: crate::array::ArrayProgram) -> Result<TypedArray, Vec<Diagnostic>> {
     let ast = crate::resolve::resolve(program.body);
     let mut ctx = Ctx {
@@ -84,13 +86,14 @@ pub fn typecheck_array(program: crate::array::ArrayProgram) -> Result<TypedArray
             "invalid vectorized result type",
         ));
     }
-    if ctx
-        .param_ty
-        .values()
-        .any(|ty| !matches!(ty, Ty::ArrayF64 | Ty::F64))
-    {
+    let mut indexed_i64_params = FxHashMap::default();
+    collect_index_i64_params(&ast, ast.root, &ctx.param_ty, &mut indexed_i64_params);
+    if ctx.param_ty.iter().any(|(name, ty)| {
+        !matches!(ty, Ty::ArrayF64 | Ty::F64 | Ty::I64)
+            || (*ty == Ty::I64 && !indexed_i64_params.contains_key(name))
+    }) {
         ctx.diags.push(Diagnostic::error(
-            "vectorized bodies accept indexed f64 columns and unindexed f64 broadcasts",
+            "vectorized bodies accept indexed f64 columns, i64 index offsets, and unindexed f64 broadcasts",
             ast.span(ast.root),
             "expected every parameter to be an f64 column or broadcast",
         ));
@@ -113,6 +116,78 @@ pub fn typecheck_array(program: crate::array::ArrayProgram) -> Result<TypedArray
         })
     } else {
         Err(diags)
+    }
+}
+
+fn collect_index_i64_params(
+    ast: &Ast,
+    idx: ExprIdx,
+    params: &FxHashMap<String, Ty>,
+    found: &mut FxHashMap<String, ()>,
+) {
+    match ast.get(idx) {
+        Expr::Index { base, index } => {
+            collect_index_i64_params(ast, *base, params, found);
+            collect_index_i64_params(ast, *index, params, found);
+            collect_i64_idents(ast, *index, params, found);
+        }
+        Expr::Unary { operand, .. } => collect_index_i64_params(ast, *operand, params, found),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_index_i64_params(ast, *lhs, params, found);
+            collect_index_i64_params(ast, *rhs, params, found);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_index_i64_params(ast, *arg, params, found);
+            }
+        }
+        Expr::If { cond, then_, else_ } => {
+            collect_index_i64_params(ast, *cond, params, found);
+            collect_index_i64_params(ast, *then_, params, found);
+            collect_index_i64_params(ast, *else_, params, found);
+        }
+        Expr::Let { value, body, .. } => {
+            collect_index_i64_params(ast, *value, params, found);
+            collect_index_i64_params(ast, *body, params, found);
+        }
+        Expr::Float(_) | Expr::Int(_) | Expr::Bool(_) | Expr::Ident(_) => {}
+    }
+}
+
+fn collect_i64_idents(
+    ast: &Ast,
+    idx: ExprIdx,
+    params: &FxHashMap<String, Ty>,
+    found: &mut FxHashMap<String, ()>,
+) {
+    match ast.get(idx) {
+        Expr::Ident(name) if params.get(name) == Some(&Ty::I64) => {
+            found.insert(name.clone(), ());
+        }
+        Expr::Unary { operand, .. } => collect_i64_idents(ast, *operand, params, found),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_i64_idents(ast, *lhs, params, found);
+            collect_i64_idents(ast, *rhs, params, found);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_i64_idents(ast, *arg, params, found);
+            }
+        }
+        Expr::Index { base, index } => {
+            collect_i64_idents(ast, *base, params, found);
+            collect_i64_idents(ast, *index, params, found);
+        }
+        Expr::If { cond, then_, else_ } => {
+            collect_i64_idents(ast, *cond, params, found);
+            collect_i64_idents(ast, *then_, params, found);
+            collect_i64_idents(ast, *else_, params, found);
+        }
+        Expr::Let { value, body, .. } => {
+            collect_i64_idents(ast, *value, params, found);
+            collect_i64_idents(ast, *body, params, found);
+        }
+        Expr::Float(_) | Expr::Int(_) | Expr::Bool(_) | Expr::Ident(_) => {}
     }
 }
 
@@ -472,6 +547,22 @@ mod tests {
         assert!(err
             .iter()
             .any(|diagnostic| diagnostic.message.contains("unindexed f64 broadcasts")));
+    }
+
+    #[test]
+    fn vectorized_body_accepts_an_i64_index_offset() {
+        let (tokens, lex_diags) = lex("@vectorize result[i] = a[i + shift]");
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (program, parse_diags) = crate::array::parse(&tokens);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let typed = typecheck_array(program.expect("vector program")).unwrap();
+        assert_eq!(
+            typed.params,
+            vec![
+                ("a".to_string(), Ty::ArrayF64),
+                ("shift".to_string(), Ty::I64)
+            ]
+        );
     }
 
     #[test]

@@ -65,8 +65,13 @@ the largest shared in-bounds window: negative offsets skip leading rows,
 positive offsets trim trailing rows, and a window too short for the requested
 offsets returns an empty result. The same column may be used at multiple
 constant offsets, including stencil-style expressions such as
-`a[i - 1] + a[i] + a[i + 1]`. Dynamic offsets remain rejected explicitly
-because they require a gather operation. Array expressions containing
+`a[i - 1] + a[i] + a[i + 1]`. Loop-invariant dynamic scalar offsets such as
+`a[i + shift]` are supported through
+`evaluate_vectorized_with_typed_broadcasts` with an `RtValue::I64`; the runtime
+materializes the call-time offset into the same checked constant-offset window.
+The f64-only broadcast APIs continue to reject these sources because their ABI
+cannot carry an i64 value. Per-row array-valued indices and other genuinely
+non-contiguous gathers remain outside the current language. Array expressions containing
 `sin`, `cos`, `tan`, `exp`, `log`, or `pow` retain packed execution through a
 lane-preserving libm adapter that applies the interpreter's scalar operation to
 each active lane and repacks the exact results. The full AArch64

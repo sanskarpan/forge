@@ -12,6 +12,9 @@ pub enum VectorInst {
     Param {
         index: u32,
     },
+    Broadcast {
+        index: u32,
+    },
     Move(Value),
     Add(Value, Value),
     Sub(Value, Value),
@@ -121,11 +124,24 @@ fn lower_f64_vector_with_param_offsets(
     lanes: u8,
     param_offsets: &[i32],
 ) -> Result<VectorFunction, String> {
+    let scalar_params = vec![false; function.params.len()];
+    lower_f64_vector_with_param_offsets_and_kinds(function, lanes, param_offsets, &scalar_params)
+}
+
+fn lower_f64_vector_with_param_offsets_and_kinds(
+    function: &Function,
+    lanes: u8,
+    param_offsets: &[i32],
+    scalar_params: &[bool],
+) -> Result<VectorFunction, String> {
     if !matches!(lanes, 2 | 4 | 8) {
         return Err(format!("unsupported f64 vector width: {lanes}"));
     }
     if param_offsets.len() != function.params.len() {
         return Err("vector parameter offsets do not match the function signature".to_string());
+    }
+    if scalar_params.len() != function.params.len() {
+        return Err("vector parameter kinds do not match the function signature".to_string());
     }
     if function.blocks.len() == 1 {
         let block = &function.blocks[0];
@@ -140,7 +156,7 @@ fn lower_f64_vector_with_param_offsets(
                 .ok_or_else(|| format!("block references missing instruction {value:?}"))?;
             insts.push((
                 value,
-                lower_vector_inst(function, value, scalar, lanes, param_offsets)?,
+                lower_vector_inst(function, value, scalar, lanes, param_offsets, scalar_params)?,
             ));
         }
         return Ok(VectorFunction {
@@ -150,7 +166,7 @@ fn lower_f64_vector_with_param_offsets(
         });
     }
 
-    lower_structured_vector(function, lanes, param_offsets)
+    lower_structured_vector(function, lanes, param_offsets, scalar_params)
 }
 
 fn lower_vector_inst(
@@ -159,6 +175,7 @@ fn lower_vector_inst(
     scalar: &Inst,
     lanes: u8,
     param_offsets: &[i32],
+    scalar_params: &[bool],
 ) -> Result<VectorInst, String> {
     let result_ty = function
         .types
@@ -170,6 +187,9 @@ fn lower_vector_inst(
         Inst::ConstI64(number) => VectorInst::SplatF64((*number as f64).to_bits()),
         Inst::ConstBool(value) => {
             VectorInst::SplatF64((if *value { 1.0f64 } else { 0.0f64 }).to_bits())
+        }
+        Inst::Param { index, ty: Ty::F64 } if scalar_params[*index as usize] => {
+            VectorInst::Broadcast { index: *index }
         }
         Inst::Param { index, ty: Ty::F64 } => VectorInst::VecLoad {
             base: value,
@@ -278,6 +298,7 @@ fn lower_structured_vector(
     function: &Function,
     lanes: u8,
     param_offsets: &[i32],
+    scalar_params: &[bool],
 ) -> Result<VectorFunction, String> {
     let order = reachable_blocks(function)?;
     let mut insts = Vec::new();
@@ -349,7 +370,14 @@ fn lower_structured_vector(
             } else {
                 insts.push((
                     value,
-                    lower_vector_inst(function, value, scalar, lanes, param_offsets)?,
+                    lower_vector_inst(
+                        function,
+                        value,
+                        scalar,
+                        lanes,
+                        param_offsets,
+                        scalar_params,
+                    )?,
                 ));
             }
         }
@@ -842,7 +870,7 @@ pub fn evaluate_vectorized_with_broadcasts_and_features(
         param_offsets[*index as usize] = *offset;
     }
     let (min_offset, max_offset) = array_load_offset_bounds(&array_function)?;
-    let input_offset = min_offset.unsigned_abs() as usize;
+    let input_offset = min_offset.min(0).unsigned_abs() as usize;
     let trim = input_offset
         .checked_add(max_offset.max(0) as usize)
         .ok_or_else(|| "vectorized load window is too large".to_string())?;
@@ -855,6 +883,120 @@ pub fn evaluate_vectorized_with_broadcasts_and_features(
         features,
         &param_offsets,
     )
+}
+
+/// Evaluates a source-level vectorized expression with typed loop-invariant
+/// broadcasts. f64 values are ordinary scalar broadcasts; i64 values may be
+/// used by indexed loads such as `a[i + shift]`. Because every free parameter
+/// is invariant across the row loop, dynamic scalar offsets are materialized
+/// into the checked constant-offset form before packed lowering. This keeps
+/// the packed evaluator's memory accesses contiguous and gives dynamic
+/// offsets the same shared-window and empty-result bounds contract.
+pub fn evaluate_vectorized_with_typed_broadcasts(
+    source: &str,
+    columns: &[&[f64]],
+    broadcasts: &[forge_ir::interp::RtValue],
+) -> Result<ArrayResult, String> {
+    evaluate_vectorized_with_typed_broadcasts_and_features(
+        source,
+        columns,
+        broadcasts,
+        CpuFeatures::detect(),
+    )
+}
+
+/// Feature-masked form of [`evaluate_vectorized_with_typed_broadcasts`].
+/// Requested features are intersected with the host capabilities after the
+/// dynamic scalar offsets have been validated and materialized.
+pub fn evaluate_vectorized_with_typed_broadcasts_and_features(
+    source: &str,
+    columns: &[&[f64]],
+    broadcasts: &[forge_ir::interp::RtValue],
+    requested: CpuFeatures,
+) -> Result<ArrayResult, String> {
+    let typed = parse_typed_array_source(source)?;
+    let mut f64_broadcasts = Vec::new();
+    let mut dynamic_offsets = Vec::new();
+    let mut broadcast = 0usize;
+    for (name, ty) in &typed.params {
+        match ty {
+            forge_syntax::typeck::Ty::ArrayF64 => {}
+            forge_syntax::typeck::Ty::F64 => {
+                let Some(forge_ir::interp::RtValue::F64(value)) = broadcasts.get(broadcast) else {
+                    return Err(format!("typed broadcast `{name}` must be an f64 value"));
+                };
+                f64_broadcasts.push(*value);
+                broadcast += 1;
+            }
+            forge_syntax::typeck::Ty::I64 => {
+                let Some(forge_ir::interp::RtValue::I64(value)) = broadcasts.get(broadcast) else {
+                    return Err(format!("typed broadcast `{name}` must be an i64 value"));
+                };
+                dynamic_offsets.push((name.clone(), *value));
+                broadcast += 1;
+            }
+            forge_syntax::typeck::Ty::Bool => {
+                return Err(format!(
+                    "typed broadcast `{name}` has unsupported bool type"
+                ));
+            }
+        }
+    }
+    if broadcast != broadcasts.len() {
+        return Err("typed vectorized broadcasts do not match the input signature".to_string());
+    }
+    let materialized = materialize_dynamic_offsets(source, &dynamic_offsets)?;
+    evaluate_vectorized_with_broadcasts_and_features(
+        &materialized,
+        columns,
+        &f64_broadcasts,
+        requested,
+    )
+}
+
+fn parse_typed_array_source(source: &str) -> Result<forge_syntax::typeck::TypedArray, String> {
+    let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
+    if !lex_diags.is_empty() {
+        return Err(format!("lexing failed: {lex_diags:?}"));
+    }
+    let (program, parse_diags) = forge_syntax::array::parse(&tokens);
+    if !parse_diags.is_empty() {
+        return Err(format!("parsing failed: {parse_diags:?}"));
+    }
+    let program = program
+        .ok_or_else(|| "expected @vectorize output[index] = expression declaration".to_string())?;
+    forge_syntax::typeck::typecheck_array(program)
+        .map_err(|diagnostics| format!("type checking failed: {diagnostics:?}"))
+}
+
+fn materialize_dynamic_offsets(source: &str, offsets: &[(String, i64)]) -> Result<String, String> {
+    if offsets.is_empty() {
+        return Ok(source.to_string());
+    }
+    let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
+    if !lex_diags.is_empty() {
+        return Err(format!("lexing failed: {lex_diags:?}"));
+    }
+    let mut materialized = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    for token in tokens {
+        if token.kind != forge_syntax::token::TokenKind::Ident {
+            continue;
+        }
+        let Some((_, value)) = offsets.iter().find(|(name, _)| name == &token.text) else {
+            continue;
+        };
+        let start = token.span.start as usize;
+        let end = token.span.end as usize;
+        if start < cursor || end > source.len() {
+            return Err("dynamic offset token span is outside the source".to_string());
+        }
+        materialized.push_str(&source[cursor..start]);
+        materialized.push_str(&value.to_string());
+        cursor = end;
+    }
+    materialized.push_str(&source[cursor..]);
+    Ok(materialized)
 }
 
 fn array_load_offset_bounds(
@@ -1074,8 +1216,17 @@ unsafe fn evaluate_packed_loop<V: PackedOps>(
 ) -> Result<Vec<f64>, ()> {
     let vector_loop =
         lower_f64_vector_loop(function, V::LANES as u8, plan.elements).map_err(|_| ())?;
-    let vector = lower_f64_vector_with_param_offsets(function, V::LANES as u8, param_offsets)
-        .map_err(|_| ())?;
+    let scalar_params = inputs
+        .iter()
+        .map(|input| matches!(input, ArrayInput::Scalar(_)))
+        .collect::<Vec<_>>();
+    let vector = lower_f64_vector_with_param_offsets_and_kinds(
+        function,
+        V::LANES as u8,
+        param_offsets,
+        &scalar_params,
+    )
+    .map_err(|_| ())?;
     if vector_loop.store.value != vector_loop.body.result
         || vector_loop.store.lanes as usize != V::LANES
     {
@@ -1111,8 +1262,17 @@ unsafe fn evaluate_packed_with_active<V: PackedOps>(
     if active == 0 || active > V::LANES {
         return Err(());
     }
-    let vector = lower_f64_vector_with_param_offsets(function, V::LANES as u8, param_offsets)
-        .map_err(|_| ())?;
+    let scalar_params = inputs
+        .iter()
+        .map(|input| matches!(input, ArrayInput::Scalar(_)))
+        .collect::<Vec<_>>();
+    let vector = lower_f64_vector_with_param_offsets_and_kinds(
+        function,
+        V::LANES as u8,
+        param_offsets,
+        &scalar_params,
+    )
+    .map_err(|_| ())?;
     evaluate_vector_function::<V>(function, &vector, inputs, start, active, input_offset)
 }
 
@@ -1134,6 +1294,12 @@ unsafe fn evaluate_vector_function<V: PackedOps>(
     for &(value, inst) in &vector.insts {
         let result = match inst {
             VectorInst::SplatF64(bits) => V::splat(f64::from_bits(bits)),
+            VectorInst::Broadcast { index } => {
+                let ArrayInput::Scalar(value) = inputs.get(index as usize).ok_or(())? else {
+                    return Err(());
+                };
+                V::splat(*value)
+            }
             VectorInst::Param { index } => match inputs.get(index as usize).ok_or(())? {
                 ArrayInput::Column(column) => {
                     let begin = start.checked_add(input_offset).ok_or(())?;
@@ -3017,9 +3183,74 @@ mod tests {
         let error =
             evaluate_vectorized("@vectorize result[i] = a[i + shift]", &[&[1.0, 2.0]]).unwrap_err();
         assert!(
-            error.contains("constant integer offset") || error.contains("f64 column or broadcast"),
+            error.contains("typed vectorized broadcast entry point"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn source_vectorize_supports_typed_dynamic_offsets() {
+        let values = (0..40).map(|index| index as f64 - 7.0).collect::<Vec<_>>();
+        for shift in [2_i64, 0, -1] {
+            let source = "@vectorize result[i] = a[i + shift] * scale";
+            let packed = evaluate_vectorized_with_typed_broadcasts(
+                source,
+                &[&values],
+                &[
+                    forge_ir::interp::RtValue::I64(shift),
+                    forge_ir::interp::RtValue::F64(1.5),
+                ],
+            )
+            .unwrap();
+            let expected = if shift >= 0 {
+                values[shift as usize..]
+                    .iter()
+                    .map(|value| value * 1.5)
+                    .collect::<Vec<_>>()
+            } else {
+                values[..values.len() - shift.unsigned_abs() as usize]
+                    .iter()
+                    .map(|value| value * 1.5)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                packed
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "dynamic offset mismatch for shift {shift}"
+            );
+            assert_eq!(
+                packed.plan.input_offset,
+                shift.min(0).unsigned_abs() as usize
+            );
+            assert_eq!(
+                packed.values.len(),
+                values.len() - shift.unsigned_abs() as usize
+            );
+            assert_eq!(
+                packed.used_packed_backend,
+                packed.plan.width != SimdWidth::Scalar,
+                "shift {shift}, plan {:?}",
+                packed.plan
+            );
+        }
+    }
+
+    #[test]
+    fn typed_dynamic_offsets_validate_the_broadcast_abi() {
+        let error = evaluate_vectorized_with_typed_broadcasts(
+            "@vectorize result[i] = a[i + shift]",
+            &[&[1.0, 2.0]],
+            &[forge_ir::interp::RtValue::F64(1.0)],
+        )
+        .unwrap_err();
+        assert!(error.contains("must be an i64 value"), "{error}");
     }
 
     #[test]
