@@ -774,10 +774,11 @@ pub fn evaluate_vectorized_with_broadcasts_and_features(
     let array_function =
         forge_runtime::lower_array_source(source).map_err(|error| error.to_string())?;
     let column_count = array_function
-        .param_kinds
+        .param_sources
         .iter()
-        .filter(|kind| **kind == ArrayParamKind::Column)
-        .count();
+        .flatten()
+        .max()
+        .map_or(0, |source| *source as usize + 1);
     let broadcast_count = array_function
         .param_kinds
         .iter()
@@ -790,18 +791,16 @@ pub fn evaluate_vectorized_with_broadcasts_and_features(
     if columns.iter().any(|column| column.len() != input_elements) {
         return Err("vectorized columns must have equal lengths".to_string());
     }
-    let mut column = 0usize;
     let mut broadcast = 0usize;
     let inputs = array_function
-        .param_kinds
+        .param_sources
         .iter()
-        .map(|kind| match kind {
-            ArrayParamKind::Column => {
-                let input = ArrayInput::Column(columns[column]);
-                column += 1;
+        .map(|source| match source {
+            Some(source) => {
+                let input = ArrayInput::Column(columns[*source as usize]);
                 input
             }
-            ArrayParamKind::ScalarBroadcast => {
+            None => {
                 let input = ArrayInput::Scalar(broadcasts[broadcast]);
                 broadcast += 1;
                 input
@@ -809,24 +808,17 @@ pub fn evaluate_vectorized_with_broadcasts_and_features(
         })
         .collect::<Vec<_>>();
     let features = requested.supported_by_host();
-    let loads = array_function.blocks[1]
-        .insts
-        .iter()
-        .filter_map(|inst| match inst {
-            forge_ir::array::ArrayInst::Load { offset, .. } => Some(*offset),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
     let mut param_offsets = vec![0; array_function.params.len()];
-    let mut load = 0usize;
-    for (param, kind) in array_function.param_kinds.iter().enumerate() {
-        if *kind == ArrayParamKind::Column {
-            param_offsets[param] = loads
-                .get(load)
-                .copied()
-                .ok_or_else(|| "array IR is missing a column load offset".to_string())?;
-            load += 1;
-        }
+    for inst in &array_function.blocks[1].insts {
+        let forge_ir::array::ArrayInst::Load { result, offset, .. } = inst else {
+            continue;
+        };
+        let Some(forge_ir::Inst::Param { index, .. }) =
+            array_function.element.insts.get(result.0 as usize)
+        else {
+            return Err("array IR load does not reference an element parameter".to_string());
+        };
+        param_offsets[*index as usize] = *offset;
     }
     let (min_offset, max_offset) = array_load_offset_bounds(&array_function)?;
     let input_offset = min_offset.unsigned_abs() as usize;
@@ -2841,6 +2833,32 @@ mod tests {
             evaluate_vectorized("@vectorize result[i] = a[i + 3]", &[&[1.0, 2.0, 3.0]]).unwrap();
         assert!(empty.values.is_empty());
         assert_eq!(empty.plan.elements, 0);
+    }
+
+    #[test]
+    fn source_vectorize_reuses_a_column_at_multiple_offsets() {
+        let values = (0..64).map(|index| index as f64 - 20.0).collect::<Vec<_>>();
+        let source = "@vectorize result[i] = a[i - 1] + a[i] + a[i + 1]";
+        let packed = evaluate_vectorized(source, &[&values]).unwrap();
+        let scalar =
+            evaluate_vectorized_with_features(source, &[&values], CpuFeatures::scalar()).unwrap();
+        let expected = (0..62)
+            .map(|index| values[index] + values[index + 1] + values[index + 2])
+            .collect::<Vec<_>>();
+        assert_eq!(packed.plan.input_offset, 1);
+        assert_eq!(packed.values.len(), expected.len());
+        assert_eq!(
+            packed
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(packed.values, scalar.values);
     }
 
     #[test]

@@ -63,8 +63,10 @@ materializing repeated arrays. Indexed columns also support constant offsets,
 for example `@vectorize result[i] = a[i + 1] - b[i - 2]`. The evaluator uses
 the largest shared in-bounds window: negative offsets skip leading rows,
 positive offsets trim trailing rows, and a window too short for the requested
-offsets returns an empty result. Dynamic offsets and using different offsets
-for the same column remain rejected explicitly. The full AArch64
+offsets returns an empty result. The same column may be used at multiple
+constant offsets, including stencil-style expressions such as
+`a[i - 1] + a[i] + a[i + 1]`. Dynamic offsets remain rejected explicitly
+because they require a gather operation. The full AArch64
 expression backend remains an explicit scope boundary; pure acyclic
 structured conditionals are already handled by the packed evaluator with lane
 masks and predicated selects. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
