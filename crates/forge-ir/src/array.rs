@@ -198,6 +198,11 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
 /// Unindexed f64 parameters remain scalar broadcasts in the element function
 /// and are not represented by memory loads.
 pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
+    if typed.params.iter().any(|(_, ty)| *ty == AstTy::I64) {
+        return Err(
+            "dynamic array offsets require the typed vectorized broadcast entry point".to_string(),
+        );
+    }
     let mut ast = typed.ast.clone();
     let root = ast.root;
     let mut column_offsets = Vec::new();
