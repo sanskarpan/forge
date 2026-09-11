@@ -577,16 +577,25 @@ pub fn evaluate_array_with_features(
 ) -> Result<ArrayResult, String> {
     let features = requested.supported_by_host();
     let (function, plan) = prepare_array(source, columns, features)?;
+    evaluate_lowered_array_with_features(&function, columns, plan, features)
+}
+
+fn evaluate_lowered_array_with_features(
+    function: &Function,
+    columns: &[&[f64]],
+    plan: ArrayPlan,
+    features: CpuFeatures,
+) -> Result<ArrayResult, String> {
     let elements = plan.elements;
     if plan.width != SimdWidth::Scalar {
         let mut values = Vec::with_capacity(elements);
         let lanes = plan.width.lanes();
-        if let Some(chunks) = try_evaluate_packed_loop(&function, columns, plan, features) {
+        if let Some(chunks) = try_evaluate_packed_loop(function, columns, plan, features) {
             let mut used_packed = plan.full_chunks > 0;
             values.extend(chunks);
             if plan.tail > 0 {
                 if let Some(tail) = try_evaluate_packed_tail(
-                    &function,
+                    function,
                     columns,
                     plan.full_chunks * lanes,
                     plan.width,
@@ -601,7 +610,7 @@ pub fn evaluate_array_with_features(
                             .iter()
                             .map(|column| column[index])
                             .collect::<Vec<_>>();
-                        values.push(evaluate_scalar(source, &args)?);
+                        values.push(evaluate_scalar_function(function, &args)?);
                     }
                 }
             }
@@ -621,13 +630,66 @@ pub fn evaluate_array_with_features(
             .iter()
             .map(|column| column[index])
             .collect::<Vec<_>>();
-        values.push(evaluate_scalar(source, &args)?);
+        values.push(evaluate_scalar_function(function, &args)?);
     }
     Ok(ArrayResult {
         values,
         plan,
         used_packed_backend: false,
     })
+}
+
+fn evaluate_scalar_function(function: &Function, args: &[f64]) -> Result<f64, String> {
+    if function.params.len() != args.len() || function.params.iter().any(|(_, ty)| *ty != Ty::F64) {
+        return Err("array element function requires all-f64 parameters".to_string());
+    }
+    match forge_ir::interp::interpret(
+        function,
+        &args
+            .iter()
+            .copied()
+            .map(forge_ir::interp::RtValue::F64)
+            .collect::<Vec<_>>(),
+    ) {
+        forge_ir::interp::RtValue::F64(value) => Ok(value),
+        _ => Err("array element function did not return f64".to_string()),
+    }
+}
+
+/// Evaluates the documented source-level `@vectorize output[index] = ...`
+/// form. Its array envelope is lowered to [`forge_ir::array::ArrayFunction`]
+/// before the same packed loop, masked-tail, and scalar-equivalence machinery
+/// used by [`evaluate_array_with_features`] is selected.
+pub fn evaluate_vectorized(source: &str, columns: &[&[f64]]) -> Result<ArrayResult, String> {
+    evaluate_vectorized_with_features(source, columns, CpuFeatures::detect())
+}
+
+/// Feature-masked form of [`evaluate_vectorized`]. The mask is intersected
+/// with the host capabilities exactly like the existing array API.
+pub fn evaluate_vectorized_with_features(
+    source: &str,
+    columns: &[&[f64]],
+    requested: CpuFeatures,
+) -> Result<ArrayResult, String> {
+    let array_function =
+        forge_runtime::lower_array_source(source).map_err(|error| error.to_string())?;
+    if array_function.params.len() != columns.len()
+        || columns.iter().any(|column| {
+            columns
+                .first()
+                .is_some_and(|first| first.len() != column.len())
+        })
+    {
+        return Err(
+            "vectorized columns must match the indexed input signature and length".to_string(),
+        );
+    }
+    let features = requested.supported_by_host();
+    let plan = ArrayPlan::for_len_with_features(
+        columns.first().map_or(0, |column| column.len()),
+        features,
+    );
+    evaluate_lowered_array_with_features(&array_function.element, columns, plan, features)
 }
 
 /// Reduces the per-row results of a pure all-f64 expression in source order.
@@ -2381,6 +2443,86 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn source_vectorize_matches_scalar_for_every_tail_length() {
+        let left = (0..100)
+            .map(|index| index as f64 - 37.5)
+            .collect::<Vec<_>>();
+        let right = (0..100)
+            .map(|index| (index as f64 * 0.25) - 8.0)
+            .collect::<Vec<_>>();
+        let addend = (0..100)
+            .map(|index| if index % 3 == 0 { -0.0 } else { 1.25 })
+            .collect::<Vec<_>>();
+        for length in 1..=100 {
+            let vectorized = evaluate_vectorized(
+                "@vectorize result[i] = a[i] * b[i] + c[i]",
+                &[&left[..length], &right[..length], &addend[..length]],
+            )
+            .unwrap();
+            let scalar = evaluate_array_with_features(
+                "a * b + c",
+                &[&left[..length], &right[..length], &addend[..length]],
+                CpuFeatures::scalar(),
+            )
+            .unwrap();
+            assert_eq!(
+                vectorized
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                scalar
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "mismatch for length {length}"
+            );
+            assert_eq!(vectorized.plan.elements, length);
+        }
+    }
+
+    #[test]
+    fn source_vectorize_supports_structured_if_and_scalar_fallback() {
+        let values = [-2.0, -0.0, 1.0, f64::NAN, 4.0];
+        let result = evaluate_vectorized_with_features(
+            "@vectorize result[i] = if a[i] < 0.0 then a[i] * a[i] else a[i] + 1.0",
+            &[&values],
+            CpuFeatures::scalar(),
+        )
+        .unwrap();
+        let expected = values
+            .iter()
+            .map(|value| {
+                if *value < 0.0 {
+                    value * value
+                } else {
+                    value + 1.0
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(!result.used_packed_backend);
+        assert_eq!(
+            result
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn source_vectorize_rejects_noncanonical_indexing() {
+        let error =
+            evaluate_vectorized("@vectorize result[i] = a[i + 1]", &[&[1.0, 2.0]]).unwrap_err();
+        assert!(error.contains("declared induction variable"), "{error}");
     }
 
     #[test]

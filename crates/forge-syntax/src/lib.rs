@@ -1,6 +1,7 @@
 //! forge-syntax: source spans, diagnostics, tokens, and lexer for the
 //! forge expression language.
 
+pub mod array;
 pub mod ast;
 pub mod diagnostic;
 pub mod lexer;

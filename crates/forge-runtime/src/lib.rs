@@ -26,6 +26,7 @@ pub enum CompileError {
     Ir(String),
     Allocation(String),
     UnsupportedTarget(&'static str),
+    Array(String),
     Memory(std::io::Error),
 }
 
@@ -38,6 +39,7 @@ impl std::fmt::Display for CompileError {
             Self::Ir(e) => write!(f, "IR verification failed: {e}"),
             Self::Allocation(e) => write!(f, "register allocation verification failed: {e}"),
             Self::UnsupportedTarget(e) => write!(f, "JIT unavailable: {e}"),
+            Self::Array(e) => write!(f, "array lowering failed: {e}"),
             Self::Memory(e) => write!(f, "executable memory allocation failed: {e}"),
         }
     }
@@ -80,6 +82,24 @@ pub fn lower_source(source: &str) -> Result<Function, CompileError> {
     let function = forge_ir::lower::lower(&typed);
     forge_ir::verify::verify(&function).map_err(CompileError::Ir)?;
     Ok(function)
+}
+
+/// Parses, resolves, type-checks, and lowers the source-level array form
+/// `@vectorize output[index] = expression` into explicit loop/memory IR.
+pub fn lower_array_source(source: &str) -> Result<forge_ir::array::ArrayFunction, CompileError> {
+    let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
+    if !lex_diags.is_empty() {
+        return Err(CompileError::Lex(lex_diags));
+    }
+    let (program, parse_diags) = forge_syntax::array::parse(&tokens);
+    if !parse_diags.is_empty() {
+        return Err(CompileError::Parse(parse_diags));
+    }
+    let program = program.ok_or(CompileError::UnsupportedTarget(
+        "expected @vectorize output[index] = expression declaration",
+    ))?;
+    let typed = forge_syntax::typeck::typecheck_array(program).map_err(CompileError::Type)?;
+    forge_ir::array::lower_array(&typed).map_err(CompileError::Array)
 }
 
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
@@ -705,6 +725,19 @@ mod tests {
     #[test]
     fn lower_source_reports_frontend_errors() {
         assert!(matches!(lower_source("1 +"), Err(CompileError::Parse(_))));
+    }
+
+    #[test]
+    fn lower_array_source_exposes_verified_loop_and_memory_ir() {
+        let function = lower_array_source("@vectorize result[i] = a[i] * b[i] + c[i]").unwrap();
+        assert_eq!(function.output, "result");
+        assert_eq!(function.index, "i");
+        assert_eq!(function.blocks.len(), 3);
+        assert_eq!(function.params.len(), 3);
+        assert!(matches!(
+            function.blocks[1].insts.last(),
+            Some(forge_ir::array::ArrayInst::Store { output, .. }) if output == "result"
+        ));
     }
 
     #[test]

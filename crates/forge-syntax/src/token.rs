@@ -16,6 +16,8 @@ pub enum TokenKind {
     In,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
     At,
     Assign,

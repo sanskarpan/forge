@@ -125,6 +125,8 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
         let kind = match c {
             '(' => Some(TokenKind::LParen),
             ')' => Some(TokenKind::RParen),
+            '[' => Some(TokenKind::LBracket),
+            ']' => Some(TokenKind::RBracket),
             ',' => Some(TokenKind::Comma),
             '@' => Some(TokenKind::At),
             '=' => Some(TokenKind::Assign),
@@ -243,6 +245,20 @@ mod tests {
                 TokenKind::Pipe,
                 TokenKind::Caret,
                 TokenKind::Tilde,
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn array_index_tokens() {
+        assert_eq!(
+            kinds("a[i]"),
+            vec![
+                TokenKind::Ident,
+                TokenKind::LBracket,
+                TokenKind::Ident,
+                TokenKind::RBracket,
                 TokenKind::Eof
             ]
         );

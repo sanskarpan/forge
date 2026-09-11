@@ -67,6 +67,7 @@ fn type_name(ty: Ty) -> String {
         Ty::F64 => "f64",
         Ty::I64 => "i64",
         Ty::Bool => "bool",
+        Ty::ArrayF64 => "array<f64>",
     }
     .to_string()
 }
@@ -196,6 +197,9 @@ fn contains_f64_remainder(typed: &TypedAst, idx: ExprIdx) -> bool {
             .iter()
             .copied()
             .any(|arg| contains_f64_remainder(typed, arg)),
+        Expr::Index { base, index } => {
+            contains_f64_remainder(typed, *base) || contains_f64_remainder(typed, *index)
+        }
         Expr::If { cond, then_, else_ } => {
             contains_f64_remainder(typed, *cond)
                 || contains_f64_remainder(typed, *then_)
@@ -236,6 +240,10 @@ fn collect_lets(
                 collect_lets(typed, ast, *arg, first_local, lets, local_types);
             }
         }
+        Expr::Index { base, index } => {
+            collect_lets(typed, ast, *base, first_local, lets, local_types);
+            collect_lets(typed, ast, *index, first_local, lets, local_types);
+        }
         Expr::If { cond, then_, else_ } => {
             collect_lets(typed, ast, *cond, first_local, lets, local_types);
             collect_lets(typed, ast, *then_, first_local, lets, local_types);
@@ -272,6 +280,9 @@ fn emit_expr(
                 .ok_or_else(|| format!("unknown local {name}"))?;
             out.push(0x20);
             push_uleb(*local, out);
+        }
+        Expr::Index { .. } => {
+            return Err("array indexing requires the vectorized evaluator".to_string())
         }
         Expr::Unary { op, operand } => match (op, typed.types[idx.index()]) {
             (UnaryOp::Neg, Ty::F64) => {
@@ -344,6 +355,7 @@ fn emit_expr(
                     BinaryOp::Ne => 0x47,
                     _ => return Err("invalid bool binary operation".to_string()),
                 },
+                Ty::ArrayF64 => return Err("array value used as a scalar".to_string()),
             });
         }
         Expr::Call { callee, args } => match (callee.as_str(), args.as_slice()) {
@@ -405,6 +417,7 @@ fn wasm_valtype(ty: Ty) -> u8 {
         Ty::F64 => 0x7c,
         Ty::I64 => 0x7e,
         Ty::Bool => 0x7f,
+        Ty::ArrayF64 => unreachable!("array values are not scalar WASM locals"),
     }
 }
 
