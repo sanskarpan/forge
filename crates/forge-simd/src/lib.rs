@@ -1098,6 +1098,40 @@ mod x86_packed {
         };
     }
 
+    unsafe fn avx512_round(value: [f64; 8]) -> Result<[f64; 8], ()> {
+        let abs_mask = [f64::from_bits(0x7fff_ffff_ffff_ffff); 8];
+        let sign_mask = [f64::from_bits(0x8000_0000_0000_0000); 8];
+        let half = [0.5; 8];
+        let mut output = [0.0; 8];
+        asm!(
+            "vmovupd zmm0, [{value}]",
+            "vcmppd k1, zmm0, zmm0, 3",
+            "vmovupd zmm1, [{value}]",
+            "vmovupd zmm2, [{abs_mask}]",
+            "vandpd zmm1, zmm1, zmm2",
+            "vmovupd zmm2, [{half}]",
+            "vaddpd zmm1, zmm1, zmm2",
+            "vrndscalepd zmm1, zmm1, 1",
+            "vmovupd zmm2, [{sign_mask}]",
+            "vandpd zmm0, zmm0, zmm2",
+            "vorpd zmm0, zmm0, zmm1",
+            "vmovupd [{out}], zmm0",
+            "vmovupd zmm1, [{value}]",
+            "vmovupd [{out}] {{k1}}, zmm1",
+            value = in(reg) value.as_ptr(),
+            abs_mask = in(reg) abs_mask.as_ptr(),
+            sign_mask = in(reg) sign_mask.as_ptr(),
+            half = in(reg) half.as_ptr(),
+            out = in(reg) output.as_mut_ptr(),
+            out("zmm0") _,
+            out("zmm1") _,
+            out("zmm2") _,
+            out("k1") _,
+            options(nostack, preserves_flags),
+        );
+        Ok(output)
+    }
+
     impl PackedOps for Avx512 {
         type Vector = [f64; 8];
         const LANES: usize = 8;
@@ -1179,6 +1213,9 @@ mod x86_packed {
         avx512_rounding!(floor, "1");
         avx512_rounding!(ceil, "2");
         avx512_rounding!(trunc, "3");
+        unsafe fn round(value: Self::Vector) -> Result<Self::Vector, ()> {
+            avx512_round(value)
+        }
 
         // AVX-512F is reached through stable inline assembly for arithmetic,
         // but exact Forge min/max semantics are intentionally kept in the
@@ -1363,13 +1400,28 @@ mod x86_packed {
         ))
     }
 
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_round(value: __m256d) -> Result<__m256d, ()> {
+        let abs_mask = _mm256_set1_pd(f64::from_bits(0x7fff_ffff_ffff_ffff));
+        let sign_mask = _mm256_set1_pd(f64::from_bits(0x8000_0000_0000_0000));
+        let nan = _mm256_cmp_pd(value, value, _CMP_UNORD_Q);
+        let magnitude = _mm256_and_pd(value, abs_mask);
+        let shifted = _mm256_add_pd(magnitude, _mm256_set1_pd(0.5));
+        let rounded = _mm256_round_pd(shifted, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+        let signed = _mm256_or_pd(_mm256_and_pd(value, sign_mask), rounded);
+        Ok(_mm256_or_pd(
+            _mm256_and_pd(nan, value),
+            _mm256_andnot_pd(nan, signed),
+        ))
+    }
+
     macro_rules! impl_x86_ops {
         ($name:ident, $vector:ty, $lanes:expr, $set1:ident, $load:ident, $store:ident,
          $add:ident, $sub:ident, $mul:ident, $div:ident, $sqrt:ident, $and:ident,
          $cmp:ident, $andnot:ident, $or:ident, $setzero:ident, $cast_si:ident,
          $cast_pd:ident, $and_si:ident, $andnot_si:ident, $or_si:ident,
          $set1_epi64x:ident, $mask:expr, $feature:literal,
-         $floor:ident, $ceil:ident, $trunc:ident) => {
+         $floor:ident, $ceil:ident, $round:ident, $trunc:ident) => {
             impl PackedOps for $name {
                 type Vector = $vector;
                 const LANES: usize = $lanes;
@@ -1458,6 +1510,10 @@ mod x86_packed {
                     $ceil(value)
                 }
                 #[target_feature(enable = $feature)]
+                unsafe fn round(value: Self::Vector) -> Result<Self::Vector, ()> {
+                    $round(value)
+                }
+                #[target_feature(enable = $feature)]
                 unsafe fn trunc(value: Self::Vector) -> Result<Self::Vector, ()> {
                     $trunc(value)
                 }
@@ -1521,6 +1577,7 @@ mod x86_packed {
         "sse2",
         unavailable_128,
         unavailable_128,
+        unavailable_128,
         unavailable_128
     );
 
@@ -1551,6 +1608,7 @@ mod x86_packed {
         "avx2",
         avx2_floor,
         avx2_ceil,
+        avx2_round,
         avx2_trunc
     );
 
@@ -1642,6 +1700,10 @@ mod x86_packed {
         #[target_feature(enable = "avx2")]
         unsafe fn ceil(value: Self::Vector) -> Result<Self::Vector, ()> {
             avx2_ceil(value)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn round(value: Self::Vector) -> Result<Self::Vector, ()> {
+            avx2_round(value)
         }
         #[target_feature(enable = "avx2")]
         unsafe fn trunc(value: Self::Vector) -> Result<Self::Vector, ()> {
@@ -2144,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_rounding_operations_match_scalar_bits_and_fallback_explicitly() {
+    fn packed_rounding_operations_match_scalar_bits() {
         let input = [
             -3.75,
             -2.5,
@@ -2157,11 +2219,11 @@ mod tests {
             f64::INFINITY,
             f64::NAN,
         ];
-        for (source, expected, x86_packed) in [
-            ("floor(x)", input.map(f64::floor), true),
-            ("ceil(x)", input.map(f64::ceil), true),
-            ("trunc(x)", input.map(f64::trunc), true),
-            ("round(x)", input.map(f64::round), false),
+        for (source, expected) in [
+            ("floor(x)", input.map(f64::floor)),
+            ("ceil(x)", input.map(f64::ceil)),
+            ("trunc(x)", input.map(f64::trunc)),
+            ("round(x)", input.map(f64::round)),
         ] {
             let result = evaluate_array(source, &[&input]).unwrap();
             let actual_bits = result
@@ -2177,11 +2239,9 @@ mod tests {
 
             let has_full_chunk =
                 result.plan.width != SimdWidth::Scalar && result.plan.full_chunks > 0;
-            let expected_packed = if cfg!(target_arch = "aarch64") {
-                has_full_chunk
-            } else {
-                x86_packed && has_full_chunk
-            };
+            let expected_packed = has_full_chunk
+                && (cfg!(target_arch = "aarch64")
+                    || (cfg!(target_arch = "x86_64") && result.plan.width != SimdWidth::F64x2));
             assert_eq!(result.used_packed_backend, expected_packed, "{source}");
         }
     }
