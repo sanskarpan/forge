@@ -683,6 +683,7 @@ fn emit_libm_call(
 /// Arguments are first staged in the outgoing area. That makes mixed-bank
 /// register moves cycle-safe even when the allocator happened to place an
 /// input in another input register.
+#[allow(clippy::too_many_arguments)]
 fn emit_external_call(
     asm: &mut Assembler,
     address: usize,
