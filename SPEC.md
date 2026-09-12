@@ -200,6 +200,25 @@ restores both before returning. Local spill slots are biased below this saved
 area, so spills cannot overwrite nonvolatile values. High-pressure native
 Windows tests verify RBX/XMM6 allocation and execution through the runtime.
 
+### Registered external calls
+
+Native callers may opt into named external calls with
+`forge_runtime::evaluate_typed_with_externals(source, args, externals)`. Each
+registered target has a unique source name, a raw C-ABI function address, an
+ordered `Vec<Ty>` parameter signature, and a `Ty` result. Registration from a
+raw address is `unsafe` because Rust cannot prove that an address actually has
+the declared C ABI; the constructor documents that the target must be a live,
+non-variadic function whose arguments and result exactly match the descriptor.
+The compiler resolves only names present in the supplied registry, keeps the
+built-in intrinsic table authoritative, and rejects duplicate names, arity or
+type mismatches, variadic signatures, aggregate types, and more than sixteen
+arguments before emission. The x86-64 emitter marshals mixed f64/i64/bool
+arguments through the System V or Win64 register banks and aligned outgoing
+stack slots, preserving live caller-saved values; the AArch64 emitter applies
+the corresponding AAPCS64 banks, stack slots, and link-register preservation.
+External calls are deliberately native-only: WASM artifact and browser APIs
+reject raw process addresses instead of attempting to serialize them.
+
 ---
 
 ## §4 Architecture
