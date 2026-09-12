@@ -288,9 +288,9 @@ pub fn evaluate_typed_with_externals(
         if let Some(value) = execute_native_typed_aarch64_bytes(args, &function, &bytes)? {
             return Ok(value);
         }
-        return Err(CompileError::UnsupportedTarget(
+        Err(CompileError::UnsupportedTarget(
             "AArch64 external call signature is outside the native boundary",
-        ));
+        ))
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -606,7 +606,7 @@ fn execute_native_typed_aarch64_bytes(
     }
 
     let mut body = ExecutableBuffer::new(bytes.len())?;
-    body.write(|dst| dst[..bytes.len()].copy_from_slice(&bytes));
+    body.write(|dst| dst[..bytes.len()].copy_from_slice(bytes));
     body.make_executable()?;
 
     let mut trampoline = Aarch64Assembler::new();
