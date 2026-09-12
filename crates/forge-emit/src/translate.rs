@@ -298,6 +298,9 @@ pub fn translate_inst(
                 asm.movsd_reg_reg(dst_r, PhysReg::Xmm0);
             }
         }
+        MachineInst::ExternalCall { .. } => unreachable!(
+            "forge-emit: external calls are layout-sensitive and handled by emit_body"
+        ),
 
         MachineInst::Jump { .. } | MachineInst::Branch { .. } | MachineInst::Return { .. } => {
             unreachable!(
