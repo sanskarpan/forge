@@ -71,7 +71,13 @@ constant offsets, including stencil-style expressions such as
 materializes the call-time offset into the same checked constant-offset window.
 The f64-only broadcast APIs continue to reject these sources because their ABI
 cannot carry an i64 value. Per-row array-valued indices and other genuinely
-non-contiguous gathers remain outside the current language. Array expressions containing
+non-contiguous gathers remain outside the current one-dimensional language.
+Nested source loops use declarations such as
+`@vectorize result[i, j] = a[i * width + j] + bias`; callers pass flattened
+row-major columns and dimensions to `evaluate_nested_vectorized`. That API
+checks shape products, typed broadcasts, and every computed index before any
+load, and uses the verified scalar evaluator for arbitrary nested addressing.
+Array expressions containing
 `sin`, `cos`, `tan`, `exp`, `log`, or `pow` retain packed execution through a
 lane-preserving libm adapter that applies the interpreter's scalar operation to
 each active lane and repacks the exact results. The full AArch64

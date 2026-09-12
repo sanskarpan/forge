@@ -15,10 +15,13 @@ use crate::token::{Token, TokenKind};
 pub struct ArrayProgram {
     pub output: String,
     pub index: String,
+    /// All declared loop indices in row-major nesting order. `index` is kept
+    /// as the first entry for the existing one-dimensional lowering path.
+    pub indices: Vec<String>,
     pub body: Ast,
 }
 
-/// Parses `@vectorize output[index] = expression`.
+/// Parses `@vectorize output[index, ...] = expression`.
 pub fn parse(tokens: &[Token]) -> (Option<ArrayProgram>, Vec<Diagnostic>) {
     let mut p = HeaderParser {
         tokens,
@@ -39,7 +42,12 @@ pub fn parse(tokens: &[Token]) -> (Option<ArrayProgram>, Vec<Diagnostic>) {
     }
     let output = p.expect(TokenKind::Ident);
     p.expect(TokenKind::LBracket);
-    let index = p.expect(TokenKind::Ident);
+    let first_index = p.expect(TokenKind::Ident);
+    let mut indices = vec![first_index.text.clone()];
+    while p.peek().kind == TokenKind::Comma {
+        p.advance();
+        indices.push(p.expect(TokenKind::Ident).text);
+    }
     p.expect(TokenKind::RBracket);
     p.expect(TokenKind::Assign);
 
@@ -54,7 +62,8 @@ pub fn parse(tokens: &[Token]) -> (Option<ArrayProgram>, Vec<Diagnostic>) {
         (
             Some(ArrayProgram {
                 output: output.text,
-                index: index.text,
+                index: first_index.text,
+                indices,
                 body,
             }),
             p.diags,
@@ -121,6 +130,7 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(program.output, "result");
         assert_eq!(program.index, "i");
+        assert_eq!(program.indices, vec!["i"]);
         assert!(matches!(
             program.body.get(program.body.root),
             Expr::Binary { .. }
@@ -134,5 +144,16 @@ mod tests {
         let (program, parse_diags) = parse(&tokens);
         assert!(program.is_none());
         assert!(parse_diags.is_empty());
+    }
+
+    #[test]
+    fn parses_nested_row_major_indices() {
+        let (tokens, lex_diags) = lex("@vectorize result[i, j] = a[i + j]");
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (program, diags) = parse(&tokens);
+        let program = program.expect("nested array program");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(program.indices, vec!["i", "j"]);
+        assert_eq!(program.index, "i");
     }
 }
