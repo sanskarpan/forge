@@ -21,7 +21,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit Rust dependencies
-        run: cargo audit --locked
+        run: cargo audit
 
   npm-audit:
     name: Workbench dependency audit
