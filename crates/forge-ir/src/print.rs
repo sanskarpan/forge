@@ -66,6 +66,10 @@ fn print_inst(inst: &Inst) -> String {
             let parts: Vec<String> = args.iter().map(|a| format!("v{}", a.0)).collect();
             format!("call.{func:?} {}", parts.join(", "))
         }
+        Inst::ExternalCall { address, args } => {
+            let parts: Vec<String> = args.iter().map(|a| format!("v{}", a.0)).collect();
+            format!("call.external@0x{address:x} {}", parts.join(", "))
+        }
         Inst::IToF(a) => format!("itof v{}", a.0),
         Inst::FToI(a) => format!("ftoi v{}", a.0),
         Inst::Phi { incoming } => {
