@@ -38,6 +38,8 @@ export interface AssemblyInstruction {
   bytes?: string;
   text?: string;
   value?: string;
+  stack_before?: number;
+  stack_after?: number;
 }
 
 export interface CompileArtifact {
@@ -55,6 +57,7 @@ export interface CompileArtifact {
   intervals?: Interval[];
   asm?: AssemblyInstruction[];
   encoding?: string;
+  stack_max_depth?: number;
 }
 
 export interface BenchmarkResult {
