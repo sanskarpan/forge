@@ -169,10 +169,10 @@ pub fn verify(f: &Function) -> Result<(), String> {
                     return Err(format!("returned value {v:?} does not dominate {block:?}"));
                 }
                 if def_block == block
-                    && defined_at
-                        .get(v.0 as usize)
-                        .and_then(|position| *position)
-                        .map_or(true, |position| position >= bd.insts.len())
+                    && match defined_at.get(v.0 as usize).and_then(|position| *position) {
+                        Some(position) => position >= bd.insts.len(),
+                        None => true,
+                    }
                 {
                     return Err(format!("returned value {v:?} is not defined in {block:?}"));
                 }
