@@ -153,12 +153,22 @@ fn lower_expr(
         Expr::Call { callee, args } => {
             let mut vals = Vec::new();
             let mut block = block;
+            // External signatures are exact at the source boundary. The
+            // ordinary call path permits the language's implicit i64 -> f64
+            // widening, but applying it to a registered external would
+            // change the machine-level ABI class (GPR to XMM) and pass the
+            // integer's floating-point bit pattern to the foreign target.
+            let exact_external = externals.contains_key(&callee) && !is_builtin(&callee);
             for a in &args {
                 let (v, blk) = lower_expr(b, typed, *a, externals);
                 let arg_ty = lower_ty(typed.types[a.index()]);
                 block = blk;
                 b.cur_block = block;
-                vals.push(coerce_to_f64(b, block, v, arg_ty, span));
+                vals.push(if exact_external {
+                    v
+                } else {
+                    coerce_to_f64(b, block, v, arg_ty, span)
+                });
             }
             let inst = lower_call(&callee, &vals, externals);
             (b.emit(block, inst, ty, span), block)
@@ -266,6 +276,27 @@ fn lower_binary(op: BinaryOp, l: Value, r: Value) -> Inst {
             rhs: r,
         },
     }
+}
+
+fn is_builtin(callee: &str) -> bool {
+    matches!(
+        callee,
+        "sqrt"
+            | "abs"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "trunc"
+            | "min"
+            | "max"
+            | "fma"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "exp"
+            | "log"
+            | "pow"
+    )
 }
 
 /// # Precondition
