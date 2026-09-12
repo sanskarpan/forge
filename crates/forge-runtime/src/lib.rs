@@ -1040,7 +1040,12 @@ mod tests {
     #[test]
     fn typed_runtime_marshals_external_overflow_arguments_and_results() {
         extern "C" fn sum_seven(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64 {
-            a + b + c + d + e + f + g
+            a.wrapping_add(b)
+                .wrapping_add(c)
+                .wrapping_add(d)
+                .wrapping_add(e)
+                .wrapping_add(f)
+                .wrapping_add(g)
         }
         let external = unsafe {
             ExternalFunction::from_raw(
