@@ -198,6 +198,12 @@ pub fn verify_array(function: &ArrayFunction) -> Result<(), String> {
 /// Unindexed f64 parameters remain scalar broadcasts in the element function
 /// and are not represented by memory loads.
 pub fn lower_array(typed: &TypedArray) -> Result<ArrayFunction, String> {
+    if typed.indices.len() != 1 {
+        return Err(
+            "nested vectorized declarations require the nested-array evaluation entry point"
+                .to_string(),
+        );
+    }
     if typed.params.iter().any(|(_, ty)| *ty == AstTy::I64) {
         return Err(
             "dynamic array offsets require the typed vectorized broadcast entry point".to_string(),
@@ -510,5 +516,17 @@ mod tests {
                 "expected rejection for {source}"
             );
         }
+    }
+
+    #[test]
+    fn directs_nested_declarations_to_nested_evaluation() {
+        let source = "@vectorize result[i, j] = a[i + j]";
+        let (tokens, lex_diags) = lex(source);
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (program, parse_diags) = parse(&tokens);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let typed = typecheck_array(program.expect("nested array program")).unwrap();
+        let error = lower_array(&typed).unwrap_err();
+        assert!(error.contains("nested-array evaluation entry point"));
     }
 }

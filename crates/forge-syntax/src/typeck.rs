@@ -30,6 +30,7 @@ pub struct TypedArray {
     pub params: Vec<(String, Ty)>,
     pub output: String,
     pub index: String,
+    pub indices: Vec<String>,
 }
 
 pub fn typecheck(ast: Ast) -> Result<TypedAst, Vec<Diagnostic>> {
@@ -76,7 +77,15 @@ pub fn typecheck_array(program: crate::array::ArrayProgram) -> Result<TypedArray
         diags: Vec::new(),
         allow_arrays: true,
     };
-    ctx.local_ty.insert(program.index.clone(), Ty::I64);
+    for index in &program.indices {
+        if ctx.local_ty.insert(index.clone(), Ty::I64).is_some() {
+            ctx.diags.push(Diagnostic::error(
+                format!("duplicate vectorized loop index `{index}`"),
+                ast.span(ast.root),
+                "duplicate loop index",
+            ));
+        }
+    }
     ctx.infer_expect(ast.root, Some(Ty::F64));
     let result_ty = ctx.check(ast.root);
     if result_ty != Ty::F64 {
@@ -113,6 +122,7 @@ pub fn typecheck_array(program: crate::array::ArrayProgram) -> Result<TypedArray
             params,
             output: program.output,
             index: program.index,
+            indices: program.indices,
         })
     } else {
         Err(diags)
@@ -563,6 +573,28 @@ mod tests {
                 ("shift".to_string(), Ty::I64)
             ]
         );
+    }
+
+    #[test]
+    fn vectorized_body_types_all_nested_indices_as_i64_locals() {
+        let (tokens, lex_diags) = lex("@vectorize result[i, j] = a[i + j]");
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (program, parse_diags) = crate::array::parse(&tokens);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let typed = typecheck_array(program.expect("nested vector program")).unwrap();
+        assert_eq!(typed.indices, vec!["i", "j"]);
+        assert_eq!(typed.params, vec![("a".to_string(), Ty::ArrayF64)]);
+    }
+
+    #[test]
+    fn vectorized_body_rejects_duplicate_loop_indices() {
+        let (tokens, _) = lex("@vectorize result[i, i] = a[i]");
+        let (program, parse_diags) = crate::array::parse(&tokens);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let errors = typecheck_array(program.expect("duplicate-index program")).unwrap_err();
+        assert!(errors[0]
+            .message
+            .contains("duplicate vectorized loop index"));
     }
 
     #[test]

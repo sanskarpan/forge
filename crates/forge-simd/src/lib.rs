@@ -1,7 +1,11 @@
 //! Runtime SIMD capability selection shared by native front ends.
 
+mod nested;
+
 use forge_ir::array::ArrayParamKind;
 use forge_ir::{CmpOp, Function, Inst, LibFunc, Terminator, Ty, Value};
+
+pub use nested::{evaluate_nested_vectorized, NestedArrayResult};
 
 /// The typed, lane-wise IR consumed by the packed evaluator. Values reuse the
 /// scalar IR's SSA indices so the vector program can be inspected alongside
