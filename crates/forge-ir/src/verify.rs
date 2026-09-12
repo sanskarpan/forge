@@ -35,6 +35,10 @@ pub fn verify(f: &Function) -> Result<(), String> {
         ));
     }
 
+    // Value slots are stable indices. Optimizer passes may tombstone a
+    // replaced instruction in `f.insts` after removing it from its block;
+    // only values listed by a block are live definitions and participate in
+    // dominance/use validation.
     let mut defined_in = vec![None; f.insts.len()];
     let mut defined_at = vec![None; f.insts.len()];
     for (bi, bd) in f.blocks.iter().enumerate() {
@@ -68,15 +72,6 @@ pub fn verify(f: &Function) -> Result<(), String> {
             }
         }
     }
-    for (index, block) in defined_in.iter().enumerate() {
-        if block.is_none() {
-            return Err(format!(
-                "instruction value {:?} is not listed in any block",
-                Value(index as u32)
-            ));
-        }
-    }
-
     let mut expected_preds = vec![Vec::new(); f.blocks.len()];
     for (bi, bd) in f.blocks.iter().enumerate() {
         let block = Block(bi as u32);
