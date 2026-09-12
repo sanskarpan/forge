@@ -191,19 +191,20 @@ fn native_x64_artifact(source: &str) -> Result<String, String> {
     forge_regalloc::verify_allocation(&intervals, &assignment)
         .map_err(|error| error.to_string())?;
     let bytes = forge_emit::emit_body(&function, &selected, &assignment);
-    let asm = selected
-        .insts
-        .iter()
-        .enumerate()
-        .map(|(index, inst)| {
-            format!(
-                r#"{{"offset":{},"bytes":"","text":{}}}"#,
-                index,
-                json_string(&format!("{inst:?}"))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
+    // `emit_body` currently returns the finalized function bytes as one
+    // buffer; it does not expose instruction boundaries because prologue,
+    // spill, pool, and branch-fixup bytes can be inserted between selected
+    // instructions. Keep the inspection artifact truthful by reporting that
+    // exact contiguous body as one byte-bearing row instead of fabricating
+    // empty per-instruction encodings.
+    let asm = format!(
+        r#"{{"offset":0,"bytes":{},"text":{}}}"#,
+        json_string(&hex_bytes(&bytes)),
+        json_string(&format!(
+            "encoded x86-64 body ({} selected instructions)",
+            selected.insts.len()
+        ))
+    );
     let intervals = intervals_json(&intervals, &assignment);
     let analysis = analysis_core_json(source)?;
     Ok(format!(
@@ -1061,6 +1062,7 @@ mod tests {
         assert!(x86.contains(r#""bytes_len":"#));
         assert!(x86.contains(r#""intervals":["#));
         assert!(x86.contains(r#""asm":["#));
+        assert!(!x86.contains(r#""bytes":"","text":"#));
         assert_eq!(x86.matches(r#""encoding":"#).count(), 1);
 
         let arm = compile_target_artifact_json("x + 1.0", "aarch64");
