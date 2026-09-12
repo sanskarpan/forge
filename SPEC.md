@@ -1190,7 +1190,7 @@ support remains an open boundary.
 
 ## §10 WASM Backend (for the workbench)
 
-The workbench runs in a browser, where we obviously cannot execute generated x86. So there's a third backend emitting **WebAssembly bytes**, assembled at runtime via `WebAssembly.instantiate`. Same IR, same optimizer, same register allocation *(skipped — WASM is a stack machine)*, real measurable speedup over the interpreter. The MVP instruction set has no scalar f64 remainder opcode; an artifact using `%` declares the typed `forge.fmod` host import and the browser supplies `{ forge: { fmod: (lhs, rhs) => lhs % rhs } }`. Other artifacts declare no imports.
+The workbench runs in a browser, where we obviously cannot execute generated x86. So there's a third backend emitting **WebAssembly bytes**, assembled at runtime via `WebAssembly.instantiate`. Same IR and optimizer feed the stack-machine emitter; register allocation is intentionally not applied. The artifact boundary also exposes decoded stack instructions with exact module byte offsets, abstract operand-stack depth, and logical stack-value lifetimes for inspection. The MVP instruction set has no scalar f64 remainder opcode; an artifact using `%` declares the typed `forge.fmod` host import and the browser supplies `{ forge: { fmod: (lhs, rhs) => lhs % rhs } }`. Other artifacts declare no imports.
 
 ```rust
 /// WASM is a stack machine, so instruction selection is trivial: post-order
@@ -1437,9 +1437,10 @@ implement ties-away-from-zero `round` exactly with packed absolute-value,
 offset, floor, and sign-restoration operations, preserving original NaN
 payloads. SSE2-only and unsupported x86 widths use the scalar interpreter's
 exact result. The canonical source-level array form is backed by explicit
-array memory IR; unsupported packed operations, including libm calls, use the
-scalar element fallback. Nested source loops and arbitrary memory addressing
-remain future language extensions.
+array memory IR; unsupported packed operations use the scalar element fallback,
+while the documented libm adapter preserves packed surrounding expressions.
+Nested source loops and arbitrary memory addressing remain future language
+extensions.
 
 ```rust
 /// A pure expression over element i becomes a lane-wise dataflow graph:
