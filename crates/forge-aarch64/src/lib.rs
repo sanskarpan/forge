@@ -1996,9 +1996,9 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
                 }
                 Some(Inst::ExternalCall { address, args }) => {
                     if function.types.get(value.0 as usize) != Some(&Ty::F64)
-                        || args.iter().any(|arg| {
-                            function.types.get(arg.0 as usize) != Some(&Ty::F64)
-                        })
+                        || args
+                            .iter()
+                            .any(|arg| function.types.get(arg.0 as usize) != Some(&Ty::F64))
                     {
                         return Err(
                             "AArch64 homogeneous external calls require f64 arguments and result"
@@ -2007,7 +2007,10 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
                     }
                     let argument_types = vec![Ty::F64; args.len()];
                     let placements = external_aarch64_placements(&argument_types);
-                    let stack_count = placements.iter().filter(|(_, stack)| stack.is_some()).count();
+                    let stack_count = placements
+                        .iter()
+                        .filter(|(_, stack)| stack.is_some())
+                        .count();
                     let outgoing = u16::try_from((stack_count * 8 + 15) & !15)
                         .map_err(|_| "AArch64 external call area is too large".to_string())?;
                     if outgoing != 0 {
@@ -2024,9 +2027,9 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
                             F64Location::Stack(offset) => asm.ldr_d(
                                 scratch_a,
                                 SP,
-                                offset
-                                    .checked_add(outgoing)
-                                    .ok_or_else(|| "AArch64 external call offset overflow".to_string())?,
+                                offset.checked_add(outgoing).ok_or_else(|| {
+                                    "AArch64 external call offset overflow".to_string()
+                                })?,
                             ),
                         }
                         if let Some(ordinal) = register {
@@ -2035,8 +2038,9 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
                             asm.str_d(
                                 scratch_a,
                                 SP,
-                                u16::try_from(stack.expect("external stack ordinal") * 8)
-                                    .map_err(|_| "AArch64 external call area is too large".to_string())?,
+                                u16::try_from(stack.expect("external stack ordinal") * 8).map_err(
+                                    |_| "AArch64 external call area is too large".to_string(),
+                                )?,
                             );
                         }
                     }
@@ -2051,9 +2055,9 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
                         F64Location::Stack(offset) => asm.str_d(
                             Gpr::new_d(0),
                             SP,
-                            offset
-                                .checked_add(outgoing)
-                                .ok_or_else(|| "AArch64 external call offset overflow".to_string())?,
+                            offset.checked_add(outgoing).ok_or_else(|| {
+                                "AArch64 external call offset overflow".to_string()
+                            })?,
                         ),
                     }
                     if outgoing != 0 {
@@ -2602,7 +2606,10 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let placements = external_aarch64_placements(&argument_types);
-                    let stack_count = placements.iter().filter(|(_, stack)| stack.is_some()).count();
+                    let stack_count = placements
+                        .iter()
+                        .filter(|(_, stack)| stack.is_some())
+                        .count();
                     let outgoing = u16::try_from((stack_count * 8 + 15) & !15)
                         .map_err(|_| "AArch64 external call area is too large".to_string())?;
                     if outgoing != 0 {
@@ -2635,8 +2642,8 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                                         SP,
                                         u16::try_from(stack.expect("external stack ordinal") * 8)
                                             .map_err(|_| {
-                                                "AArch64 external call area is too large".to_string()
-                                            })?,
+                                            "AArch64 external call area is too large".to_string()
+                                        })?,
                                     );
                                 }
                             }
@@ -2663,8 +2670,8 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                                         SP,
                                         u16::try_from(stack.expect("external stack ordinal") * 8)
                                             .map_err(|_| {
-                                                "AArch64 external call area is too large".to_string()
-                                            })?,
+                                            "AArch64 external call area is too large".to_string()
+                                        })?,
                                     );
                                 }
                             }
