@@ -177,7 +177,7 @@ pub fn verify(f: &Function) -> Result<(), String> {
                     && defined_at
                         .get(v.0 as usize)
                         .and_then(|position| *position)
-                        .is_none_or(|position| position >= bd.insts.len())
+                        .map_or(true, |position| position >= bd.insts.len())
                 {
                     return Err(format!("returned value {v:?} is not defined in {block:?}"));
                 }
