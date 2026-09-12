@@ -1393,9 +1393,15 @@ valid window: `input_offset = max(0, -min_offset)` and
 Negative offsets therefore skip the necessary leading input rows and positive
 offsets trim the trailing rows; short windows return an empty result. The
 verified array `Load` records the source column and offset, and packed/scalar
-execution applies it with checked address arithmetic. Dynamic offsets remain
-outside the current language boundary because they require a gather operation
-and a separately defined bounds contract. Unary `sin`, `cos`, `tan`, `exp`, and
+execution applies it with checked address arithmetic. Loop-invariant scalar
+offsets are also accepted when supplied through
+`evaluate_vectorized_with_typed_broadcasts`: an `i64` free parameter used inside
+an index expression is materialized at the call boundary into the existing
+constant-offset window, so packed loads remain contiguous and use the same
+checked bounds and empty-window behavior. The legacy f64-only broadcast entry
+point rejects such sources because it cannot represent the typed i64 ABI.
+Per-row array-valued indices and other genuinely non-contiguous gathers remain
+outside the current language and bounds contract. Unary `sin`, `cos`, `tan`, `exp`, and
 `log`, together with binary `pow`, are supported in packed array expressions by
 a lane-preserving adapter: each active lane uses the same scalar Rust/libm
 operation as the interpreter oracle and the results are repacked into the
