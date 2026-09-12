@@ -1094,7 +1094,11 @@ mod tests {
             )
         };
         assert!(matches!(
-            evaluate_typed_with_externals("identity(x)", &[RtValue::F64(1.0)], &[external.clone()],),
+            evaluate_typed_with_externals(
+                "identity(x)",
+                &[RtValue::F64(1.0)],
+                std::slice::from_ref(&external),
+            ),
             Err(CompileError::UnsupportedTarget(_))
         ));
         assert!(matches!(
