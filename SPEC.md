@@ -104,6 +104,9 @@ let t = x*x + y*y in sqrt(t) / (1 + t)
 @vectorize
 result[i] = a[i] * b[i] + c[i]          # → vfmadd231pd
 
+# nested array mode uses row-major flattened columns and explicit shape
+@vectorize result[i, j] = a[i * width + j] + bias
+
 # integer domain
 (n * 2654435761) >> 16                  # strength reduction: * → shift+lea
 n / 7                                   # → magic-number multiply
@@ -1406,10 +1409,22 @@ outside the current language and bounds contract. Unary `sin`, `cos`, `tan`, `ex
 a lane-preserving adapter: each active lane uses the same scalar Rust/libm
 operation as the interpreter oracle and the results are repacked into the
 selected vector width. This keeps the surrounding expression packed without
-claiming a non-portable native vector-libm ABI. Nested source loops remain
-outside this language boundary. Broadcast values are supplied
+claiming a non-portable native vector-libm ABI. Broadcast values are supplied
 separately from columns and are splat directly into packed lanes without
 constructing repeated input arrays.
+
+Nested source loops use the extended declaration
+`@vectorize output[i, j, ...] = expression`. The indices describe a row-major
+output shape, and every source column is a flattened f64 buffer with the same
+shape. Callers provide the dimensions separately through the nested-array
+evaluation API; the product of the dimensions is checked against every column
+before any load occurs. Index expressions may use the declared loop indices,
+integer arithmetic, and scalar i64 broadcasts. Evaluation enumerates the
+Cartesian product in row-major order, rejects overflow or out-of-bounds
+indices, and never performs an unchecked gather. The initial implementation
+uses the verified scalar element evaluator for arbitrary nested addressing;
+contiguous lane-independent bodies may be lowered to the existing packed
+outer-loop path later without changing the semantics or bounds contract.
 
 ### Vectorizer
 
@@ -1439,8 +1454,8 @@ payloads. SSE2-only and unsupported x86 widths use the scalar interpreter's
 exact result. The canonical source-level array form is backed by explicit
 array memory IR; unsupported packed operations use the scalar element fallback,
 while the documented libm adapter preserves packed surrounding expressions.
-Nested source loops and arbitrary memory addressing remain future language
-extensions.
+Nested source loops use the checked scalar fallback described above; arbitrary
+memory addressing remains outside the language boundary.
 
 ```rust
 /// A pure expression over element i becomes a lane-wise dataflow graph:
