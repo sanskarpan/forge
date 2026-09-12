@@ -283,8 +283,9 @@ pub fn evaluate_typed_with_externals(
     #[cfg(target_arch = "aarch64")]
     {
         let function = prepare_function(function, true)?;
-        let bytes = forge_aarch64::emit_scalar(&function)
-            .map_err(|_| CompileError::UnsupportedTarget("AArch64 external call emission failed"))?;
+        let bytes = forge_aarch64::emit_scalar(&function).map_err(|_| {
+            CompileError::UnsupportedTarget("AArch64 external call emission failed")
+        })?;
         if let Some(value) = execute_native_typed_aarch64_bytes(args, &function, &bytes)? {
             return Ok(value);
         }
@@ -1038,15 +1039,7 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn typed_runtime_marshals_external_overflow_arguments_and_results() {
-        extern "C" fn sum_seven(
-            a: i64,
-            b: i64,
-            c: i64,
-            d: i64,
-            e: i64,
-            f: i64,
-            g: i64,
-        ) -> i64 {
+        extern "C" fn sum_seven(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64 {
             a + b + c + d + e + f + g
         }
         let external = unsafe {
@@ -1100,11 +1093,7 @@ mod tests {
             )
         };
         assert!(matches!(
-            evaluate_typed_with_externals(
-                "identity(x)",
-                &[RtValue::F64(1.0)],
-                &[external.clone()],
-            ),
+            evaluate_typed_with_externals("identity(x)", &[RtValue::F64(1.0)], &[external.clone()],),
             Err(CompileError::UnsupportedTarget(_))
         ));
         assert!(matches!(
