@@ -287,6 +287,15 @@ pub enum MachineInst {
         args: smallvec::SmallVec<[Value; 2]>,
     },
 
+    /// A caller-registered native target. Unlike `CallLibm`, the address and
+    /// mixed argument types are supplied by the runtime; layout emission
+    /// performs the ABI-bank and outgoing-stack marshalling.
+    ExternalCall {
+        dst: Value,
+        address: usize,
+        args: smallvec::SmallVec<[Value; 2]>,
+    },
+
     // Control flow
     Jump {
         target: Block,
@@ -593,6 +602,13 @@ impl<'a> Selector<'a> {
                 self.insts.push(MachineInst::CallLibm {
                     dst,
                     func: *func,
+                    args: args.clone(),
+                });
+            }
+            Inst::ExternalCall { address, args } => {
+                self.insts.push(MachineInst::ExternalCall {
+                    dst,
+                    address: *address,
                     args: args.clone(),
                 });
             }

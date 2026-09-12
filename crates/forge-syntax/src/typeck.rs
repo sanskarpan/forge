@@ -5,6 +5,7 @@ use rustc_hash::FxHashMap;
 use crate::ast::{Ast, BinaryOp, Expr, ExprIdx, UnaryOp};
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
@@ -23,6 +24,12 @@ pub struct TypedAst {
     pub params: Vec<(String, Ty)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalSignature {
+    pub params: Vec<Ty>,
+    pub result: Ty,
+}
+
 #[derive(Debug)]
 pub struct TypedArray {
     pub ast: Ast,
@@ -34,6 +41,17 @@ pub struct TypedArray {
 }
 
 pub fn typecheck(ast: Ast) -> Result<TypedAst, Vec<Diagnostic>> {
+    typecheck_with_externals(ast, &HashMap::new())
+}
+
+/// Type-checks an expression with an explicit registry of named external
+/// function signatures. Built-in intrinsics take precedence; unknown calls
+/// are accepted only when their complete signature is present in this
+/// registry, and external arguments are exact with no implicit widening.
+pub fn typecheck_with_externals(
+    ast: Ast,
+    externals: &HashMap<String, ExternalSignature>,
+) -> Result<TypedAst, Vec<Diagnostic>> {
     let mut ctx = Ctx {
         ast: &ast,
         param_ty: FxHashMap::default(),
@@ -42,6 +60,7 @@ pub fn typecheck(ast: Ast) -> Result<TypedAst, Vec<Diagnostic>> {
         types: vec![Ty::F64; ast.exprs.len()],
         diags: Vec::new(),
         allow_arrays: false,
+        externals,
     };
     ctx.infer_expect(ast.root, None);
     ctx.check(ast.root);
@@ -68,6 +87,7 @@ pub fn typecheck(ast: Ast) -> Result<TypedAst, Vec<Diagnostic>> {
 /// offset; the array runtime supplies that value as a loop-invariant scalar.
 pub fn typecheck_array(program: crate::array::ArrayProgram) -> Result<TypedArray, Vec<Diagnostic>> {
     let ast = crate::resolve::resolve(program.body);
+    let no_externals = HashMap::new();
     let mut ctx = Ctx {
         ast: &ast,
         param_ty: FxHashMap::default(),
@@ -76,6 +96,7 @@ pub fn typecheck_array(program: crate::array::ArrayProgram) -> Result<TypedArray
         types: vec![Ty::F64; ast.exprs.len()],
         diags: Vec::new(),
         allow_arrays: true,
+        externals: &no_externals,
     };
     for index in &program.indices {
         if ctx.local_ty.insert(index.clone(), Ty::I64).is_some() {
@@ -201,6 +222,16 @@ fn collect_i64_idents(
     }
 }
 
+fn intrinsic_signature(callee: &str) -> Option<(usize, Ty)> {
+    Some(match callee {
+        "sqrt" | "abs" | "floor" | "ceil" | "round" | "trunc" | "sin" | "cos" | "tan" | "exp"
+        | "log" => (1, Ty::F64),
+        "min" | "max" | "pow" => (2, Ty::F64),
+        "fma" => (3, Ty::F64),
+        _ => return None,
+    })
+}
+
 struct Ctx<'a> {
     ast: &'a Ast,
     param_ty: FxHashMap<String, Ty>,
@@ -209,6 +240,7 @@ struct Ctx<'a> {
     types: Vec<Ty>,
     diags: Vec<Diagnostic>,
     allow_arrays: bool,
+    externals: &'a HashMap<String, ExternalSignature>,
 }
 
 impl<'a> Ctx<'a> {
@@ -281,7 +313,16 @@ impl<'a> Ctx<'a> {
                 self.infer_expect(lhs, inner);
                 self.infer_expect(rhs, inner);
             }
-            Expr::Call { args, .. } => {
+            Expr::Call { callee, args } => {
+                if intrinsic_signature(&callee).is_none() {
+                    if let Some(signature) = self.externals.get(&callee) {
+                        let expected = signature.params.clone();
+                        for (arg, ty) in args.iter().zip(expected) {
+                            self.infer_expect(*arg, Some(ty));
+                        }
+                        return;
+                    }
+                }
                 for a in args {
                     self.infer_expect(a, Some(Ty::F64));
                 }
@@ -484,6 +525,26 @@ impl<'a> Ctx<'a> {
                 *ret
             }
             None => {
+                if let Some(signature) = self.externals.get(callee).cloned() {
+                    if args.len() != signature.params.len() {
+                        self.diags.push(Diagnostic::error(
+                            format!(
+                                "external `{callee}` takes {} argument(s), got {}",
+                                signature.params.len(),
+                                args.len()
+                            ),
+                            span,
+                            "arity mismatch",
+                        ));
+                    }
+                    for (index, &arg) in args.iter().enumerate() {
+                        let actual = self.check(arg);
+                        if let Some(expected) = signature.params.get(index) {
+                            self.expect(actual, *expected, self.ast.span(arg));
+                        }
+                    }
+                    return signature.result;
+                }
                 self.diags.push(Diagnostic::error(
                     format!("unknown intrinsic `{callee}`"),
                     span,

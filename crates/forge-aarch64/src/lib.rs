@@ -766,6 +766,38 @@ pub fn stack_param_ordinal(params: &[(String, Ty)], index: usize) -> Option<usiz
     None
 }
 
+/// Returns the AAPCS64 register-bank ordinal and, when that bank is full, the
+/// outgoing stack-slot ordinal for each scalar external-call argument.
+fn external_aarch64_placements(types: &[Ty]) -> Vec<(Option<usize>, Option<usize>)> {
+    let mut integer_ordinal = 0usize;
+    let mut float_ordinal = 0usize;
+    let mut stack_ordinal = 0usize;
+    types
+        .iter()
+        .map(|ty| {
+            let ordinal = match ty {
+                Ty::F64 => {
+                    let ordinal = float_ordinal;
+                    float_ordinal += 1;
+                    ordinal
+                }
+                Ty::I64 | Ty::Bool => {
+                    let ordinal = integer_ordinal;
+                    integer_ordinal += 1;
+                    ordinal
+                }
+            };
+            if ordinal < 8 {
+                (Some(ordinal), None)
+            } else {
+                let stack = stack_ordinal;
+                stack_ordinal += 1;
+                (None, Some(stack))
+            }
+        })
+        .collect()
+}
+
 fn aarch64_has_stack_params(params: &[(String, Ty)]) -> bool {
     params
         .iter()
@@ -1277,6 +1309,7 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
                             | Inst::Cmp { .. }
                             | Inst::Phi { .. }
                             | Inst::Call { .. }
+                            | Inst::ExternalCall { .. }
                     )
                 )
             });
@@ -1308,7 +1341,7 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
         .insts
         .iter()
         .any(|inst| {
-            matches!(inst, Inst::Call { .. })
+            matches!(inst, Inst::Call { .. } | Inst::ExternalCall { .. })
                 || matches!(inst, Inst::Rem(lhs, _) if function.types.get(lhs.0 as usize) == Some(&Ty::F64))
         })
         && function.params.iter().all(|(_, ty)| *ty == Ty::F64);
@@ -1317,7 +1350,7 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
         .insts
         .iter()
         .any(|inst| {
-            matches!(inst, Inst::Call { .. })
+                matches!(inst, Inst::Call { .. } | Inst::ExternalCall { .. })
                 || matches!(inst, Inst::Rem(lhs, _) if function.types.get(lhs.0 as usize) == Some(&Ty::F64))
         });
     let reuse_allocation = if has_stack_params || contains_f64_call || contains_mixed_call {
@@ -1368,6 +1401,7 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
                         | Inst::FToI(_)
                         | Inst::Phi { .. }
                         | Inst::Call { .. }
+                        | Inst::ExternalCall { .. }
                 )
             )
         });
@@ -1596,6 +1630,9 @@ pub fn emit_scalar(function: &Function) -> Result<Vec<u8>, String> {
                 Inst::Call { .. } => {
                     return Err(format!("AArch64 f64 emitter does not support {:?}", inst))
                 }
+                Inst::ExternalCall { .. } => {
+                    return Err("AArch64 external calls require the stack spill path".to_string())
+                }
             }
         }
 
@@ -1711,7 +1748,7 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
     let contains_call = function
         .insts
         .iter()
-        .any(|inst| matches!(inst, Inst::Call { .. }));
+        .any(|inst| matches!(inst, Inst::Call { .. } | Inst::ExternalCall { .. }));
 
     let mut locations = HashMap::<Value, F64Location>::new();
     let mut next_slot: u16 = if contains_call { 8 } else { 0 };
@@ -1957,6 +1994,76 @@ fn emit_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, String> {
                     asm.blr(Gpr::new(16));
                     store(&mut asm, value, Gpr::new_d(0))?;
                 }
+                Some(Inst::ExternalCall { address, args }) => {
+                    if function.types.get(value.0 as usize) != Some(&Ty::F64)
+                        || args
+                            .iter()
+                            .any(|arg| function.types.get(arg.0 as usize) != Some(&Ty::F64))
+                    {
+                        return Err(
+                            "AArch64 homogeneous external calls require f64 arguments and result"
+                                .to_string(),
+                        );
+                    }
+                    let argument_types = vec![Ty::F64; args.len()];
+                    let placements = external_aarch64_placements(&argument_types);
+                    let stack_count = placements
+                        .iter()
+                        .filter(|(_, stack)| stack.is_some())
+                        .count();
+                    let outgoing = u16::try_from((stack_count * 8 + 15) & !15)
+                        .map_err(|_| "AArch64 external call area is too large".to_string())?;
+                    if outgoing != 0 {
+                        asm.sub_imm(SP, SP, outgoing, false);
+                    }
+                    for (index, arg) in args.iter().enumerate() {
+                        let (register, stack) = placements[index];
+                        match location_of(*arg)? {
+                            F64Location::Register(register) => {
+                                if register != scratch_a {
+                                    asm.fmov_d(scratch_a, register);
+                                }
+                            }
+                            F64Location::Stack(offset) => asm.ldr_d(
+                                scratch_a,
+                                SP,
+                                offset.checked_add(outgoing).ok_or_else(|| {
+                                    "AArch64 external call offset overflow".to_string()
+                                })?,
+                            ),
+                        }
+                        if let Some(ordinal) = register {
+                            asm.fmov_d(Gpr::new_d(ordinal as u8), scratch_a);
+                        } else {
+                            asm.str_d(
+                                scratch_a,
+                                SP,
+                                u16::try_from(stack.expect("external stack ordinal") * 8).map_err(
+                                    |_| "AArch64 external call area is too large".to_string(),
+                                )?,
+                            );
+                        }
+                    }
+                    emit_i64_constant(&mut asm, Gpr::new(16), *address as u64);
+                    asm.blr(Gpr::new(16));
+                    match location_of(value)? {
+                        F64Location::Register(register) => {
+                            if register != Gpr::new_d(0) {
+                                asm.fmov_d(register, Gpr::new_d(0));
+                            }
+                        }
+                        F64Location::Stack(offset) => asm.str_d(
+                            Gpr::new_d(0),
+                            SP,
+                            offset.checked_add(outgoing).ok_or_else(|| {
+                                "AArch64 external call offset overflow".to_string()
+                            })?,
+                        ),
+                    }
+                    if outgoing != 0 {
+                        asm.add_imm(SP, SP, outgoing, false);
+                    }
+                }
                 Some(inst) => {
                     return Err(format!(
                         "AArch64 f64 spill emitter does not support {inst:?}"
@@ -2075,7 +2182,7 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
     let contains_call = function
         .insts
         .iter()
-        .any(|inst| matches!(inst, Inst::Call { .. }));
+        .any(|inst| matches!(inst, Inst::Call { .. } | Inst::ExternalCall { .. }));
     let mut locations = HashMap::<Value, MixedLocation>::new();
     let mut incoming_stack_offsets = HashMap::<Value, u16>::new();
     let mut next_slot = 24u16;
@@ -2486,6 +2593,126 @@ fn emit_mixed_f64_with_stack_spills(function: &Function) -> Result<Vec<u8>, Stri
                     emit_i64_constant(&mut asm, Gpr::new(16), libm_address(*func) as u64);
                     asm.blr(Gpr::new(16));
                     store_f64(&mut asm, value, Gpr::new_d(0))?;
+                }
+                Inst::ExternalCall { address, args } => {
+                    let argument_types = args
+                        .iter()
+                        .map(|arg| {
+                            function
+                                .types
+                                .get(arg.0 as usize)
+                                .copied()
+                                .ok_or_else(|| format!("external argument {arg:?} has no type"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let placements = external_aarch64_placements(&argument_types);
+                    let stack_count = placements
+                        .iter()
+                        .filter(|(_, stack)| stack.is_some())
+                        .count();
+                    let outgoing = u16::try_from((stack_count * 8 + 15) & !15)
+                        .map_err(|_| "AArch64 external call area is too large".to_string())?;
+                    if outgoing != 0 {
+                        asm.sub_imm(SP, SP, outgoing, false);
+                    }
+                    for (index, arg) in args.iter().enumerate() {
+                        let ty = argument_types[index];
+                        let (register, stack) = placements[index];
+                        match ty {
+                            Ty::F64 => {
+                                match location_of(*arg)? {
+                                    MixedLocation::Register(register) => {
+                                        if register != float_a {
+                                            asm.fmov_d(float_a, register);
+                                        }
+                                    }
+                                    MixedLocation::Stack(offset) => asm.ldr_d(
+                                        float_a,
+                                        SP,
+                                        offset.checked_add(outgoing).ok_or_else(|| {
+                                            "AArch64 external call offset overflow".to_string()
+                                        })?,
+                                    ),
+                                }
+                                if let Some(ordinal) = register {
+                                    asm.fmov_d(Gpr::new_d(ordinal as u8), float_a);
+                                } else {
+                                    asm.str_d(
+                                        float_a,
+                                        SP,
+                                        u16::try_from(stack.expect("external stack ordinal") * 8)
+                                            .map_err(|_| {
+                                            "AArch64 external call area is too large".to_string()
+                                        })?,
+                                    );
+                                }
+                            }
+                            Ty::I64 | Ty::Bool => {
+                                match location_of(*arg)? {
+                                    MixedLocation::Register(register) => {
+                                        if register != int_a {
+                                            asm.orr_reg(int_a, XZR, register);
+                                        }
+                                    }
+                                    MixedLocation::Stack(offset) => asm.ldr(
+                                        int_a,
+                                        SP,
+                                        offset.checked_add(outgoing).ok_or_else(|| {
+                                            "AArch64 external call offset overflow".to_string()
+                                        })?,
+                                    ),
+                                }
+                                if let Some(ordinal) = register {
+                                    asm.orr_reg(Gpr::new(ordinal as u8), XZR, int_a);
+                                } else {
+                                    asm.str(
+                                        int_a,
+                                        SP,
+                                        u16::try_from(stack.expect("external stack ordinal") * 8)
+                                            .map_err(|_| {
+                                            "AArch64 external call area is too large".to_string()
+                                        })?,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    emit_i64_constant(&mut asm, Gpr::new(16), *address as u64);
+                    asm.blr(Gpr::new(16));
+                    match function.types.get(value.0 as usize) {
+                        Some(Ty::F64) => match location_of(value)? {
+                            MixedLocation::Register(register) => {
+                                if register != Gpr::new_d(0) {
+                                    asm.fmov_d(register, Gpr::new_d(0));
+                                }
+                            }
+                            MixedLocation::Stack(offset) => asm.str_d(
+                                Gpr::new_d(0),
+                                SP,
+                                offset.checked_add(outgoing).ok_or_else(|| {
+                                    "AArch64 external call offset overflow".to_string()
+                                })?,
+                            ),
+                        },
+                        Some(Ty::I64 | Ty::Bool) => match location_of(value)? {
+                            MixedLocation::Register(register) => {
+                                if register != Gpr::new(0) {
+                                    asm.orr_reg(register, XZR, Gpr::new(0));
+                                }
+                            }
+                            MixedLocation::Stack(offset) => asm.str(
+                                Gpr::new(0),
+                                SP,
+                                offset.checked_add(outgoing).ok_or_else(|| {
+                                    "AArch64 external call offset overflow".to_string()
+                                })?,
+                            ),
+                        },
+                        None => return Err(format!("external result {value:?} has no type")),
+                    }
+                    if outgoing != 0 {
+                        asm.add_imm(SP, SP, outgoing, false);
+                    }
                 }
                 inst => {
                     return Err(format!(

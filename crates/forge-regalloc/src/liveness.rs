@@ -50,7 +50,9 @@ pub fn reads_of(inst: &MachineInst) -> Vec<Value> {
         } => {
             vec![*cond, *then_val, *else_val]
         }
-        MachineInst::CallLibm { args, .. } => args.iter().copied().collect(),
+        MachineInst::CallLibm { args, .. } | MachineInst::ExternalCall { args, .. } => {
+            args.iter().copied().collect()
+        }
         MachineInst::Jump { .. } => vec![],
         MachineInst::Branch { cond, .. } => vec![*cond],
         MachineInst::Return { value } => vec![*value],
@@ -99,6 +101,7 @@ pub fn def_of(inst: &MachineInst) -> Option<Value> {
         | MachineInst::IntToFloat { dst, .. }
         | MachineInst::FloatToInt { dst, .. }
         | MachineInst::CallLibm { dst, .. }
+        | MachineInst::ExternalCall { dst, .. }
         | MachineInst::Param { dst, .. } => Some(*dst),
     }
 }

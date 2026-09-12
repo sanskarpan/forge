@@ -93,6 +93,16 @@ pub enum Inst {
         args: SmallVec<[Value; 2]>,
     },
 
+    /// A call to a caller-registered native C-ABI target. The target address
+    /// is resolved before lowering and is never serialized into portable
+    /// artifacts. Argument and result types come from the surrounding
+    /// function's `types` table; the runtime validates them against the
+    /// registered signature before constructing this instruction.
+    ExternalCall {
+        address: usize,
+        args: SmallVec<[Value; 2]>,
+    },
+
     IToF(Value),
     FToI(Value),
 
@@ -161,6 +171,7 @@ pub fn uses_of(inst: &Inst) -> Vec<Value> {
         Inst::Fma { a, b, c } => vec![*a, *b, *c],
         Inst::Cmp { lhs, rhs, .. } => vec![*lhs, *rhs],
         Inst::Call { args, .. } => args.iter().copied().collect(),
+        Inst::ExternalCall { args, .. } => args.iter().copied().collect(),
         Inst::Phi { incoming } => incoming.iter().map(|(_, v)| *v).collect(),
         Inst::ConstF64(_) | Inst::ConstI64(_) | Inst::ConstBool(_) | Inst::Param { .. } => vec![],
     }
@@ -211,6 +222,11 @@ pub fn replace_in_inst(inst: &mut Inst, old: Value, new: Value) {
             sub(rhs);
         }
         Inst::Call { args, .. } => {
+            for a in args.iter_mut() {
+                sub(a);
+            }
+        }
+        Inst::ExternalCall { args, .. } => {
             for a in args.iter_mut() {
                 sub(a);
             }

@@ -122,6 +122,23 @@ pub fn emit_body(
                         },
                     );
                 }
+                MachineInst::ExternalCall { dst, address, args } => {
+                    emit_external_call(
+                        &mut asm,
+                        *address,
+                        args,
+                        &loc,
+                        loc(*dst),
+                        func,
+                        selected,
+                        position,
+                        &EmitContext {
+                            intervals: &intervals,
+                            assignment,
+                            framed,
+                        },
+                    );
+                }
                 MachineInst::IntDiv { .. } | MachineInst::IntRem { .. } => {
                     let saved = live_gpr_registers(
                         position,
@@ -660,6 +677,212 @@ fn emit_libm_call(
         asm.movsd_reg_reg(dst, scratch);
     }
     asm.alu_reg_imm(AluOp::Add, PhysReg::Rsp, bytes as i32);
+}
+
+/// Emits a registered native call using the active platform's scalar C ABI.
+/// Arguments are first staged in the outgoing area. That makes mixed-bank
+/// register moves cycle-safe even when the allocator happened to place an
+/// input in another input register.
+#[allow(clippy::too_many_arguments)]
+fn emit_external_call(
+    asm: &mut Assembler,
+    address: usize,
+    args: &[Value],
+    loc: &dyn Fn(Value) -> PhysReg,
+    dst: PhysReg,
+    func: &Function,
+    selected: &SelectedFunction,
+    position: usize,
+    context: &EmitContext<'_>,
+) {
+    let caller_saved = [
+        PhysReg::Rax,
+        PhysReg::Rcx,
+        PhysReg::Rdx,
+        PhysReg::Rsi,
+        PhysReg::Rdi,
+        PhysReg::R8,
+        PhysReg::R9,
+        PhysReg::R10,
+        PhysReg::R11,
+    ];
+    let mut saved = Vec::new();
+    for (&value, &(start, end)) in context.intervals {
+        if start < position as u32 && end > position as u32 {
+            if let Location::Reg(reg) = context.assignment[&value] {
+                if (caller_saved.contains(&reg) || is_xmm_reg(reg))
+                    && !saved.iter().any(|(r, _)| *r == reg)
+                {
+                    saved.push((reg, value));
+                }
+            }
+        }
+    }
+    saved.sort_by_key(|(reg, _)| (is_xmm_reg(*reg), reg.encoding()));
+
+    let placements = external_arg_placements(args, func, selected);
+    let stack_count = placements
+        .iter()
+        .filter(|(_, stack)| stack.is_some())
+        .count();
+    let abi_area = if cfg!(windows) {
+        32 + stack_count * 8
+    } else {
+        stack_count * 8
+    };
+    let stage_base = abi_area;
+    let save_base = stage_base + args.len() * 8;
+    let raw = save_base + saved.len() * 8;
+    let desired = if context.framed { 0 } else { 8 };
+    let bytes = raw + (desired + 16 - raw % 16) % 16;
+    asm.alu_reg_imm(
+        AluOp::Sub,
+        PhysReg::Rsp,
+        i32::try_from(bytes).expect("external call frame is too large"),
+    );
+    for (i, (reg, _)) in saved.iter().enumerate() {
+        let offset = i32::try_from(save_base + i * 8).expect("external call frame is too large");
+        if is_xmm_reg(*reg) {
+            asm.movsd_mem_reg(PhysReg::Rsp, offset, *reg);
+        } else {
+            asm.mov_mem_reg(PhysReg::Rsp, offset, *reg);
+        }
+    }
+
+    for (i, value) in args.iter().enumerate() {
+        let source = loc(*value);
+        let offset = i32::try_from(stage_base + i * 8).expect("external call frame is too large");
+        if value_ty(func, selected, *value) == Ty::F64 {
+            asm.movsd_mem_reg(PhysReg::Rsp, offset, source);
+        } else {
+            asm.mov_mem_reg(PhysReg::Rsp, offset, source);
+        }
+    }
+    for (i, (register, stack)) in placements.iter().enumerate() {
+        let ty = value_ty(func, selected, args[i]);
+        let source_offset =
+            i32::try_from(stage_base + i * 8).expect("external call frame is too large");
+        if let Some(register) = register {
+            if ty == Ty::F64 {
+                asm.movsd_reg_mem(*register, PhysReg::Rsp, source_offset);
+            } else {
+                asm.mov_reg_mem(*register, PhysReg::Rsp, source_offset);
+            }
+        } else {
+            let stack_index = stack.expect("external stack placement has no index");
+            let stack_offset = if cfg!(windows) {
+                32 + stack_index * 8
+            } else {
+                stack_index * 8
+            };
+            let stack_offset =
+                i32::try_from(stack_offset).expect("external call frame is too large");
+            if ty == Ty::F64 {
+                let scratch = forge_regalloc::SCRATCH_XMM[2];
+                asm.movsd_reg_mem(scratch, PhysReg::Rsp, source_offset);
+                asm.movsd_mem_reg(PhysReg::Rsp, stack_offset, scratch);
+            } else {
+                let scratch = forge_regalloc::SCRATCH_GPR[1];
+                asm.mov_reg_mem(scratch, PhysReg::Rsp, source_offset);
+                asm.mov_mem_reg(PhysReg::Rsp, stack_offset, scratch);
+            }
+        }
+    }
+
+    asm.mov_reg_imm(
+        PhysReg::R11,
+        i64::try_from(address).expect("external target address does not fit in i64"),
+    );
+    asm.call_reg(PhysReg::R11);
+    let result_ty = value_ty(
+        func,
+        selected,
+        def_of(&selected.insts[position]).expect("external call has a result"),
+    );
+    if result_ty == Ty::F64 {
+        let scratch = forge_regalloc::SCRATCH_XMM[2];
+        asm.movsd_reg_reg(scratch, PhysReg::Xmm0);
+        for (i, (reg, _)) in saved.iter().enumerate().rev() {
+            let offset =
+                i32::try_from(save_base + i * 8).expect("external call frame is too large");
+            if is_xmm_reg(*reg) {
+                asm.movsd_reg_mem(*reg, PhysReg::Rsp, offset);
+            } else {
+                asm.mov_reg_mem(*reg, PhysReg::Rsp, offset);
+            }
+        }
+        if dst != scratch {
+            asm.movsd_reg_reg(dst, scratch);
+        }
+    } else {
+        let scratch = forge_regalloc::SCRATCH_GPR[1];
+        asm.mov_reg_reg(scratch, PhysReg::Rax);
+        for (i, (reg, _)) in saved.iter().enumerate().rev() {
+            let offset =
+                i32::try_from(save_base + i * 8).expect("external call frame is too large");
+            if is_xmm_reg(*reg) {
+                asm.movsd_reg_mem(*reg, PhysReg::Rsp, offset);
+            } else {
+                asm.mov_reg_mem(*reg, PhysReg::Rsp, offset);
+            }
+        }
+        if dst != scratch {
+            asm.mov_reg_reg(dst, scratch);
+        }
+    }
+    asm.alu_reg_imm(
+        AluOp::Add,
+        PhysReg::Rsp,
+        i32::try_from(bytes).expect("external call frame is too large"),
+    );
+}
+
+fn external_arg_placements(
+    args: &[Value],
+    func: &Function,
+    selected: &SelectedFunction,
+) -> Vec<(Option<PhysReg>, Option<usize>)> {
+    let mut gpr = 0usize;
+    let mut xmm = 0usize;
+    let mut stack = 0usize;
+    args.iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let ty = value_ty(func, selected, *value);
+            if cfg!(windows) {
+                if index < 4 {
+                    let register = if ty == Ty::F64 {
+                        [PhysReg::Xmm0, PhysReg::Xmm1, PhysReg::Xmm2, PhysReg::Xmm3][index]
+                    } else {
+                        [PhysReg::Rcx, PhysReg::Rdx, PhysReg::R8, PhysReg::R9][index]
+                    };
+                    (Some(register), None)
+                } else {
+                    let slot = stack;
+                    stack += 1;
+                    (None, Some(slot))
+                }
+            } else if ty == Ty::F64 {
+                if xmm < forge_regalloc::SYSV_FLOAT_ARGS.len() {
+                    let register = forge_regalloc::SYSV_FLOAT_ARGS[xmm];
+                    xmm += 1;
+                    (Some(register), None)
+                } else {
+                    let slot = stack;
+                    stack += 1;
+                    (None, Some(slot))
+                }
+            } else if gpr < forge_regalloc::SYSV_INT_ARGS.len() {
+                let register = forge_regalloc::SYSV_INT_ARGS[gpr];
+                gpr += 1;
+                (Some(register), None)
+            } else {
+                let slot = stack;
+                stack += 1;
+                (None, Some(slot))
+            }
+        })
+        .collect()
 }
 
 fn aligned_call_bytes(saved_slots: usize, framed: bool) -> usize {

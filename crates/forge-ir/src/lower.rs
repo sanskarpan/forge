@@ -4,6 +4,7 @@ use smallvec::smallvec;
 
 use forge_syntax::ast::{BinaryOp, Expr, ExprIdx, UnaryOp};
 use forge_syntax::typeck::{Ty as AstTy, TypedAst};
+use std::collections::HashMap;
 
 use crate::builder::Builder;
 use crate::ir::*;
@@ -21,6 +22,12 @@ use crate::ir::*;
 /// or an index-out-of-bounds in `lower_call`, rather than returning a
 /// diagnostic.
 pub fn lower(typed: &TypedAst) -> Function {
+    lower_with_externals(typed, &HashMap::new())
+}
+
+/// Lowers a type-checked AST and resolves source-level external calls to the
+/// already-validated native target addresses supplied by the runtime.
+pub fn lower_with_externals(typed: &TypedAst, externals: &HashMap<String, usize>) -> Function {
     let mut b = Builder::new();
     let entry = b.create_block();
     b.f.entry = entry;
@@ -43,7 +50,7 @@ pub fn lower(typed: &TypedAst) -> Function {
         b.write_variable(name, entry, v);
     }
 
-    let (result, exit_block) = lower_expr(&mut b, typed, typed.ast.root);
+    let (result, exit_block) = lower_expr(&mut b, typed, typed.ast.root, externals);
     b.f.blocks[exit_block.0 as usize].term = Some(Terminator::Return(result));
     b.f
 }
@@ -89,7 +96,12 @@ fn coerce_to_f64(
 /// recursing into (or emitting in) the new block; see the `If` arm for the
 /// canonical pattern (assign `b.cur_block` immediately before each
 /// `lower_expr` call into a freshly created block).
-fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block) {
+fn lower_expr(
+    b: &mut Builder,
+    typed: &TypedAst,
+    idx: ExprIdx,
+    externals: &HashMap<String, usize>,
+) -> (Value, Block) {
     let span = typed.ast.span(idx);
     let ty = lower_ty(typed.types[idx.index()]);
     let block = b.cur_block;
@@ -101,7 +113,7 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
         Expr::Ident(name) => (b.read_variable(&name, block, ty), block),
 
         Expr::Unary { op, operand } => {
-            let (v, block) = lower_expr(b, typed, operand);
+            let (v, block) = lower_expr(b, typed, operand, externals);
             b.cur_block = block;
             let inst = match op {
                 UnaryOp::Neg => Inst::Neg(v),
@@ -111,9 +123,9 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
         }
 
         Expr::Binary { op, lhs, rhs } => {
-            let (l, block) = lower_expr(b, typed, lhs);
+            let (l, block) = lower_expr(b, typed, lhs, externals);
             b.cur_block = block;
-            let (r, block) = lower_expr(b, typed, rhs);
+            let (r, block) = lower_expr(b, typed, rhs, externals);
             b.cur_block = block;
             // Implicit i64 -> f64 widening (SPEC §3): typeck's check_binary
             // allows (F64,F64), (I64,F64), (F64,I64), and (I64,I64), yielding
@@ -141,14 +153,24 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
         Expr::Call { callee, args } => {
             let mut vals = Vec::new();
             let mut block = block;
+            // External signatures are exact at the source boundary. The
+            // ordinary call path permits the language's implicit i64 -> f64
+            // widening, but applying it to a registered external would
+            // change the machine-level ABI class (GPR to XMM) and pass the
+            // integer's floating-point bit pattern to the foreign target.
+            let exact_external = externals.contains_key(&callee) && !is_builtin(&callee);
             for a in &args {
-                let (v, blk) = lower_expr(b, typed, *a);
+                let (v, blk) = lower_expr(b, typed, *a, externals);
                 let arg_ty = lower_ty(typed.types[a.index()]);
                 block = blk;
                 b.cur_block = block;
-                vals.push(coerce_to_f64(b, block, v, arg_ty, span));
+                vals.push(if exact_external {
+                    v
+                } else {
+                    coerce_to_f64(b, block, v, arg_ty, span)
+                });
             }
-            let inst = lower_call(&callee, &vals);
+            let inst = lower_call(&callee, &vals, externals);
             (b.emit(block, inst, ty, span), block)
         }
 
@@ -157,7 +179,7 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
         }
 
         Expr::If { cond, then_, else_ } => {
-            let (c, block) = lower_expr(b, typed, cond);
+            let (c, block) = lower_expr(b, typed, cond, externals);
             let then_block = b.create_block();
             let else_block = b.create_block();
             let merge_block = b.create_block();
@@ -173,12 +195,12 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
             b.seal_block(else_block);
 
             b.cur_block = then_block;
-            let (then_val, then_exit) = lower_expr(b, typed, then_);
+            let (then_val, then_exit) = lower_expr(b, typed, then_, externals);
             b.f.blocks[then_exit.0 as usize].term = Some(Terminator::Jump(merge_block));
             b.add_pred(merge_block, then_exit);
 
             b.cur_block = else_block;
-            let (else_val, else_exit) = lower_expr(b, typed, else_);
+            let (else_val, else_exit) = lower_expr(b, typed, else_, externals);
             b.f.blocks[else_exit.0 as usize].term = Some(Terminator::Jump(merge_block));
             b.add_pred(merge_block, else_exit);
 
@@ -196,10 +218,10 @@ fn lower_expr(b: &mut Builder, typed: &TypedAst, idx: ExprIdx) -> (Value, Block)
         // can never collide with (or need restoring after) any other
         // binding — see the design doc's "Resolved ambiguities".
         Expr::Let { name, value, body } => {
-            let (v, block) = lower_expr(b, typed, value);
+            let (v, block) = lower_expr(b, typed, value, externals);
             b.cur_block = block;
             b.write_variable(&name, block, v);
-            lower_expr(b, typed, body)
+            lower_expr(b, typed, body, externals)
         }
     };
 
@@ -256,6 +278,27 @@ fn lower_binary(op: BinaryOp, l: Value, r: Value) -> Inst {
     }
 }
 
+fn is_builtin(callee: &str) -> bool {
+    matches!(
+        callee,
+        "sqrt"
+            | "abs"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "trunc"
+            | "min"
+            | "max"
+            | "fma"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "exp"
+            | "log"
+            | "pow"
+    )
+}
+
 /// # Precondition
 ///
 /// `callee` must be a known intrinsic name and `args` must have exactly the
@@ -263,7 +306,7 @@ fn lower_binary(op: BinaryOp, l: Value, r: Value) -> Inst {
 /// ceil/round/trunc/sin/cos/tan/exp/log, 2 for min/max/pow, 3 for fma) — see
 /// `lower`'s doc comment. The `debug_assert!`s below turn a violation into a
 /// clear panic message in debug builds instead of a raw index-out-of-bounds.
-fn lower_call(callee: &str, args: &[Value]) -> Inst {
+fn lower_call(callee: &str, args: &[Value], externals: &HashMap<String, usize>) -> Inst {
     match callee {
         "sqrt" => {
             debug_assert!(args.len() == 1);
@@ -347,7 +390,15 @@ fn lower_call(callee: &str, args: &[Value]) -> Inst {
                 args: args.iter().copied().collect(),
             }
         }
-        other => unreachable!("type checker already rejected unknown intrinsic `{other}`"),
+        other => {
+            let address = *externals
+                .get(other)
+                .unwrap_or_else(|| panic!("type checker accepted unknown external `{other}`"));
+            Inst::ExternalCall {
+                address,
+                args: args.iter().copied().collect(),
+            }
+        }
     }
 }
 
