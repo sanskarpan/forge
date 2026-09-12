@@ -1037,6 +1037,36 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
+    fn typed_runtime_marshals_external_overflow_arguments_and_results() {
+        extern "C" fn sum_seven(
+            a: i64,
+            b: i64,
+            c: i64,
+            d: i64,
+            e: i64,
+            f: i64,
+            g: i64,
+        ) -> i64 {
+            a + b + c + d + e + f + g
+        }
+        let external = unsafe {
+            ExternalFunction::from_raw(
+                "sum_seven",
+                sum_seven as *const (),
+                vec![forge_ir::Ty::I64; 7],
+                forge_ir::Ty::I64,
+            )
+        };
+        let source = "sum_seven(a, b, c, d, e, f, g)";
+        let args = (1..=7).map(RtValue::I64).collect::<Vec<_>>();
+        assert_eq!(
+            evaluate_typed_with_externals(source, &args, &[external]).unwrap(),
+            RtValue::I64(28)
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
     fn typed_runtime_external_registry_rejects_bad_signatures() {
         extern "C" fn identity(value: i64) -> i64 {
             value
