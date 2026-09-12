@@ -111,7 +111,7 @@ pub fn compile_wasm(source: &str) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
 pub fn compile_artifact_json(source: &str) -> String {
     match compile_artifact(source) {
         Ok(artifact) => {
-            let analysis = match analysis_json(source) {
+            let analysis = match analysis_json(source, &artifact.wasm_bytes) {
                 Ok(analysis) => analysis,
                 Err(error) => return format!(r#"{{"ok":false,"error":{}}}"#, json_string(&error)),
             };
@@ -322,14 +322,451 @@ fn json_error(error: &str) -> String {
 }
 
 /// Produces the target-independent analysis fields used by the workbench.
-/// WASM is a stack machine, so register intervals and native assembly are
-/// represented as empty arrays with an explicit encoding marker; the lowered
-/// and optimized IR plus CFG remain real artifacts from the compiler itself.
-fn analysis_json(source: &str) -> Result<String, String> {
+/// WASM is a stack machine, so its assembly field is a decoded stack trace and
+/// its interval field contains logical stack-value lifetimes rather than
+/// native register assignments.
+fn analysis_json(source: &str, wasm_bytes: &[u8]) -> Result<String, String> {
     let analysis = analysis_core_json(source)?;
+    let (asm, intervals, max_depth) = wasm_stack_analysis(wasm_bytes)?;
     Ok(format!(
-        r#"{analysis},"intervals":[],"asm":[],"encoding":"wasm-stack""#
+        r#"{analysis},"intervals":[{intervals}],"asm":[{asm}],"encoding":"wasm-stack","stack_max_depth":{max_depth}""#
     ))
+}
+
+#[derive(Debug)]
+struct WasmStackInstruction {
+    offset: usize,
+    bytes: String,
+    text: String,
+    stack_before: usize,
+    stack_after: usize,
+    pops: usize,
+    pushes: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct WasmStackFrame {
+    base_depth: usize,
+    result_type: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct WasmStackValue {
+    id: usize,
+    start: usize,
+    ty: &'static str,
+    depth: usize,
+}
+
+/// Decodes the emitted function body into a browser-facing stack trace. This
+/// is deliberately a stack artifact, not a native disassembly: each row
+/// records the exact module byte span, decoded opcode, and abstract operand
+/// stack depth, while the interval rows show the lifetime of logical stack
+/// values.
+fn wasm_stack_analysis(wasm_bytes: &[u8]) -> Result<(String, String, usize), String> {
+    let (body, body_offset) = wasm_function_body(wasm_bytes)?;
+    let (local_group_count, mut cursor) = read_uleb(body, 0)?;
+    for _ in 0..local_group_count {
+        let (count, next) = read_uleb(body, cursor)?;
+        cursor = next
+            .checked_add(1)
+            .ok_or("WASM local declaration overflow")?;
+        if cursor > body.len() {
+            return Err("WASM local declaration is truncated".to_string());
+        }
+        if count == 0 {
+            return Err("WASM local declaration has an empty group".to_string());
+        }
+    }
+
+    let mut instructions = Vec::new();
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    let mut frames = Vec::new();
+    while cursor < body.len() {
+        let start = cursor;
+        let (info, next) = decode_wasm_instruction(body, cursor)?;
+        cursor = next;
+        let before = depth;
+        match info.text.as_str() {
+            "if" => {
+                if depth == 0 {
+                    return Err("WASM if has no condition on the stack".to_string());
+                }
+                depth -= 1;
+                frames.push(WasmStackFrame {
+                    base_depth: depth,
+                    result_type: info.pushes,
+                });
+            }
+            "else" => {
+                let frame = frames.last().ok_or("WASM else has no matching if")?;
+                depth = frame.base_depth;
+            }
+            "end" => {
+                if let Some(frame) = frames.pop() {
+                    depth = frame.base_depth + usize::from(frame.result_type.is_some());
+                } else {
+                    instructions.push(WasmStackInstruction {
+                        offset: body_offset + start,
+                        bytes: hex_bytes(&body[start..cursor]),
+                        text: info.text,
+                        stack_before: before,
+                        stack_after: depth,
+                        pops: info.pops,
+                        pushes: info.pushes,
+                    });
+                    break;
+                }
+            }
+            _ => {
+                if depth < info.pops {
+                    return Err(format!("WASM stack underflow while decoding {}", info.text));
+                }
+                depth = depth - info.pops + usize::from(info.pushes.is_some());
+            }
+        }
+        max_depth = max_depth.max(depth);
+        instructions.push(WasmStackInstruction {
+            offset: body_offset + start,
+            bytes: hex_bytes(&body[start..cursor]),
+            text: info.text,
+            stack_before: before,
+            stack_after: depth,
+            pops: info.pops,
+            pushes: info.pushes,
+        });
+    }
+    if !frames.is_empty() {
+        return Err("WASM control structure is unterminated".to_string());
+    }
+
+    let mut values = Vec::new();
+    let mut active: Vec<WasmStackValue> = Vec::new();
+    let mut next_id = 0;
+    let mut frame_values = Vec::new();
+    for (index, instruction) in instructions.iter().enumerate() {
+        if instruction.text == "if" {
+            if let Some(value) = active.pop() {
+                values.push((value.id, value.start, index, value.ty, value.depth));
+            }
+            frame_values.push((active.len(), instruction.pushes));
+        } else if instruction.text == "else" {
+            let base = frame_values.last().ok_or("WASM else has no value frame")?.0;
+            while active.len() > base {
+                if let Some(value) = active.pop() {
+                    values.push((value.id, value.start, index, value.ty, value.depth));
+                }
+            }
+        } else if instruction.text == "end" {
+            if let Some((base, result_type)) = frame_values.pop() {
+                while active.len() > base {
+                    if let Some(value) = active.pop() {
+                        values.push((value.id, value.start, index, value.ty, value.depth));
+                    }
+                }
+                if let Some(ty) = result_type {
+                    active.push(WasmStackValue {
+                        id: next_id,
+                        start: index,
+                        ty,
+                        depth: active.len(),
+                    });
+                    next_id += 1;
+                }
+            }
+        } else {
+            for _ in 0..instruction.pops {
+                if let Some(value) = active.pop() {
+                    values.push((value.id, value.start, index, value.ty, value.depth));
+                }
+            }
+            if let Some(ty) = instruction.pushes {
+                active.push(WasmStackValue {
+                    id: next_id,
+                    start: index,
+                    ty,
+                    depth: active.len(),
+                });
+                next_id += 1;
+            }
+        }
+    }
+    for value in active {
+        values.push((
+            value.id,
+            value.start,
+            instructions.len(),
+            value.ty,
+            value.depth,
+        ));
+    }
+    let asm = instructions
+        .iter()
+        .map(|instruction| {
+            format!(
+                r#"{{"offset":{},"bytes":{},"text":{},"stack_before":{},"stack_after":{}}}"#,
+                instruction.offset,
+                json_string(&instruction.bytes),
+                json_string(&instruction.text),
+                instruction.stack_before,
+                instruction.stack_after
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let intervals = values
+        .iter()
+        .map(|(id, start, end, ty, depth)| {
+            format!(
+                r#"{{"value":"s{}","start":{},"end":{},"class":{},"location":"stack[{}]"}}"#,
+                id,
+                start,
+                end,
+                json_string(ty),
+                depth
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok((asm, intervals, max_depth))
+}
+
+struct WasmInstructionInfo {
+    text: String,
+    pops: usize,
+    pushes: Option<&'static str>,
+}
+
+fn wasm_function_body(bytes: &[u8]) -> Result<(&[u8], usize), String> {
+    if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
+        return Err("WASM artifact has an invalid header".to_string());
+    }
+    let mut cursor = 8;
+    while cursor < bytes.len() {
+        let id = *bytes.get(cursor).ok_or("WASM section is missing its id")?;
+        cursor += 1;
+        let (length, next) = read_uleb(bytes, cursor)?;
+        cursor = next;
+        let end = cursor
+            .checked_add(length)
+            .ok_or("WASM section length overflow")?;
+        if end > bytes.len() {
+            return Err("WASM section is truncated".to_string());
+        }
+        if id == 10 {
+            let payload = &bytes[cursor..end];
+            let (count, body_start) = read_uleb(payload, 0)?;
+            if count != 1 {
+                return Err("WASM artifact must contain exactly one function".to_string());
+            }
+            let (body_length, body_start) = read_uleb(payload, body_start)?;
+            let body_end = body_start
+                .checked_add(body_length)
+                .ok_or("WASM function body length overflow")?;
+            if body_end > payload.len() {
+                return Err("WASM function body is truncated".to_string());
+            }
+            return Ok((&payload[body_start..body_end], cursor + body_start));
+        }
+        cursor = end;
+    }
+    Err("WASM artifact has no code section".to_string())
+}
+
+fn decode_wasm_instruction(
+    bytes: &[u8],
+    start: usize,
+) -> Result<(WasmInstructionInfo, usize), String> {
+    let opcode = *bytes.get(start).ok_or("WASM instruction is truncated")?;
+    let mut cursor = start + 1;
+    let mut text = String::new();
+    let mut pops = 0;
+    let mut pushes = None;
+    match opcode {
+        0x04 => {
+            let result = *bytes
+                .get(cursor)
+                .ok_or("WASM if result type is truncated")?;
+            cursor += 1;
+            text.push_str("if");
+            pushes = wasm_result_type(result)?;
+        }
+        0x05 => text.push_str("else"),
+        0x0b => text.push_str("end"),
+        0x10 => {
+            let (index, next) = read_uleb(bytes, cursor)?;
+            cursor = next;
+            text = format!("call {index}");
+            pops = 2;
+            pushes = Some("f64");
+        }
+        0x20 | 0x21 => {
+            let (index, next) = read_uleb(bytes, cursor)?;
+            cursor = next;
+            text = format!(
+                "{} {index}",
+                if opcode == 0x20 {
+                    "local.get"
+                } else {
+                    "local.set"
+                }
+            );
+            pops = usize::from(opcode == 0x21);
+            pushes = (opcode == 0x20).then_some("value");
+        }
+        0x41 => {
+            let (_, next) = read_sleb(bytes, cursor)?;
+            cursor = next;
+            text.push_str("i32.const");
+            pushes = Some("i32");
+        }
+        0x42 => {
+            let (_, next) = read_sleb(bytes, cursor)?;
+            cursor = next;
+            text.push_str("i64.const");
+            pushes = Some("i64");
+        }
+        0x44 => {
+            cursor = cursor.checked_add(8).ok_or("WASM f64.const overflow")?;
+            if cursor > bytes.len() {
+                return Err("WASM f64.const is truncated".to_string());
+            }
+            text.push_str("f64.const");
+            pushes = Some("f64");
+        }
+        0x45 => {
+            text.push_str("i32.eqz");
+            pops = 1;
+            pushes = Some("i32");
+        }
+        0x46..=0x47 | 0x51..=0x59 | 0x61..=0x66 | 0x71..=0x72 | 0x7c..=0x88 | 0x99..=0xa5 => {
+            text.push_str(wasm_opcode_name(opcode));
+            pops = if (0x99..=0x9f).contains(&opcode) {
+                1
+            } else {
+                2
+            };
+            pushes = Some(
+                if (0x46..=0x47).contains(&opcode)
+                    || (0x51..=0x59).contains(&opcode)
+                    || (0x61..=0x66).contains(&opcode)
+                    || (0x71..=0x72).contains(&opcode)
+                {
+                    "i32"
+                } else if (0x7c..=0x88).contains(&opcode) {
+                    "i64"
+                } else {
+                    "f64"
+                },
+            );
+        }
+        _ => {
+            return Err(format!(
+                "WASM decoder does not recognize opcode 0x{opcode:02x}"
+            ))
+        }
+    }
+    Ok((WasmInstructionInfo { text, pops, pushes }, cursor))
+}
+
+fn wasm_opcode_name(opcode: u8) -> &'static str {
+    match opcode {
+        0x46 => "i32.eq",
+        0x47 => "i32.ne",
+        0x51 => "i64.eq",
+        0x52 => "i64.ne",
+        0x53 => "i64.lt_s",
+        0x55 => "i64.gt_s",
+        0x57 => "i64.le_s",
+        0x59 => "i64.ge_s",
+        0x61 => "f64.eq",
+        0x62 => "f64.ne",
+        0x63 => "f64.lt",
+        0x64 => "f64.gt",
+        0x65 => "f64.le",
+        0x66 => "f64.ge",
+        0x71 => "i32.and",
+        0x72 => "i32.or",
+        0x7c => "i64.add",
+        0x7d => "i64.sub",
+        0x7e => "i64.mul",
+        0x7f => "i64.div_s",
+        0x81 => "i64.rem_s",
+        0x83 => "i64.and",
+        0x84 => "i64.or",
+        0x85 => "i64.xor",
+        0x86 => "i64.shl",
+        0x88 => "i64.shr_s",
+        0x99 => "f64.abs",
+        0x9a => "f64.neg",
+        0x9b => "f64.ceil",
+        0x9c => "f64.floor",
+        0x9d => "f64.trunc",
+        0x9e => "f64.nearest",
+        0x9f => "f64.sqrt",
+        0xa0 => "f64.add",
+        0xa1 => "f64.sub",
+        0xa2 => "f64.mul",
+        0xa3 => "f64.div",
+        0xa4 => "f64.min",
+        0xa5 => "f64.max",
+        _ => "unknown",
+    }
+}
+
+fn wasm_result_type(byte: u8) -> Result<Option<&'static str>, String> {
+    match byte {
+        0x40 => Ok(None),
+        0x7c => Ok(Some("f64")),
+        0x7e => Ok(Some("i64")),
+        0x7f => Ok(Some("i32")),
+        _ => Err(format!("WASM block result has unknown type 0x{byte:02x}")),
+    }
+}
+
+fn read_uleb(bytes: &[u8], mut cursor: usize) -> Result<(usize, usize), String> {
+    let mut value = 0usize;
+    let mut shift = 0usize;
+    loop {
+        let byte = *bytes
+            .get(cursor)
+            .ok_or("WASM unsigned immediate is truncated")?;
+        cursor += 1;
+        value |= usize::from(byte & 0x7f)
+            .checked_shl(shift as u32)
+            .ok_or("WASM unsigned immediate overflows usize")?;
+        if byte & 0x80 == 0 {
+            return Ok((value, cursor));
+        }
+        shift += 7;
+        if shift >= usize::BITS as usize {
+            return Err("WASM unsigned immediate is too wide".to_string());
+        }
+    }
+}
+
+fn read_sleb(bytes: &[u8], mut cursor: usize) -> Result<(i64, usize), String> {
+    let mut value = 0i64;
+    let mut shift = 0;
+    loop {
+        let byte = *bytes
+            .get(cursor)
+            .ok_or("WASM signed immediate is truncated")?;
+        cursor += 1;
+        value |= i64::from(byte & 0x7f) << shift;
+        let done = byte & 0x80 == 0;
+        shift += 7;
+        if done {
+            if shift < 64 && byte & 0x40 != 0 {
+                value |= (!0i64) << shift;
+            }
+            return Ok((value, cursor));
+        }
+        if shift >= 64 {
+            return Err("WASM signed immediate is too wide".to_string());
+        }
+    }
 }
 
 fn analysis_core_json(source: &str) -> Result<String, String> {
@@ -582,7 +1019,9 @@ mod tests {
         assert!(artifact.contains(r#""wasm_bytes_len":"#));
         assert!(artifact.contains(r#""ir_stages":["#));
         assert!(artifact.contains(r#""cfg":"digraph forge_cfg"#));
-        assert!(artifact.contains(r#""intervals":[]"#));
+        assert!(artifact.contains(r#""intervals":["#));
+        assert!(artifact.contains(r#""asm":["#));
+        assert!(artifact.contains(r#""stack_max_depth":"#));
         assert!(artifact.contains(r#""encoding":"wasm-stack""#));
 
         let error = compile_artifact_json("x +");
@@ -591,6 +1030,17 @@ mod tests {
 
         let remainder = compile_artifact_json("x % y");
         assert!(remainder.contains(r#""required_imports":["forge.fmod"]"#));
+    }
+
+    #[test]
+    fn browser_artifact_reports_stack_trace_for_control_flow_and_locals() {
+        let artifact =
+            compile_artifact_json("let t = x * x in if t < 9.0 then sqrt(t) else t + 1.0");
+        assert!(artifact.contains(r#""ok":true"#));
+        assert!(artifact.contains(r#""encoding":"wasm-stack""#));
+        assert!(artifact.contains(r#""text":"local.set "#));
+        assert!(artifact.contains(r#""text":"if""#));
+        assert!(artifact.contains(r#""location":"stack["#));
     }
 
     #[test]

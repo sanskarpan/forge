@@ -77,7 +77,9 @@ lane-preserving libm adapter that applies the interpreter's scalar operation to
 each active lane and repacks the exact results. The full AArch64
 expression backend remains an explicit scope boundary; pure acyclic
 structured conditionals are already handled by the packed evaluator with lane
-masks and predicated selects. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
+masks and predicated selects. WASM target artifacts now include a decoded
+stack-machine instruction trace with byte offsets, stack depth, and logical
+stack-value lifetimes; native register intervals remain target-specific. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
 AVX-512F, and NEON where their rounding semantics are exact; SSE4.1 width-2,
 AVX2, and AVX-512F implement ties-away-from-zero `round` with exact packed
 sequences, while SSE2-only and unsupported x86 widths use the scalar
