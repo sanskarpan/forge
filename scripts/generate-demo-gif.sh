@@ -45,6 +45,8 @@ for active in "${!labels[@]}"; do
     fi
     x_end=$((xs[index] + 138))
     y_end=$((ys[index] + 96))
+    text_x=$((xs[index] + 12))
+    text_y=$((ys[index] + 55))
     args+=(
       -fill "$color"
       -stroke "$border"
@@ -53,7 +55,7 @@ for active in "${!labels[@]}"; do
       -stroke none
       -fill "#f8fafc"
       -pointsize 19
-      -annotate "+$((xs[index] + 12))+${ys[index] + 55}" "${labels[index]}"
+      -annotate "+${text_x}+${text_y}" "${labels[index]}"
     )
   done
 
