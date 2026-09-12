@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node test.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "vite build",
     "dev": "vite --host 0.0.0.0"
   },
