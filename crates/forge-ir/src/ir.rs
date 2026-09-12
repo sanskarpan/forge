@@ -93,6 +93,16 @@ pub enum Inst {
         args: SmallVec<[Value; 2]>,
     },
 
+    /// A call to a caller-registered native C-ABI target. The target address
+    /// is resolved before lowering and is never serialized into portable
+    /// artifacts. Argument and result types come from the surrounding
+    /// function's `types` table; the runtime validates them against the
+    /// registered signature before constructing this instruction.
+    ExternalCall {
+        address: usize,
+        args: SmallVec<[Value; 2]>,
+    },
+
     IToF(Value),
     FToI(Value),
 
