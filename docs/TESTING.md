@@ -12,6 +12,7 @@ cargo clippy --workspace --all-targets --offline --locked -- -D warnings
 cargo test --workspace --offline --locked
 npm ci --prefix workbench
 npm test --prefix workbench
+npm run typecheck --prefix workbench
 npm run build --prefix workbench
 ```
 
