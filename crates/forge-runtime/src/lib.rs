@@ -1067,6 +1067,26 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
+    fn typed_runtime_executes_external_bool_result() {
+        extern "C" fn is_odd(value: i64) -> bool {
+            value & 1 != 0
+        }
+        let external = unsafe {
+            ExternalFunction::from_raw(
+                "is_odd",
+                is_odd as *const (),
+                vec![forge_ir::Ty::I64],
+                forge_ir::Ty::Bool,
+            )
+        };
+        assert_eq!(
+            evaluate_typed_with_externals("is_odd(n)", &[RtValue::I64(3)], &[external]).unwrap(),
+            RtValue::Bool(true)
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
     fn typed_runtime_external_registry_rejects_bad_signatures() {
         extern "C" fn identity(value: i64) -> i64 {
             value
