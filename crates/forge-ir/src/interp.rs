@@ -219,6 +219,10 @@ pub fn interpret(f: &Function, args: &[RtValue]) -> RtValue {
                     })
                 }
 
+                Inst::ExternalCall { address, .. } => panic!(
+                    "cannot interpret raw external call target 0x{address:x}; use the native runtime entry point"
+                ),
+
                 Inst::IToF(a) => RtValue::F64(get(&vals, *a).as_i64() as f64),
                 Inst::FToI(a) => RtValue::I64(get(&vals, *a).as_f64() as i64),
 

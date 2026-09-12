@@ -200,6 +200,25 @@ restores both before returning. Local spill slots are biased below this saved
 area, so spills cannot overwrite nonvolatile values. High-pressure native
 Windows tests verify RBX/XMM6 allocation and execution through the runtime.
 
+### Registered external calls
+
+Native callers may opt into named external calls with
+`forge_runtime::evaluate_typed_with_externals(source, args, externals)`. Each
+registered target has a unique source name, a raw C-ABI function address, an
+ordered `Vec<Ty>` parameter signature, and a `Ty` result. Registration from a
+raw address is `unsafe` because Rust cannot prove that an address actually has
+the declared C ABI; the constructor documents that the target must be a live,
+non-variadic function whose arguments and result exactly match the descriptor.
+The compiler resolves only names present in the supplied registry, keeps the
+built-in intrinsic table authoritative, and rejects duplicate names, arity or
+type mismatches, variadic signatures, aggregate types, and more than sixteen
+arguments before emission. The x86-64 emitter marshals mixed f64/i64/bool
+arguments through the System V or Win64 register banks and aligned outgoing
+stack slots, preserving live caller-saved values; the AArch64 emitter applies
+the corresponding AAPCS64 banks, stack slots, and link-register preservation.
+External calls are deliberately native-only: WASM artifact and browser APIs
+reject raw process addresses instead of attempting to serialize them.
+
 ---
 
 ## §4 Architecture
@@ -1186,8 +1205,9 @@ branches are emitted before either edge's copies, so copies cannot invalidate
 the comparison flags. Integer and boolean values share the AAPCS64 GPR class
 for both allocation and parameter-bank ordinals. Genuine pressure, calls,
 stack-backed parameters, and unsupported CFG shapes continue through the
-established spill/ABI fallbacks. Arbitrary mixed-signature external-call ABI
-support remains an open boundary.
+established spill/ABI fallbacks. Registered external calls use the typed
+scalar ABI contract described in §3 and are lowered through the native call
+paths on x86-64 and AArch64.
 
 ---
 
@@ -1328,9 +1348,10 @@ X0..X7 and supported bool-returning bodies whose comparison operands overflow a
 register bank. Native AArch64 scalar `floor`, `ceil`, `round`, and `trunc`
 also use the corresponding FRINT instruction in both register and supported
 stack-spill bodies. Control-flow phi spilling beyond the supported typed spill
-shapes and broader external calls remain outside this typed trampoline
-boundary; supported no-call structured CFGs use the scalar backend's
-CFG-aware register allocator before selecting a spill fallback.
+shapes uses the established stack-spill fallback; registered external calls
+use the direct native ABI emitter rather than the packed typed trampoline.
+Supported no-call structured CFGs use the scalar backend's CFG-aware register
+allocator before selecting a spill fallback.
 Unsupported shapes fall back to the interpreter rather than being called
 through an unverifiable function pointer type.
 
