@@ -47,6 +47,41 @@ impl std::fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
+/// A caller-owned native function made available to the typed runtime entry
+/// point. The address is deliberately explicit: Forge does not resolve
+/// symbols or infer an ABI from an arbitrary process pointer.
+#[derive(Clone, Debug)]
+pub struct ExternalFunction {
+    pub name: String,
+    pub address: usize,
+    pub params: Vec<forge_ir::Ty>,
+    pub result: forge_ir::Ty,
+}
+
+impl ExternalFunction {
+    /// Registers a raw C-ABI function address for native execution.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `address` points to a live function whose
+    /// scalar C ABI signature exactly matches `params` and `result` for the
+    /// active target. Forge validates the source-level types, but cannot
+    /// prove the foreign function's machine-level ABI from a raw pointer.
+    pub unsafe fn from_raw(
+        name: impl Into<String>,
+        address: *const (),
+        params: Vec<forge_ir::Ty>,
+        result: forge_ir::Ty,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            address: address as usize,
+            params,
+            result,
+        }
+    }
+}
+
 /// The inspectable output of the scalar compilation pipeline.
 ///
 /// This is intentionally separate from [`CompiledFunction`]: inspection is
@@ -69,6 +104,14 @@ impl From<std::io::Error> for CompileError {
 
 /// Parses, resolves, type-checks, and lowers one source expression.
 pub fn lower_source(source: &str) -> Result<Function, CompileError> {
+    lower_source_with_externals(source, &HashMap::new(), &HashMap::new())
+}
+
+fn lower_source_with_externals(
+    source: &str,
+    signatures: &HashMap<String, forge_syntax::typeck::ExternalSignature>,
+    addresses: &HashMap<String, usize>,
+) -> Result<Function, CompileError> {
     let (tokens, lex_diags) = forge_syntax::lexer::lex(source);
     if !lex_diags.is_empty() {
         return Err(CompileError::Lex(lex_diags));
@@ -77,9 +120,16 @@ pub fn lower_source(source: &str) -> Result<Function, CompileError> {
     if !parse_diags.is_empty() {
         return Err(CompileError::Parse(parse_diags));
     }
-    let typed = forge_syntax::typeck::typecheck(forge_syntax::resolve::resolve(ast))
-        .map_err(CompileError::Type)?;
-    let function = forge_ir::lower::lower(&typed);
+    let typed = forge_syntax::typeck::typecheck_with_externals(
+        forge_syntax::resolve::resolve(ast),
+        signatures,
+    )
+    .map_err(CompileError::Type)?;
+    let function = if addresses.is_empty() {
+        forge_ir::lower::lower(&typed)
+    } else {
+        forge_ir::lower::lower_with_externals(&typed, addresses)
+    };
     forge_ir::verify::verify(&function).map_err(CompileError::Ir)?;
     Ok(function)
 }
@@ -167,6 +217,99 @@ pub fn evaluate_typed(source: &str, args: &[RtValue]) -> Result<RtValue, Compile
     Ok(forge_ir::interp::interpret(&function, args))
 }
 
+/// Executes a typed expression that calls functions supplied by the caller.
+///
+/// External calls are native-only by design: the registry contains raw
+/// process addresses, so this API never silently falls back to the portable
+/// interpreter or emits a WASM/portable artifact containing those addresses.
+/// Built-in Forge intrinsics remain authoritative when a registry name would
+/// otherwise collide with one.
+pub fn evaluate_typed_with_externals(
+    source: &str,
+    args: &[RtValue],
+    externals: &[ExternalFunction],
+) -> Result<RtValue, CompileError> {
+    let mut signatures = HashMap::new();
+    let mut addresses = HashMap::new();
+    for external in externals {
+        if external.name.is_empty() {
+            return Err(CompileError::UnsupportedTarget(
+                "external function names must not be empty",
+            ));
+        }
+        if external.address == 0 {
+            return Err(CompileError::UnsupportedTarget(
+                "external function addresses must be non-null",
+            ));
+        }
+        if external.params.len() > 16 {
+            return Err(CompileError::UnsupportedTarget(
+                "external functions support at most 16 scalar parameters",
+            ));
+        }
+        if signatures
+            .insert(
+                external.name.clone(),
+                forge_syntax::typeck::ExternalSignature {
+                    params: external.params.iter().copied().map(syntax_ty).collect(),
+                    result: syntax_ty(external.result),
+                },
+            )
+            .is_some()
+            || addresses
+                .insert(external.name.clone(), external.address)
+                .is_some()
+        {
+            return Err(CompileError::UnsupportedTarget(
+                "external function names must be unique",
+            ));
+        }
+    }
+    let function = lower_source_with_externals(source, &signatures, &addresses)?;
+    validate_typed_arguments(&function, args)?;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !supports_native_typed_signature(&function) {
+            return Err(CompileError::UnsupportedTarget(
+                "external calls exceed the active x86-64 trampoline boundary",
+            ));
+        }
+        let function = prepare_function(function, true)?;
+        let artifacts = compile_native_x86_function(function)?;
+        return execute_native_typed_bytes(args, &artifacts.function, &artifacts.bytes);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let function = prepare_function(function, true)?;
+        let bytes = forge_aarch64::emit_scalar(&function)
+            .map_err(|_| CompileError::UnsupportedTarget("AArch64 external call emission failed"))?;
+        if let Some(value) = execute_native_typed_aarch64_bytes(args, &function, &bytes)? {
+            return Ok(value);
+        }
+        return Err(CompileError::UnsupportedTarget(
+            "AArch64 external call signature is outside the native boundary",
+        ));
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = function;
+        Err(CompileError::UnsupportedTarget(
+            "registered external calls require a native x86-64 or AArch64 target",
+        ))
+    }
+}
+
+fn syntax_ty(ty: forge_ir::Ty) -> forge_syntax::typeck::Ty {
+    match ty {
+        forge_ir::Ty::F64 => forge_syntax::typeck::Ty::F64,
+        forge_ir::Ty::I64 => forge_syntax::typeck::Ty::I64,
+        forge_ir::Ty::Bool => forge_syntax::typeck::Ty::Bool,
+    }
+}
+
 fn value_ty(value: RtValue) -> forge_ir::Ty {
     match value {
         RtValue::F64(_) => forge_ir::Ty::F64,
@@ -209,15 +352,23 @@ fn execute_native_typed(
     function: &Function,
 ) -> Result<RtValue, CompileError> {
     let artifacts = compile_artifacts(source)?;
-    let result_ty = *artifacts
-        .function
+    execute_native_typed_bytes(args, &artifacts.function, &artifacts.bytes)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn execute_native_typed_bytes(
+    args: &[RtValue],
+    function: &Function,
+    bytes: &[u8],
+) -> Result<RtValue, CompileError> {
+    let result_ty = *function
         .types
         .last()
         .ok_or(CompileError::UnsupportedTarget(
             "function has no result type",
         ))?;
-    let mut body = ExecutableBuffer::new(artifacts.bytes.len())?;
-    body.write(|dst| dst[..artifacts.bytes.len()].copy_from_slice(&artifacts.bytes));
+    let mut body = ExecutableBuffer::new(bytes.len())?;
+    body.write(|dst| dst[..bytes.len()].copy_from_slice(bytes));
     body.make_executable()?;
 
     let mut trampoline = Assembler::new();
@@ -417,13 +568,6 @@ fn execute_native_typed_aarch64(
         .ok_or(CompileError::UnsupportedTarget(
             "function has no result type",
         ))?;
-    // The mixed f64-result emitter also handles AAPCS64 stack-backed
-    // parameters. Keep the packed trampoline's immediate-offset limit
-    // explicit so an unusually large public signature falls back cleanly.
-    if function.params.len() > 4095 {
-        return Ok(None);
-    }
-
     let bytes = match result_ty {
         forge_ir::Ty::F64 => forge_aarch64::emit_f64(function),
         forge_ir::Ty::I64
@@ -439,6 +583,28 @@ fn execute_native_typed_aarch64(
     let Ok(bytes) = bytes else {
         return Ok(None);
     };
+    execute_native_typed_aarch64_bytes(args, function, &bytes)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn execute_native_typed_aarch64_bytes(
+    args: &[RtValue],
+    function: &Function,
+    bytes: &[u8],
+) -> Result<Option<RtValue>, CompileError> {
+    let result_ty = *function
+        .types
+        .last()
+        .ok_or(CompileError::UnsupportedTarget(
+            "function has no result type",
+        ))?;
+    // The mixed f64-result emitter also handles AAPCS64 stack-backed
+    // parameters. Keep the packed trampoline's immediate-offset limit
+    // explicit so an unusually large public signature falls back cleanly.
+    if function.params.len() > 4095 {
+        return Ok(None);
+    }
+
     let mut body = ExecutableBuffer::new(bytes.len())?;
     body.write(|dst| dst[..bytes.len()].copy_from_slice(&bytes));
     body.make_executable()?;
@@ -619,7 +785,11 @@ pub fn compile_artifacts_with_optimization(
     source: &str,
     optimize: bool,
 ) -> Result<CompilationArtifacts, CompileError> {
-    let mut function = lower_source(source)?;
+    let function = prepare_function(lower_source(source)?, optimize)?;
+    compile_x86_artifacts(function)
+}
+
+fn prepare_function(mut function: Function, optimize: bool) -> Result<Function, CompileError> {
     if optimize {
         forge_opt::optimize(&mut function);
     }
@@ -630,6 +800,15 @@ pub fn compile_artifacts_with_optimization(
         ));
     }
     forge_ir::verify::verify(&function).map_err(CompileError::Ir)?;
+    Ok(function)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn compile_native_x86_function(function: Function) -> Result<CompilationArtifacts, CompileError> {
+    compile_x86_artifacts(function)
+}
+
+fn compile_x86_artifacts(function: Function) -> Result<CompilationArtifacts, CompileError> {
     let selected = forge_x64::select(&function);
     let intervals = forge_regalloc::build_intervals(&function, &selected);
     let excluded = forge_regalloc::excluded_registers(&function, &selected);
@@ -829,6 +1008,63 @@ mod tests {
             evaluate_typed("p0 + p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8", &float_args,).unwrap(),
             RtValue::F64(45.0)
         );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn typed_runtime_executes_registered_mixed_external_call() {
+        extern "C" fn add_bias(value: f64, bias: i64) -> f64 {
+            value + bias as f64
+        }
+        let external = unsafe {
+            ExternalFunction::from_raw(
+                "add_bias",
+                add_bias as *const (),
+                vec![forge_ir::Ty::F64, forge_ir::Ty::I64],
+                forge_ir::Ty::F64,
+            )
+        };
+        assert_eq!(
+            evaluate_typed_with_externals(
+                "add_bias(x, n) * 2.0",
+                &[RtValue::F64(2.5), RtValue::I64(3)],
+                &[external],
+            )
+            .unwrap(),
+            RtValue::F64(11.0)
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn typed_runtime_external_registry_rejects_bad_signatures() {
+        extern "C" fn identity(value: i64) -> i64 {
+            value
+        }
+        let external = unsafe {
+            ExternalFunction::from_raw(
+                "identity",
+                identity as *const (),
+                vec![forge_ir::Ty::I64],
+                forge_ir::Ty::I64,
+            )
+        };
+        assert!(matches!(
+            evaluate_typed_with_externals(
+                "identity(x)",
+                &[RtValue::F64(1.0)],
+                &[external.clone()],
+            ),
+            Err(CompileError::UnsupportedTarget(_))
+        ));
+        assert!(matches!(
+            evaluate_typed_with_externals(
+                "identity(x)",
+                &[RtValue::I64(1)],
+                &[external.clone(), external],
+            ),
+            Err(CompileError::UnsupportedTarget(_))
+        ));
     }
 
     #[cfg(target_arch = "aarch64")]
