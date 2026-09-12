@@ -277,7 +277,7 @@ pub fn evaluate_typed_with_externals(
         }
         let function = prepare_function(function, true)?;
         let artifacts = compile_native_x86_function(function)?;
-        return execute_native_typed_bytes(args, &artifacts.function, &artifacts.bytes);
+        execute_native_typed_bytes(args, &artifacts.function, &artifacts.bytes)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -350,7 +350,7 @@ fn supports_native_typed_signature(function: &Function) -> bool {
 fn execute_native_typed(
     source: &str,
     args: &[RtValue],
-    function: &Function,
+    _function: &Function,
 ) -> Result<RtValue, CompileError> {
     let artifacts = compile_artifacts(source)?;
     execute_native_typed_bytes(args, &artifacts.function, &artifacts.bytes)
