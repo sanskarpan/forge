@@ -1,0 +1,15 @@
+[book]
+title = "Forge — An Auditable JIT Compiler"
+description = "Architecture, correctness, platform, and contribution documentation for Forge."
+authors = ["Sanskar Pandey"]
+language = "en"
+src = "."
+
+[build]
+create-missing = false
+extra-watch-dirs = ["assets"]
+
+[output.html]
+git-repository-url = "https://github.com/sanskarpan/forge"
+edit-url-template = "https://github.com/sanskarpan/forge/edit/main/docs/{path}"
+site-url = "/forge/"
