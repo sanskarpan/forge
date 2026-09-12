@@ -77,6 +77,13 @@ Nested source loops use declarations such as
 row-major columns and dimensions to `evaluate_nested_vectorized`. That API
 checks shape products, typed broadcasts, and every computed index before any
 load, and uses the verified scalar evaluator for arbitrary nested addressing.
+Native callers can register scalar C-ABI functions with
+`forge_runtime::ExternalFunction::from_raw` and execute named calls through
+`evaluate_typed_with_externals`. The registry requires an exact `f64`/`i64`/
+`bool` signature and supports mixed arguments on x86-64 System V/Win64 and
+AArch64 AAPCS64, including aligned overflow stack slots. Raw addresses never
+enter portable or WASM artifacts; unsupported targets reject the native-only
+API explicitly.
 Array expressions containing
 `sin`, `cos`, `tan`, `exp`, `log`, or `pow` retain packed execution through a
 lane-preserving libm adapter that applies the interpreter's scalar operation to
