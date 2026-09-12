@@ -12,12 +12,16 @@ xs=(56 228 400 572 744 916 1088)
 ys=(245 245 245 245 245 245 245)
 width=1280
 height=720
+font_path=/System/Library/Fonts/SFNSMono.ttf
+if [[ ! -f "$font_path" ]]; then
+  font_path=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+fi
 
 for active in "${!labels[@]}"; do
   args=(
     -size "${width}x${height}"
     "xc:#0b1020"
-    -font DejaVu-Sans
+    -font "$font_path"
     -gravity NorthWest
     -stroke none
     -fill "#f8fafc"
