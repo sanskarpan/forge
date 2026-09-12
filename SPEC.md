@@ -1205,8 +1205,9 @@ branches are emitted before either edge's copies, so copies cannot invalidate
 the comparison flags. Integer and boolean values share the AAPCS64 GPR class
 for both allocation and parameter-bank ordinals. Genuine pressure, calls,
 stack-backed parameters, and unsupported CFG shapes continue through the
-established spill/ABI fallbacks. Arbitrary mixed-signature external-call ABI
-support remains an open boundary.
+established spill/ABI fallbacks. Registered external calls use the typed
+scalar ABI contract described in §3 and are lowered through the native call
+paths on x86-64 and AArch64.
 
 ---
 
@@ -1347,9 +1348,10 @@ X0..X7 and supported bool-returning bodies whose comparison operands overflow a
 register bank. Native AArch64 scalar `floor`, `ceil`, `round`, and `trunc`
 also use the corresponding FRINT instruction in both register and supported
 stack-spill bodies. Control-flow phi spilling beyond the supported typed spill
-shapes and broader external calls remain outside this typed trampoline
-boundary; supported no-call structured CFGs use the scalar backend's
-CFG-aware register allocator before selecting a spill fallback.
+shapes uses the established stack-spill fallback; registered external calls
+use the direct native ABI emitter rather than the packed typed trampoline.
+Supported no-call structured CFGs use the scalar backend's CFG-aware register
+allocator before selecting a spill fallback.
 Unsupported shapes fall back to the interpreter rather than being called
 through an unverifiable function pointer type.
 
