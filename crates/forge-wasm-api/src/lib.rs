@@ -355,6 +355,7 @@ struct WasmStackValue {
     id: usize,
     start: usize,
     ty: &'static str,
+    depth: usize,
 }
 
 /// Decodes the emitted function body into a browser-facing stack trace. This
@@ -447,21 +448,21 @@ fn wasm_stack_analysis(wasm_bytes: &[u8]) -> Result<(String, String, usize), Str
     for (index, instruction) in instructions.iter().enumerate() {
         if instruction.text == "if" {
             if let Some(value) = active.pop() {
-                values.push((value.id, value.start, index, value.ty));
+                values.push((value.id, value.start, index, value.ty, value.depth));
             }
             frame_values.push((active.len(), instruction.pushes));
         } else if instruction.text == "else" {
             let base = frame_values.last().ok_or("WASM else has no value frame")?.0;
             while active.len() > base {
                 if let Some(value) = active.pop() {
-                    values.push((value.id, value.start, index, value.ty));
+                    values.push((value.id, value.start, index, value.ty, value.depth));
                 }
             }
         } else if instruction.text == "end" {
             if let Some((base, result_type)) = frame_values.pop() {
                 while active.len() > base {
                     if let Some(value) = active.pop() {
-                        values.push((value.id, value.start, index, value.ty));
+                        values.push((value.id, value.start, index, value.ty, value.depth));
                     }
                 }
                 if let Some(ty) = result_type {
@@ -469,6 +470,7 @@ fn wasm_stack_analysis(wasm_bytes: &[u8]) -> Result<(String, String, usize), Str
                         id: next_id,
                         start: index,
                         ty,
+                        depth: active.len(),
                     });
                     next_id += 1;
                 }
@@ -476,7 +478,7 @@ fn wasm_stack_analysis(wasm_bytes: &[u8]) -> Result<(String, String, usize), Str
         } else {
             for _ in 0..instruction.pops {
                 if let Some(value) = active.pop() {
-                    values.push((value.id, value.start, index, value.ty));
+                    values.push((value.id, value.start, index, value.ty, value.depth));
                 }
             }
             if let Some(ty) = instruction.pushes {
@@ -484,13 +486,20 @@ fn wasm_stack_analysis(wasm_bytes: &[u8]) -> Result<(String, String, usize), Str
                     id: next_id,
                     start: index,
                     ty,
+                    depth: active.len(),
                 });
                 next_id += 1;
             }
         }
     }
     for value in active {
-        values.push((value.id, value.start, instructions.len(), value.ty));
+        values.push((
+            value.id,
+            value.start,
+            instructions.len(),
+            value.ty,
+            value.depth,
+        ));
     }
     let asm = instructions
         .iter()
@@ -508,14 +517,14 @@ fn wasm_stack_analysis(wasm_bytes: &[u8]) -> Result<(String, String, usize), Str
         .join(",");
     let intervals = values
         .iter()
-        .map(|(id, start, end, ty)| {
+        .map(|(id, start, end, ty, depth)| {
             format!(
                 r#"{{"value":"s{}","start":{},"end":{},"class":{},"location":"stack[{}]"}}"#,
                 id,
                 start,
                 end,
                 json_string(ty),
-                id
+                depth
             )
         })
         .collect::<Vec<_>>()
