@@ -760,8 +760,8 @@ fn emit_external_call(
     }
     for (i, (register, stack)) in placements.iter().enumerate() {
         let ty = value_ty(func, selected, args[i]);
-        let source_offset = i32::try_from(stage_base + i * 8)
-            .expect("external call frame is too large");
+        let source_offset =
+            i32::try_from(stage_base + i * 8).expect("external call frame is too large");
         if let Some(register) = register {
             if ty == Ty::F64 {
                 asm.movsd_reg_mem(*register, PhysReg::Rsp, source_offset);
@@ -775,7 +775,8 @@ fn emit_external_call(
             } else {
                 stack_index * 8
             };
-            let stack_offset = i32::try_from(stack_offset).expect("external call frame is too large");
+            let stack_offset =
+                i32::try_from(stack_offset).expect("external call frame is too large");
             if ty == Ty::F64 {
                 let scratch = forge_regalloc::SCRATCH_XMM[2];
                 asm.movsd_reg_mem(scratch, PhysReg::Rsp, source_offset);
@@ -802,7 +803,8 @@ fn emit_external_call(
         let scratch = forge_regalloc::SCRATCH_XMM[2];
         asm.movsd_reg_reg(scratch, PhysReg::Xmm0);
         for (i, (reg, _)) in saved.iter().enumerate().rev() {
-            let offset = i32::try_from(save_base + i * 8).expect("external call frame is too large");
+            let offset =
+                i32::try_from(save_base + i * 8).expect("external call frame is too large");
             if is_xmm_reg(*reg) {
                 asm.movsd_reg_mem(*reg, PhysReg::Rsp, offset);
             } else {
@@ -816,7 +818,8 @@ fn emit_external_call(
         let scratch = forge_regalloc::SCRATCH_GPR[1];
         asm.mov_reg_reg(scratch, PhysReg::Rax);
         for (i, (reg, _)) in saved.iter().enumerate().rev() {
-            let offset = i32::try_from(save_base + i * 8).expect("external call frame is too large");
+            let offset =
+                i32::try_from(save_base + i * 8).expect("external call frame is too large");
             if is_xmm_reg(*reg) {
                 asm.movsd_reg_mem(*reg, PhysReg::Rsp, offset);
             } else {
