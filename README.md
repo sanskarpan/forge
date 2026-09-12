@@ -1,112 +1,142 @@
 # forge
 
-`forge` is a small educational JIT compiler for typed mathematical
-expressions. It has a hand-written lexer/parser, typed SSA IR, reference
-interpreter, semantics-preserving optimizer, linear-scan register allocator,
-W^X executable memory, and a hand-written x86-64 encoder/emitter.
+[![CI](https://github.com/sanskarpan/forge/actions/workflows/ci.yml/badge.svg)](https://github.com/sanskarpan/forge/actions/workflows/ci.yml)
+[![Container validation](https://github.com/sanskarpan/forge/actions/workflows/ci-containers.yml/badge.svg)](https://github.com/sanskarpan/forge/actions/workflows/ci-containers.yml)
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-2563eb)](https://sanskarpan.github.io/forge/)
+[![License](https://img.shields.io/badge/license-MIT-0f172a)](LICENSE)
 
-The repository also contains portable scalar WASM and AArch64 encoder
-foundations, runtime tiering, SIMD feature/array planning, a CLI, benchmarks,
-and a React/Vite compiler workbench. The current implementation status and
-remaining boundaries are tracked in [CHECKLIST.md](CHECKLIST.md); `SPEC.md` is
-the design reference.
+`forge` is a small, auditable JIT compiler for typed mathematical
+expressions. It includes a handwritten frontend, typed SSA IR, reference
+interpreter, semantics-preserving optimizer, linear-scan register allocator,
+W^X executable memory, handwritten x86-64 emission, AArch64 emission, SIMD
+array evaluation, portable WebAssembly artifacts, and a compiler workbench.
+
+![Forge compilation pipeline](docs/assets/forge-pipeline.gif)
+
+The project is educational in scope but production-minded in engineering:
+every unsafe boundary is documented, generated code is differentially checked
+against the interpreter, encoders have disassembly round trips, and platform
+behavior is validated in native and containerized CI. It is not intended to be
+used as an unreviewed sandbox for hostile code; see [SECURITY.md](SECURITY.md).
+
+## What it demonstrates
+
+| Layer | Capability |
+| --- | --- |
+| Frontend | Spans, diagnostics, typed expressions, `let`, conditionals, intrinsic calls |
+| IR | SSA values, φ nodes, dominance, structural verification, textual printing |
+| Optimizer | Folding, GVN/CSE, DCE, reassociation, strength reduction, FMA handling |
+| Native code | Handwritten x86-64 and AArch64 encoders, ABI-aware calls, spills, W^X memory |
+| Arrays | Packed f64 evaluation, tails, reductions, broadcasts, offsets, nested shapes |
+| Portable artifacts | Typed WASM, decoded stack instructions, lifetimes, AST/IR/CFG metadata |
+| Tooling | `eval`, `compile`, `asm`, `ir`, `cfg`, `regalloc`, `bench`, `verify`, `repl` |
+| Workbench | Live editor, diagnostics, AST/IR/CFG, allocation, bytes, benchmarks, targets |
 
 ## Quick start
 
 ```sh
 cargo test --workspace --offline --locked
-cargo clippy --workspace --offline --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --offline --locked -- -D warnings
+cargo fmt --all -- --check
+
 cargo run -p forge-cli -- eval 'x * x + 1' --x 3
 cargo run -p forge-cli -- asm 'x * x + 1'
 cargo run -p forge-cli -- ir 'sqrt(x * x + y * y)'
 cargo run -p forge-cli -- cfg 'if x > 0.0 then x else -x' --dot
+```
+
+To run the workbench locally:
+
+```sh
 npm ci --prefix workbench
 npm test --prefix workbench
 npm run build --prefix workbench
+npm run dev --prefix workbench
 ```
 
-The native x86-64 JIT runs when built on x86-64. On other hosts, the runtime
-uses the verified interpreter for evaluation while still exposing x86 bytes
-and allocation artifacts for inspection. `make qemu-aarch64` runs a cross
-test when QEMU and the target toolchain are installed, otherwise it runs the
-native AArch64 encoder tests.
+The workbench expects a release `forge-wasm-api` web bundle exposed as
+`window.forgeWasm`. The browser executes WASM artifacts; x86-64 and AArch64
+bytes are inspection artifacts and are never executed in the browser.
 
 ## Architecture
 
-Source is lowered through `forge-syntax` and `forge-ir`, checked after each
-optimizer pass, selected into virtual machine instructions, allocated into
-physical registers/spill slots, and finally emitted into executable memory.
-The interpreter is the correctness oracle; differential tests compare result
-bits where the target can execute the JIT.
-
 ```text
-source → syntax/types → SSA IR → optimize → select → allocate → emit → W^X JIT
-                                      ↘ interpreter / WASM / inspection artifacts
+source
+  → lex / parse / resolve / type-check
+  → typed SSA IR
+  → verify
+  → optimize (with verification after every pass)
+  → select machine instructions
+  → allocate registers and spill slots
+  → verify allocation
+  → emit handwritten machine code
+  → W^X executable memory
 ```
 
-The project writes its own x86 encodings. `iced-x86` is used only as a
-disassembly test oracle. See [docs/ENCODING.md](docs/ENCODING.md),
-[docs/REGALLOC.md](docs/REGALLOC.md), [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md),
-and [docs/PLATFORMS.md](docs/PLATFORMS.md) for the implementation details.
+The interpreter is the semantic oracle. Native differential tests compare
+result bits, including NaNs, infinities, signed zero, subnormals, integer
+overflow, and guarded operations. Portable and unsupported paths fail closed to
+the verified interpreter rather than guessing at an ABI.
 
-## Scope notes
+## Repository map
 
-The documented source-level array form is now available end to end:
-`@vectorize result[i] = a[i] * b[i] + c[i]` parses indexed f64 columns,
-while unindexed f64 names are scalar broadcasts, e.g.
-`@vectorize result[i] = a[i] + scale`. Both forms lower to verified array
-loop/memory IR and execute through the packed evaluator with scalar epilogues
-and exact fallback. Supply broadcast values with
-`forge_simd::evaluate_vectorized_with_broadcasts` (or its feature-masked
-variant) separately from the input columns; packed backends splat them without
-materializing repeated arrays. Indexed columns also support constant offsets,
-for example `@vectorize result[i] = a[i + 1] - b[i - 2]`. The evaluator uses
-the largest shared in-bounds window: negative offsets skip leading rows,
-positive offsets trim trailing rows, and a window too short for the requested
-offsets returns an empty result. The same column may be used at multiple
-constant offsets, including stencil-style expressions such as
-`a[i - 1] + a[i] + a[i + 1]`. Loop-invariant dynamic scalar offsets such as
-`a[i + shift]` are supported through
-`evaluate_vectorized_with_typed_broadcasts` with an `RtValue::I64`; the runtime
-materializes the call-time offset into the same checked constant-offset window.
-The f64-only broadcast APIs continue to reject these sources because their ABI
-cannot carry an i64 value. Per-row array-valued indices and other genuinely
-non-contiguous gathers remain outside the current one-dimensional language.
-Nested source loops use declarations such as
-`@vectorize result[i, j] = a[i * width + j] + bias`; callers pass flattened
-row-major columns and dimensions to `evaluate_nested_vectorized`. That API
-checks shape products, typed broadcasts, and every computed index before any
-load, and uses the verified scalar evaluator for arbitrary nested addressing.
-Native callers can register scalar C-ABI functions with
-`forge_runtime::ExternalFunction::from_raw` and execute named calls through
-`evaluate_typed_with_externals`. The registry requires an exact `f64`/`i64`/
-`bool` signature and supports mixed arguments on x86-64 System V/Win64 and
-AArch64 AAPCS64, including aligned overflow stack slots. Raw addresses never
-enter portable or WASM artifacts; unsupported targets reject the native-only
-API explicitly.
-Array expressions containing
-`sin`, `cos`, `tan`, `exp`, `log`, or `pow` retain packed execution through a
-lane-preserving libm adapter that applies the interpreter's scalar operation to
-each active lane and repacks the exact results. The full AArch64
-expression backend remains an explicit scope boundary; pure acyclic
-structured conditionals are already handled by the packed evaluator with lane
-masks and predicated selects. WASM target artifacts now include a decoded
-stack-machine instruction trace with byte offsets, stack depth, and logical
-stack-value lifetimes; native register intervals remain target-specific. Array mode also uses packed floor/ceil/trunc instructions on AVX2,
-AVX-512F, and NEON where their rounding semantics are exact; SSE4.1 width-2,
-AVX2, and AVX-512F implement ties-away-from-zero `round` with exact packed
-sequences, while SSE2-only and unsupported x86 widths use the scalar
-interpreter fallback. Array
-callers can use `evaluate_array_with_features`,
-`evaluate_vectorized_with_features`,
-`evaluate_vectorized_with_broadcasts_and_features`, or
-`reduce_sum_with_features` to apply a host-safe SIMD feature mask;
-`evaluate_vectorized` and `evaluate_vectorized_with_broadcasts` are the
-convenience entries without an explicit mask. The scalar
-mask forces the exact interpreter fallback. The tested wasm-bindgen artifact/benchmark API
-and React workbench are available; the browser executes real WASM artifacts
-and receives serialized x86-64/AArch64 inspection artifacts for supported
-expressions. Native bytes are never executed in the browser, and expressions
-requiring process-local libm addresses remain an explicit unavailable case.
-These boundaries are explicit follow-up phases rather than hidden runtime
-fallbacks; the current status table in `CHECKLIST.md` is authoritative.
+```text
+crates/forge-syntax   lexer, parser, resolver, diagnostics, type checker
+crates/forge-ir       typed SSA IR, lowering, interpreter, verifier
+crates/forge-opt      optimization passes and differential property tests
+crates/forge-x64      handwritten x86-64 instruction selection and encoding
+crates/forge-aarch64  AArch64 encoding, scalar emission, ABI support
+crates/forge-regalloc liveness, linear scan, spills, allocation verification
+crates/forge-emit     physical x86-64 emission and layout
+crates/forge-mem      W^X executable memory and code cache
+crates/forge-runtime  public compile/evaluate/tiering APIs
+crates/forge-simd     packed array plans and feature-safe evaluation
+crates/forge-wasm     portable WASM byte emission
+crates/forge-wasm-api wasm-bindgen/browser artifact API
+crates/forge-cli      command-line inspection and evaluation tools
+workbench/            React/Vite compiler observatory
+docs/                 mdBook documentation and implementation guides
+```
+
+## Supported boundaries
+
+The current implementation status is maintained in
+[`CHECKLIST.md`](CHECKLIST.md). Registered native external functions require
+an explicit name, address, scalar parameter types, and scalar result type. The
+runtime validates that contract and marshals supported f64/i64/bool signatures
+for System V x86-64, Win64, and AAPCS64. Raw function addresses are rejected
+from WASM and other portable paths.
+
+Array mode supports canonical indexed columns, constant and loop-invariant
+typed offsets, scalar broadcasts, packed libm adapters, reductions, tails, and
+checked nested row-major shapes. Arbitrary per-row gathers and arbitrary
+memory addressing remain outside the language contract. Unsupported native
+operations use the interpreter fallback with an explicit diagnostic.
+
+## Documentation
+
+The [Forge documentation site](https://sanskarpan.github.io/forge/) is built
+from `docs/` with mdBook on every documentation change and deployed from
+`main`. Useful entry points include:
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Testing and verification](docs/TESTING.md)
+- [Platform and W^X notes](docs/PLATFORMS.md)
+- [Encoding guide](docs/ENCODING.md)
+- [Register allocation guide](docs/REGALLOC.md)
+- [Optimization guide](docs/OPTIMIZATION.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+
+## Quality gates
+
+The required CI matrix covers macOS build/codesign, native Windows, Linux
+x86-64 containers, emulated Linux ARM64, WASM packaging, Workbench builds,
+Valgrind executable-memory checks, Clippy, and rustfmt. The same commands are
+available through `make`, including `make container-test-arm64` on an Apple
+Silicon host with Docker or Podman.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
