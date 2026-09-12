@@ -1,0 +1,3 @@
+# Default reviewer for source, documentation, workflows, and generated
+# artifacts. Keep this file small so ownership remains unambiguous.
+* @sanskarpan
