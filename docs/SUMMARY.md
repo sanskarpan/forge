@@ -5,6 +5,7 @@
 - [Architecture](ARCHITECTURE.md)
 - [Testing and verification](TESTING.md)
 - [Release and compatibility](RELEASE.md)
+- [Checklist audit](CHECKLIST_AUDIT.md)
 - [Encoding](ENCODING.md)
 - [Register allocation](REGALLOC.md)
 - [Optimization](OPTIMIZATION.md)

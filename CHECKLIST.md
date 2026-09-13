@@ -11,6 +11,9 @@ audit. The long phase sections below retain the original design history and
 scope notes; their historical `[ ]` markers are not a claim that already
 implemented lower-level work is absent.
 
+For the phase-by-phase release audit, verification commands, and explicit
+scope resolutions, see [`docs/CHECKLIST_AUDIT.md`](docs/CHECKLIST_AUDIT.md).
+
 | Area | Current state | Evidence |
 |---|---|---|
 | Front end, SSA IR, interpreter, optimizer, executable memory, x86 encoder and selection | Implemented and workspace-tested | `crates/forge-*/src`, `cargo test --workspace --offline` |
