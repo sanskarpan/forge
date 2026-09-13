@@ -13,7 +13,7 @@ if (!packageJson.includes('"build"')) throw new Error('workbench build script is
 for (const marker of ['id="root"', 'src="/src/main.tsx"']) {
   if (!html.includes(marker)) throw new Error(`workbench shell missing ${marker}`);
 }
-for (const marker of ['EditorView', 'AstPanel', 'IrPanel', 'CfgPanel', 'IntervalPanel', 'AssemblyPanel', 'BenchmarkPanel', 'TargetPanel', 'ResponsiveContainer']) {
+for (const marker of ['EditorView', 'AstPanel', 'IrPanel', 'CfgPanel', 'IntervalPanel', 'PressureCurve', 'AssemblyPanel', 'BenchmarkPanel', 'TargetPanel', 'ResponsiveContainer', 'Share']) {
   if (!app.includes(marker)) throw new Error(`workbench UI missing ${marker}`);
 }
 for (const marker of ['parse_and_check', 'compile_artifact_json', 'compile_target_artifact_json', 'WebAssembly.instantiate', 'benchmark', 'globalThis.forgeWasm']) {
