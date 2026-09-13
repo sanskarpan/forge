@@ -205,16 +205,18 @@ fn native_x64_artifact(source: &str) -> Result<String, String> {
             selected.insts.len()
         ))
     );
-    let intervals = intervals_json(&intervals, &assignment);
+    let intervals_json = intervals_json(&intervals, &assignment);
+    let pressure = pressure_json(&intervals, selected.insts.len());
     let analysis = analysis_core_json(source)?;
     Ok(format!(
-        r#"{{"ok":true,"target":"x86_64","parameter_types":[{}],"result_type":{},"bytes_hex":{},"bytes_len":{},"wasm_bytes_hex":"","wasm_bytes_len":0,"asm":[{}],"intervals":[{}],"encoding":"x86-64",{}}}"#,
+        r#"{{"ok":true,"target":"x86_64","parameter_types":[{}],"result_type":{},"bytes_hex":{},"bytes_len":{},"wasm_bytes_hex":"","wasm_bytes_len":0,"asm":[{}],"intervals":[{}],"pressure":[{}],"encoding":"x86-64",{}}}"#,
         parameter_types_json(&function),
         json_string(&result_type_name(&function)),
         json_string(&hex_bytes(&bytes)),
         bytes.len(),
         asm,
-        intervals,
+        intervals_json,
+        pressure,
         analysis
     ))
 }
@@ -243,7 +245,7 @@ fn native_aarch64_artifact(source: &str) -> Result<String, String> {
         .join(",");
     let analysis = analysis_core_json(source)?;
     Ok(format!(
-        r#"{{"ok":true,"target":"aarch64","parameter_types":[{}],"result_type":{},"bytes_hex":{},"bytes_len":{},"wasm_bytes_hex":"","wasm_bytes_len":0,"asm":[{}],"intervals":[],"encoding":"aarch64",{}}}"#,
+        r#"{{"ok":true,"target":"aarch64","parameter_types":[{}],"result_type":{},"bytes_hex":{},"bytes_len":{},"wasm_bytes_hex":"","wasm_bytes_len":0,"asm":[{}],"intervals":[],"pressure":[],"encoding":"aarch64",{}}}"#,
         parameter_types_json(&function),
         json_string(&result_type_name(&function)),
         json_string(&hex_bytes(&bytes)),
@@ -306,6 +308,14 @@ fn intervals_json(
                 json_string(&location)
             )
         })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn pressure_json(intervals: &[forge_regalloc::Interval], program_length: usize) -> String {
+    forge_regalloc::register_pressure(intervals, program_length)
+        .iter()
+        .map(|point| format!(r#"{{"gpr":{},"xmm":{}}}"#, point.gpr, point.xmm))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1061,6 +1071,7 @@ mod tests {
         assert!(x86.contains(r#""encoding":"x86-64"#));
         assert!(x86.contains(r#""bytes_len":"#));
         assert!(x86.contains(r#""intervals":["#));
+        assert!(x86.contains(r#""pressure":["#));
         assert!(x86.contains(r#""asm":["#));
         assert!(!x86.contains(r#""bytes":"","text":"#));
         assert_eq!(x86.matches(r#""encoding":"#).count(), 1);

@@ -6,7 +6,7 @@ import dagre from 'dagre';
 import * as d3 from 'd3';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { AstNode, CompileArtifact, Diagnostic, Interval, Target, useWorkbench } from './store';
+import { AstNode, CompileArtifact, Diagnostic, Interval, PressurePoint, Target, useWorkbench } from './store';
 import { compileCurrent, hexBytes } from './compiler';
 
 const targets: Array<{ id: Target; label: string; detail: string }> = [
@@ -94,7 +94,22 @@ function Header() {
     source: state.source, args: state.args, compiling: state.compiling, status: state.status, setArgs: state.setArgs,
   }));
   const [loading, setLoading] = useState(false);
+  const [shared, setShared] = useState(false);
   const compile = async () => { setLoading(true); await compileCurrent(source, target); setLoading(false); };
+  const share = async () => {
+    const url = new URL(window.location.href);
+    url.searchParams.set('source', source);
+    url.searchParams.set('args', args);
+    url.searchParams.set('target', target);
+    url.searchParams.set('mode', mode);
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      setShared(true);
+      window.setTimeout(() => setShared(false), 1800);
+    } catch {
+      window.prompt('Copy this Forge workbench URL', url.toString());
+    }
+  };
   return <header className="topbar">
     <div className="brand"><span className="brand-glyph">ƒ</span><div><strong>forge</strong><span>compiler workbench</span></div></div>
     <div className="top-controls">
@@ -106,6 +121,7 @@ function Header() {
       <div className="segmented" aria-label="execution mode">
         {(['scalar', 'array'] as const).map((item) => <button key={item} className={mode === item ? 'selected' : ''} onClick={() => setMode(item)}>{item}</button>)}
       </div>
+      <button className="share-button" onClick={share}>{shared ? 'Copied ✓' : 'Share ↗'}</button>
       <button className="run-button" onClick={compile} disabled={loading || compiling}>{loading || compiling ? 'Compiling…' : 'Compile ↗'}</button>
     </div>
     <div className="status-line"><span className={compiling ? 'pulse-dot' : 'status-dot'} />{status}</div>
@@ -193,11 +209,21 @@ function CfgPanel({ cfg }: { cfg: string | undefined }) {
   </svg><details><summary>DOT source</summary><CodeBlock>{cfg}</CodeBlock></details></div>;
 }
 
-function IntervalPanel({ intervals, encoding, stackMaxDepth }: { intervals?: Interval[]; encoding?: string; stackMaxDepth?: number }) {
+function PressureCurve({ pressure }: { pressure: PressurePoint[] }) {
+  const width = 640;
+  const height = 118;
+  const max = Math.max(14, ...pressure.flatMap((point) => [point.gpr, point.xmm]));
+  const x = (index: number) => pressure.length <= 1 ? width / 2 : index / (pressure.length - 1) * width;
+  const y = (value: number) => height - value / max * height;
+  const path = (field: 'gpr' | 'xmm') => pressure.map((point, index) => `${x(index).toFixed(1)},${y(point[field]).toFixed(1)}`).join(' ');
+  return <div className="pressure-wrap"><div className="pressure-legend"><span>simultaneously-live values</span><span><i className="pressure-key gpr-key" />GPR 12</span><span><i className="pressure-key xmm-key" />XMM 14</span></div><svg className="pressure-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Register pressure curve"><line className="pressure-limit gpr-limit" x1="0" x2={width} y1={y(12)} y2={y(12)} /><line className="pressure-limit xmm-limit" x1="0" x2={width} y1={y(14)} y2={y(14)} /><polyline className="pressure-line gpr-line" points={path('gpr')} /><polyline className="pressure-line xmm-line" points={path('xmm')} /></svg></div>;
+}
+
+function IntervalPanel({ intervals, pressure, encoding, stackMaxDepth }: { intervals?: Interval[]; pressure?: PressurePoint[]; encoding?: string; stackMaxDepth?: number }) {
   const wasmStack = encoding === 'wasm-stack';
-  if (!intervals?.length) return <Empty message={wasmStack ? 'No logical stack values were emitted.' : 'Native register intervals are unavailable for the WASM stack target.'} />;
+  if (!intervals?.length) return <Empty message={wasmStack ? 'No logical stack values were emitted.' : 'Native register intervals are unavailable for this target artifact.'} />;
   const max = Math.max(...intervals.map((item) => item.end), 1);
-  return <div className="interval-chart">{wasmStack && <div className="artifact-badge">logical stack-value lifetimes · depth {stackMaxDepth ?? '—'}</div>}<div className="axis"><span>0</span><span>{Math.round(max / 2)}</span><span>{max}</span></div>{intervals.map((item, index) => <div className="interval-row" key={`${item.value ?? index}-${index}`}><span className="interval-name">{item.value ?? `v${index}`}</span><div className="interval-track"><span className={`interval-bar ${item.location?.startsWith('spill') ? 'spilled' : ''}`} style={{ left: `${item.start / max * 100}%`, width: `${Math.max(1, (item.end - item.start) / max * 100)}%` }} title={`${item.start}..${item.end} · ${item.location ?? 'unassigned'}`} /></div><span className="interval-location">{item.location ?? '—'}</span></div>)}</div>;
+  return <div className="interval-chart">{wasmStack && <div className="artifact-badge">logical stack-value lifetimes · depth {stackMaxDepth ?? '—'}</div>}{!wasmStack && pressure?.length ? <PressureCurve pressure={pressure} /> : null}<div className="axis"><span>0</span><span>{Math.round(max / 2)}</span><span>{max}</span></div>{intervals.map((item, index) => <div className="interval-row" key={`${item.value ?? index}-${index}`}><span className="interval-name">{item.value ?? `v${index}`}</span><div className="interval-track"><span className={`interval-bar ${item.location?.startsWith('spill') ? 'spilled' : ''}`} style={{ left: `${item.start / max * 100}%`, width: `${Math.max(1, (item.end - item.start) / max * 100)}%` }} title={`${item.start}..${item.end} · ${item.location ?? 'unassigned'}`} /></div><span className="interval-location">{item.location ?? '—'}</span></div>)}</div>;
 }
 
 function AssemblyPanel({ artifact }: { artifact: CompileArtifact | null }) {
@@ -238,6 +264,6 @@ export default function App() {
   }, [state.source, state.target]);
   return <div className="app-shell"><Header /><main className="workspace">
     <div className="editor-column"><Panel title="Expression editor" eyebrow="01 · input"><SourceEditor diagnostics={state.diagnostics} /><div className="editor-footer"><span>Source spans stay linked to every artifact.</span><span>Tip: try <code>if x &lt; 0 then abs(x) else x</code></span></div></Panel><Panel title="Diagnostics" eyebrow="frontend boundary"><DiagnosticsPanel diagnostics={state.diagnostics} error={state.error} /></Panel></div>
-    <div className="artifact-column"><Panel title="AST → SSA IR" eyebrow="02 · structure" wide><div className="split-panel"><AstPanel ast={state.ast} /><IrPanel artifact={state.artifact} /></div></Panel><Panel title="Control-flow graph" eyebrow="03 · control flow"><CfgPanel cfg={state.artifact?.cfg} /></Panel><div className="two-up"><Panel title={state.artifact?.encoding === 'wasm-stack' ? 'Stack value lifetimes' : 'Register allocation'} eyebrow="04 · liveness"><IntervalPanel intervals={state.artifact?.intervals} encoding={state.artifact?.encoding} stackMaxDepth={state.artifact?.stack_max_depth} /></Panel><Panel title={state.artifact?.encoding === 'wasm-stack' ? 'Stack instructions + hex' : 'Assembly + hex'} eyebrow="05 · emission"><AssemblyPanel artifact={state.artifact} /></Panel></div><Panel title="Benchmark & tiering" eyebrow="06 · runtime"><BenchmarkPanel benchmark={state.benchmark} /></Panel><Panel title="Target selector" eyebrow="07 · regeneration"><TargetPanel /></Panel></div>
+    <div className="artifact-column"><Panel title="AST → SSA IR" eyebrow="02 · structure" wide><div className="split-panel"><AstPanel ast={state.ast} /><IrPanel artifact={state.artifact} /></div></Panel><Panel title="Control-flow graph" eyebrow="03 · control flow"><CfgPanel cfg={state.artifact?.cfg} /></Panel><div className="two-up"><Panel title={state.artifact?.encoding === 'wasm-stack' ? 'Stack value lifetimes' : 'Register allocation'} eyebrow="04 · liveness"><IntervalPanel intervals={state.artifact?.intervals} pressure={state.artifact?.pressure} encoding={state.artifact?.encoding} stackMaxDepth={state.artifact?.stack_max_depth} /></Panel><Panel title={state.artifact?.encoding === 'wasm-stack' ? 'Stack instructions + hex' : 'Assembly + hex'} eyebrow="05 · emission"><AssemblyPanel artifact={state.artifact} /></Panel></div><Panel title="Benchmark & tiering" eyebrow="06 · runtime"><BenchmarkPanel benchmark={state.benchmark} /></Panel><Panel title="Target selector" eyebrow="07 · regeneration"><TargetPanel /></Panel></div>
   </main><footer className="app-footer"><span>FORGE / live compiler observatory</span><span>target: {state.target} · mode: {state.mode} · API: {globalThis.forgeWasm ? 'connected' : 'not loaded'}</span></footer></div>;
 }

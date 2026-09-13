@@ -25,6 +25,8 @@ button:disabled { cursor: wait; opacity: .65; }
 .segmented button + button { border-left: 1px solid #2b3b57; }
 .segmented .selected { color: #091019; background: #7ee787; }
 .run-button { border: 0; border-radius: 7px; padding: 9px 16px; color: #07100c; background: #62d6a7; font-weight: 700; }
+.share-button { border: 1px solid #2b3b57; border-radius: 7px; padding: 8px 12px; color: #b7c8e2; background: #101a2b; font-size: 12px; }
+.share-button:hover { border-color: #62d6a7; color: #d9f8e8; }
 .status-line { margin-top: 13px; min-height: 18px; color: #93a3bf; font-size: 12px; }
 .status-dot, .pulse-dot { display: inline-block; width: 7px; height: 7px; margin-right: 8px; border-radius: 50%; background: #62d6a7; vertical-align: 1px; }
 .pulse-dot { animation: pulse 1s infinite; background: #f2c572; }
@@ -80,6 +82,17 @@ button:disabled { cursor: wait; opacity: .65; }
 .two-up .panel { min-width: 0; }
 .empty { min-height: 90px; display: grid; place-items: center; padding: 20px; border: 1px dashed #2c3d58; border-radius: 7px; color: #70819c; text-align: center; font-size: 12px; }
 .interval-chart { padding-top: 7px; font: 10px ui-monospace, monospace; }
+.pressure-wrap { margin-bottom: 12px; border: 1px solid #22314a; border-radius: 7px; padding: 8px; background: #0a1320; }
+.pressure-legend { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-bottom: 5px; color: #7285a2; font-size: 9px; }
+.pressure-legend span:first-child { margin-right: auto; color: #9eb1cd; }
+.pressure-key { display: inline-block; width: 13px; height: 2px; margin-right: 4px; vertical-align: middle; }
+.gpr-key, .gpr-line { background: #f2c572; stroke: #f2c572; }
+.xmm-key, .xmm-line { background: #62d6a7; stroke: #62d6a7; }
+.pressure-svg { display: block; width: 100%; height: 90px; overflow: visible; }
+.pressure-line { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.pressure-limit { stroke-width: 1; stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; }
+.gpr-limit { stroke: #a17834; }
+.xmm-limit { stroke: #32866a; }
 .axis { display: flex; justify-content: space-between; margin-left: 44px; color: #62738e; }
 .interval-row { display: grid; grid-template-columns: 38px 1fr 55px; gap: 6px; align-items: center; margin-top: 9px; }
 .interval-name { color: #a8c2e3; text-align: right; }

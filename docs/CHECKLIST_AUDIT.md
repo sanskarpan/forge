@@ -1,6 +1,6 @@
 # Checklist audit
 
-Status date: 2026-09-13
+Status date: 2026-09-14
 
 This document is the implementation audit for [`CHECKLIST.md`](../CHECKLIST.md)
 and [`SPEC.md`](../SPEC.md). The phase sections in `CHECKLIST.md` are retained
@@ -22,6 +22,7 @@ npm ci --prefix workbench
 npm test --prefix workbench
 npm run typecheck --prefix workbench
 npm run build --prefix workbench
+./scripts/generate-demo-gif.sh /tmp/forge-pipeline-verification.gif
 ```
 
 The repository CI matrix also passed on the promotion candidate:
@@ -60,6 +61,23 @@ boundary, not a reduction in correctness coverage.
 | 15 Workbench | Complete for the browser-safe inspection contract | The Workbench builds and runs with the real WASM API, visualizes AST/IR/CFG/intervals/bytes/benchmarks, supports scalar/array and target selection, and never executes native bytes in the browser. |
 | 16 Docs and polish | Complete for the production release surface | README, mdBook, architecture/testing/release/platform/encoding/optimization/register-allocation guides, governance files, security automation, Pages workflow, and demo GIF are shipped. |
 
+## Additions verified in this audit
+
+The current implementation also closes the previously missing observability
+and reproducibility pieces that were actionable without changing the language
+contract:
+
+- `forge-cli --verbose` reports measured compilation-phase timings through a
+  public runtime trace API, with an ordered runtime regression test.
+- Native x86-64 artifact JSON includes GPR/XMM pressure samples computed from
+  the allocator’s verified intervals; the Workbench renders those samples
+  alongside native interval bars.
+- The Workbench can encode the current source, arguments, target, and scalar or
+  array mode in a share URL and restores that state on load.
+- `scripts/generate-demo-gif.sh` captures the output of real CLI commands from
+  the checkout. The checked-in GIF is generated from that script and is not a
+  simulated compiler animation.
+
 ## Explicit scope boundaries
 
 These items are intentionally resolved as release boundaries rather than
@@ -89,8 +107,9 @@ silent omissions:
 7. **Native execution in the Workbench.** Native x86-64 and AArch64 output is
    inspection-only in the browser. WASM is the executable browser target.
 8. **Benchmark targets.** The allocator benchmark is recorded with the real
-   measured result; a target is not marked achieved by changing the workload
-   or weakening the assertion.
+   measured result (46.953 µs median and 49.740 µs upper estimate in the
+   current validation run); a target is not marked achieved by changing the
+   workload or weakening the assertion.
 
 ## Audit policy
 

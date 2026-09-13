@@ -33,6 +33,11 @@ export interface Interval {
   class?: string;
 }
 
+export interface PressurePoint {
+  gpr: number;
+  xmm: number;
+}
+
 export interface AssemblyInstruction {
   offset?: number;
   bytes?: string;
@@ -55,6 +60,7 @@ export interface CompileArtifact {
   ir_stages: IrStage[];
   cfg: string;
   intervals?: Interval[];
+  pressure?: PressurePoint[];
   asm?: AssemblyInstruction[];
   encoding?: string;
   stack_max_depth?: number;
@@ -97,11 +103,26 @@ interface WorkbenchState {
   setCompilation: (value: Partial<WorkbenchState>) => void;
 }
 
+function sharedStateFromUrl(): Partial<Pick<WorkbenchState, 'source' | 'args' | 'target' | 'mode'>> {
+  if (typeof window === 'undefined') return {};
+  const params = new URLSearchParams(window.location.search);
+  const target = params.get('target');
+  const mode = params.get('mode');
+  return {
+    ...(params.get('source') ? { source: params.get('source')! } : {}),
+    ...(params.has('args') ? { args: params.get('args') ?? '' } : {}),
+    ...(target === 'wasm' || target === 'x86_64' || target === 'aarch64' ? { target } : {}),
+    ...(mode === 'scalar' || mode === 'array' ? { mode } : {}),
+  };
+}
+
+const sharedState = sharedStateFromUrl();
+
 export const useWorkbench = create<WorkbenchState>((set) => ({
-  source: 'sqrt(x * x + y * y)',
-  args: '3, 4',
-  target: 'wasm',
-  mode: 'scalar',
+  source: sharedState.source ?? 'sqrt(x * x + y * y)',
+  args: sharedState.args ?? '3, 4',
+  target: sharedState.target ?? 'wasm',
+  mode: sharedState.mode ?? 'scalar',
   activePanel: 'overview',
   compiling: false,
   status: 'Ready. Load a forge-wasm-api bundle to compile in the browser.',
