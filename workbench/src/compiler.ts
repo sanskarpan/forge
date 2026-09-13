@@ -119,11 +119,16 @@ export async function compileCurrent(source: string, target: Target): Promise<vo
     const wasmHex = artifact.wasm_bytes_hex ?? artifact.bytes_hex;
     if (!wasmHex) throw new Error('WASM artifact did not include executable bytes');
     const bytes = hexBytes(wasmHex);
-    const imports = artifact.required_imports?.includes('forge.fmod')
+    const imports: WebAssembly.Imports = artifact.required_imports?.includes('forge.fmod')
       ? { forge: { fmod: (lhs: number, rhs: number) => lhs % rhs } }
       : {};
-    const instance = await WebAssembly.instantiate(bytes, imports);
-    const evaluate = instance.exports.eval;
+    // Keep the module input backed by a plain ArrayBuffer. Recent TypeScript
+    // lib.dom definitions correctly distinguish SharedArrayBuffer from the
+    // BufferSource accepted by WebAssembly.instantiate.
+    const moduleBytes = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(moduleBytes).set(bytes);
+    const instance = await WebAssembly.instantiate(moduleBytes, imports);
+    const evaluate = instance.instance.exports.eval;
     if (typeof evaluate !== 'function') throw new Error('compiled module does not export eval');
     const invoke = (...values: number[]) => Number((evaluate as (...values: number[]) => number)(...values));
     const result = invoke(...args);

@@ -23,6 +23,8 @@ pub trait Pass {
 /// caused it, not three passes later."
 pub fn run_passes(f: &mut Function, passes: &mut [Box<dyn Pass>]) {
     for round in 0..10 {
+        #[cfg(not(debug_assertions))]
+        let _ = round;
         let mut changed = false;
         for pass in passes.iter_mut() {
             let pass_changed = pass.run(f);
