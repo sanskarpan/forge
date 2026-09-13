@@ -2,6 +2,9 @@
 name = "forge-wasm-api"
 version.workspace = true
 edition.workspace = true
+description = "Browser-facing wasm-bindgen API and compiler inspection artifacts for Forge"
+license.workspace = true
+repository.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
