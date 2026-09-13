@@ -16,6 +16,7 @@ use forge_syntax::Diagnostic;
 #[cfg(target_arch = "x86_64")]
 use forge_x64::{AluOp, Assembler, PhysReg};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 pub use tiered::{ExecutionTier, TieredExpr, BASELINE_THRESHOLD, OPTIMIZED_THRESHOLD};
 
 #[derive(Debug)]
@@ -94,6 +95,27 @@ pub struct CompilationArtifacts {
     pub intervals: Vec<forge_regalloc::Interval>,
     pub assignment: HashMap<Value, forge_regalloc::Location>,
     pub bytes: Vec<u8>,
+}
+
+/// A measured phase of the source-to-native inspection pipeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompilationPhase {
+    pub name: &'static str,
+    pub elapsed: Duration,
+}
+
+fn measure<T>(
+    phases: &mut Vec<CompilationPhase>,
+    name: &'static str,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let started = Instant::now();
+    let result = operation();
+    phases.push(CompilationPhase {
+        name,
+        elapsed: started.elapsed(),
+    });
+    result
 }
 
 impl From<std::io::Error> for CompileError {
@@ -786,8 +808,23 @@ pub fn compile_artifacts_with_optimization(
     source: &str,
     optimize: bool,
 ) -> Result<CompilationArtifacts, CompileError> {
-    let function = prepare_function(lower_source(source)?, optimize)?;
-    compile_x86_artifacts(function)
+    compile_artifacts_with_trace(source, optimize).map(|(artifacts, _)| artifacts)
+}
+
+/// Compiles an expression and returns timings for each inspectable pipeline
+/// phase. The timings are intended for CLI and Workbench observability; they
+/// do not alter compilation behavior or become part of the artifact contract.
+pub fn compile_artifacts_with_trace(
+    source: &str,
+    optimize: bool,
+) -> Result<(CompilationArtifacts, Vec<CompilationPhase>), CompileError> {
+    let mut phases = Vec::new();
+    let function = measure(&mut phases, "frontend + lowering", || lower_source(source))?;
+    let function = measure(&mut phases, "optimization + IR verification", || {
+        prepare_function(function, optimize)
+    })?;
+    let (artifacts, _) = compile_x86_artifacts_with_trace(function, &mut phases)?;
+    Ok((artifacts, phases))
 }
 
 fn prepare_function(mut function: Function, optimize: bool) -> Result<Function, CompileError> {
@@ -806,16 +843,33 @@ fn prepare_function(mut function: Function, optimize: bool) -> Result<Function, 
 
 #[cfg(target_arch = "x86_64")]
 fn compile_native_x86_function(function: Function) -> Result<CompilationArtifacts, CompileError> {
-    compile_x86_artifacts(function)
+    let (artifacts, _) = compile_x86_artifacts_with_trace(function, &mut Vec::new())?;
+    Ok(artifacts)
 }
 
-fn compile_x86_artifacts(function: Function) -> Result<CompilationArtifacts, CompileError> {
-    let selected = forge_x64::select(&function);
-    let intervals = forge_regalloc::build_intervals(&function, &selected);
-    let excluded = forge_regalloc::excluded_registers(&function, &selected);
-    let (assignment, _) = forge_regalloc::allocate(intervals.clone(), &excluded, &selected);
-    forge_regalloc::verify_allocation(&intervals, &assignment).map_err(CompileError::Allocation)?;
-    let bytes = forge_emit::emit_body(&function, &selected, &assignment);
+fn compile_x86_artifacts_with_trace(
+    function: Function,
+    phases: &mut Vec<CompilationPhase>,
+) -> Result<(CompilationArtifacts, Vec<CompilationPhase>), CompileError> {
+    let selected = measure(phases, "instruction selection", || {
+        forge_x64::select(&function)
+    });
+    let intervals = measure(phases, "liveness and interval construction", || {
+        forge_regalloc::build_intervals(&function, &selected)
+    });
+    let excluded = measure(phases, "fixed-register constraints", || {
+        forge_regalloc::excluded_registers(&function, &selected)
+    });
+    let (assignment, _) = measure(phases, "linear-scan allocation", || {
+        forge_regalloc::allocate(intervals.clone(), &excluded, &selected)
+    });
+    measure(phases, "allocation verification", || {
+        forge_regalloc::verify_allocation(&intervals, &assignment)
+    })
+    .map_err(CompileError::Allocation)?;
+    let bytes = measure(phases, "machine-code emission", || {
+        forge_emit::emit_body(&function, &selected, &assignment)
+    });
     Ok(CompilationArtifacts {
         function,
         selected,
@@ -823,6 +877,7 @@ fn compile_x86_artifacts(function: Function) -> Result<CompilationArtifacts, Com
         assignment,
         bytes,
     })
+    .map(|artifacts| (artifacts, phases.clone()))
 }
 
 impl CompiledFunction {
@@ -1200,6 +1255,26 @@ mod tests {
                 .sum::<usize>()
         };
         assert!(live_count(&optimized.function) < live_count(&baseline.function));
+    }
+
+    #[test]
+    fn traced_artifact_pipeline_reports_each_stage_in_order() {
+        let (_, phases) = compile_artifacts_with_trace("x * x + 1.0", true).unwrap();
+        let names = phases.iter().map(|phase| phase.name).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "frontend + lowering",
+                "optimization + IR verification",
+                "instruction selection",
+                "liveness and interval construction",
+                "fixed-register constraints",
+                "linear-scan allocation",
+                "allocation verification",
+                "machine-code emission",
+            ]
+        );
+        assert!(phases.iter().all(|phase| phase.elapsed >= Duration::ZERO));
     }
 
     #[test]
