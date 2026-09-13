@@ -1,1 +1,4 @@
 /target
+/workbench/node_modules
+/workbench/dist
+/docs/book
