@@ -17,6 +17,9 @@ use std::time::Instant;
     about = "Inspect and run Forge expressions"
 )]
 struct Cli {
+    /// Print measured timings for the source-to-artifact pipeline to stderr.
+    #[arg(long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -118,22 +121,29 @@ struct VerifyArgs {
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
-        Command::Eval(args) => eval_command(&args.expression, &args.values),
+        Command::Eval(args) => eval_command(&args.expression, &args.values, cli.verbose),
         Command::Compile(args) => compile_command(
             &args.expression,
             &args.arch,
             &args.opt,
             args.features.as_deref(),
             args.emit,
+            cli.verbose,
         ),
-        Command::Asm(args) => inspect_assembly(&args.expression, args.annotate),
-        Command::Ir(args) => ir_command(&args.expression, args.after.as_deref()),
-        Command::Cfg(args) => inspect_command_with_dot(&args.expression, args.dot),
-        Command::Regalloc(args) => inspect_command(&args.expression, Inspection::Regalloc),
-        Command::Bench(args) => {
-            bench_command(&args.expression, &args.sizes, args.warmup, args.json)
+        Command::Asm(args) => inspect_assembly(&args.expression, args.annotate, cli.verbose),
+        Command::Ir(args) => ir_command(&args.expression, args.after.as_deref(), cli.verbose),
+        Command::Cfg(args) => inspect_command_with_dot(&args.expression, args.dot, cli.verbose),
+        Command::Regalloc(args) => {
+            inspect_command(&args.expression, Inspection::Regalloc, cli.verbose)
         }
-        Command::Verify(args) => verify_command(&args.expression, args.iters),
+        Command::Bench(args) => bench_command(
+            &args.expression,
+            &args.sizes,
+            args.warmup,
+            args.json,
+            cli.verbose,
+        ),
+        Command::Verify(args) => verify_command(&args.expression, args.iters, cli.verbose),
         Command::Cpuinfo => cpuinfo_command(&[]),
         Command::Repl => repl_command(),
     };
@@ -156,6 +166,17 @@ fn paint(text: &str, color: u8, terminal: bool) -> String {
         format!("\x1b[{color}m{text}\x1b[0m")
     } else {
         text.to_string()
+    }
+}
+
+fn print_trace(phases: &[forge_runtime::CompilationPhase]) {
+    eprintln!("trace: compilation phases");
+    for phase in phases {
+        eprintln!(
+            "trace: {:<32} {:>8.3} ms",
+            phase.name,
+            phase.elapsed.as_secs_f64() * 1_000.0
+        );
     }
 }
 
@@ -189,7 +210,12 @@ fn is_compile_error(error: &str) -> bool {
     .any(|prefix| error.starts_with(prefix))
 }
 
-fn eval_command(expression: &str, args: &[String]) -> Result<(), String> {
+fn eval_command(expression: &str, args: &[String], verbose: bool) -> Result<(), String> {
+    if verbose {
+        if let Ok((_, phases)) = forge_runtime::compile_artifacts_with_trace(expression, true) {
+            print_trace(&phases);
+        }
+    }
     let function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
     let values = parse_values(args, &function.params)?;
     let result = forge_runtime::evaluate(expression, &values).map_err(|e| e.to_string())?;
@@ -265,6 +291,7 @@ fn compile_command(
     opt: &str,
     features: Option<&str>,
     emit: bool,
+    verbose: bool,
 ) -> Result<(), String> {
     if !matches!(opt, "0" | "1" | "2") {
         return Err(format!("--opt must be 0, 1, or 2, got {opt:?}"));
@@ -282,9 +309,12 @@ fn compile_command(
             }
         }
         "x86_64" => {
-            let artifacts =
-                forge_runtime::compile_artifacts_with_optimization(expression, opt != "0")
+            let (artifacts, phases) =
+                forge_runtime::compile_artifacts_with_trace(expression, opt != "0")
                     .map_err(|e| e.to_string())?;
+            if verbose {
+                print_trace(&phases);
+            }
             println!(
                 "target: x86_64\noptimization: {opt}\nbytes: {}",
                 artifacts.bytes.len()
@@ -320,30 +350,56 @@ enum Inspection {
     Regalloc,
 }
 
-fn inspect_command(expression: &str, inspection: Inspection) -> Result<(), String> {
-    let artifacts = forge_runtime::compile_artifacts(expression).map_err(|e| e.to_string())?;
+fn inspect_command(expression: &str, inspection: Inspection, verbose: bool) -> Result<(), String> {
+    let (artifacts, phases) =
+        forge_runtime::compile_artifacts_with_trace(expression, true).map_err(|e| e.to_string())?;
+    if verbose {
+        print_trace(&phases);
+    }
     match inspection {
         Inspection::Regalloc => print_regalloc(&artifacts),
     }
     Ok(())
 }
 
-fn inspect_assembly(expression: &str, annotate: bool) -> Result<(), String> {
-    let artifacts = forge_runtime::compile_artifacts(expression).map_err(|e| e.to_string())?;
+fn inspect_assembly(expression: &str, annotate: bool, verbose: bool) -> Result<(), String> {
+    let (artifacts, phases) =
+        forge_runtime::compile_artifacts_with_trace(expression, true).map_err(|e| e.to_string())?;
+    if verbose {
+        print_trace(&phases);
+    }
     print_assembly(&artifacts, annotate);
     Ok(())
 }
 
-fn inspect_command_with_dot(expression: &str, dot: bool) -> Result<(), String> {
-    let artifacts = forge_runtime::compile_artifacts(expression).map_err(|e| e.to_string())?;
+fn inspect_command_with_dot(expression: &str, dot: bool, verbose: bool) -> Result<(), String> {
+    let (artifacts, phases) =
+        forge_runtime::compile_artifacts_with_trace(expression, true).map_err(|e| e.to_string())?;
+    if verbose {
+        print_trace(&phases);
+    }
     print_cfg(&artifacts.function, dot);
     Ok(())
 }
 
-fn ir_command(expression: &str, after: Option<&str>) -> Result<(), String> {
+fn ir_command(expression: &str, after: Option<&str>, verbose: bool) -> Result<(), String> {
+    let started = Instant::now();
     let mut function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
+    if verbose {
+        eprintln!(
+            "trace: frontend + lowering {:>8.3} ms",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+    }
     if after.is_some_and(|pass| pass != "none" && pass != "lower") {
+        let started = Instant::now();
         forge_opt::optimize(&mut function);
+        if verbose {
+            eprintln!(
+                "trace: optimization       {:>8.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
     }
     print!("{}", forge_ir::print::print_function(&function));
     Ok(())
@@ -450,7 +506,18 @@ fn print_regalloc(artifacts: &forge_runtime::CompilationArtifacts) {
     println!("spills: {spills}");
 }
 
-fn bench_command(expression: &str, sizes: &str, warmup: usize, json: bool) -> Result<(), String> {
+fn bench_command(
+    expression: &str,
+    sizes: &str,
+    warmup: usize,
+    json: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    if verbose {
+        if let Ok((_, phases)) = forge_runtime::compile_artifacts_with_trace(expression, true) {
+            print_trace(&phases);
+        }
+    }
     let function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
     if function
         .params
@@ -535,7 +602,12 @@ fn run_bench_call(
     }
 }
 
-fn verify_command(expression: &str, iterations: usize) -> Result<(), String> {
+fn verify_command(expression: &str, iterations: usize, verbose: bool) -> Result<(), String> {
+    if verbose {
+        if let Ok((_, phases)) = forge_runtime::compile_artifacts_with_trace(expression, true) {
+            print_trace(&phases);
+        }
+    }
     let function = forge_runtime::lower_source(expression).map_err(|e| e.to_string())?;
     if function
         .params
@@ -694,16 +766,16 @@ fn repl_command_line(
         ":clear" => bindings.clear(),
         ":asm" => {
             let expression = parts.next().ok_or("usage: :asm EXPR")?;
-            inspect_assembly(expression, false)?;
+            inspect_assembly(expression, false, false)?;
         }
         ":ir" => {
             let expression = parts.next().ok_or("usage: :ir EXPR")?;
-            ir_command(expression, None)?;
+            ir_command(expression, None, false)?;
         }
         ":bench" => {
             let expression = parts.next().ok_or("usage: :bench EXPR [SIZES]")?;
             let sizes = parts.next().unwrap_or("1,10,100,1K");
-            bench_command(expression, sizes, 0, false)?;
+            bench_command(expression, sizes, 0, false, false)?;
         }
         command => return Err(format!("unknown REPL command {command:?}; try :help")),
     }
